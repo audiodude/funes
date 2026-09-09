@@ -35,6 +35,7 @@ pub mod chunk;
 pub mod commands;
 pub mod hub;
 pub mod inference;
+pub mod local_source;
 pub mod memory;
 pub mod scan;
 pub mod session_sketch;

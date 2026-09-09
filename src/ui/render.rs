@@ -26,7 +26,11 @@ pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String
     for (h, score) in hits {
         let is_omp = h.harness == "omp";
         // UUIDv7 timestamp prefixes collide across OMP sessions; headings must distinguish them.
-        let display_id = if is_omp { h.session_id.as_str() } else { &h.session_id[..h.session_id.len().min(8)] };
+        let display_id = if is_omp {
+            h.session_id.as_str()
+        } else {
+            &h.session_id[..h.session_id.len().min(8)]
+        };
         let _ = writeln!(
             out,
             "[{}] {} {}/{} {}  score={:.3}",
@@ -40,7 +44,11 @@ pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String
         for n in &h.neighbors {
             if is_omp {
                 // A clipped neighbor can omit the caveat that qualifies its reported outcome.
-                let _ = writeln!(out, "  ~ [{} {} seq{}] [session {}, seq {}] [Archived statement, not independent verification] {}", n.role, n.block_type, n.seq, h.session_id, n.seq, n.text);
+                let _ = writeln!(
+                    out,
+                    "  ~ [{} {} seq{}] [session {}, seq {}] [Archived statement, not independent verification] {}",
+                    n.role, n.block_type, n.seq, h.session_id, n.seq, n.text
+                );
             } else {
                 let np: String = n.text.chars().take(160).collect();
                 let _ = writeln!(out, "  ~ [{} {} seq{}] {}", n.role, n.block_type, n.seq, np);
@@ -344,10 +352,18 @@ mod tests {
 
     #[test]
     fn omp_neighbor_preserves_late_qualifiers_verbatim() {
-        let text = format!("{} Current tests still require inspection; this is only a reported conclusion.", "A historical claim. ".repeat(12));
+        let text = format!(
+            "{} Current tests still require inspection; this is only a reported conclusion.",
+            "A historical claim. ".repeat(12)
+        );
         let mut h = hit("2026-09-06", "text", "The accepted storage decision.");
         h.harness = "omp".into();
-        h.neighbors.push(Neighbor { seq: 8, role: "assistant".into(), block_type: "text".into(), text: text.clone() });
+        h.neighbors.push(Neighbor {
+            seq: 8,
+            role: "assistant".into(),
+            block_type: "text".into(),
+            text: text.clone(),
+        });
         let out = recall_agent("", "", &[(h, 1.0)]);
         assert!(out.contains(&text), "OMP neighbor omitted the qualifier: {out}");
     }

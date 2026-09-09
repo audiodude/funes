@@ -178,7 +178,11 @@ enum ScannerState {
 }
 
 fn merge_scanner(previous: ScannerState, current: ScannerState) -> ScannerState {
-    if previous == current { previous } else { ScannerState::Mixed }
+    if previous == current {
+        previous
+    } else {
+        ScannerState::Mixed
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -235,15 +239,17 @@ struct OmpReceipts {
 
 impl Default for OmpReceipts {
     fn default() -> Self {
-        Self { version: 1, units: HashMap::new() }
+        Self {
+            version: 1,
+            units: HashMap::new(),
+        }
     }
 }
 
 fn read_omp_receipts(path: &Path) -> Result<OmpReceipts> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let receipts: OmpReceipts = serde_json::from_slice(&bytes)
-                .context("invalid OMP coverage receipt file")?;
+            let receipts: OmpReceipts = serde_json::from_slice(&bytes).context("invalid OMP coverage receipt file")?;
             anyhow::ensure!(receipts.version == 1, "unsupported OMP coverage receipt version");
             Ok(receipts)
         }
@@ -265,9 +271,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn receipt_current(receipt: Option<&OmpReceipt>, signature: &str) -> bool {
-    receipt.is_some_and(|r| {
-        r.policy == OMP_POLICY && r.coverage.complete && r.coverage.signature == signature
-    })
+    receipt.is_some_and(|r| r.policy == OMP_POLICY && r.coverage.complete && r.coverage.signature == signature)
 }
 
 fn mark_incomplete(coverage: &mut omp::Coverage, issue: &str) {
@@ -658,9 +662,7 @@ impl Indexer {
                             std::cmp::Reverse((c.seq, c.block_idx, c.split_idx))
                         });
                         new_chunks.truncate(remaining);
-                        new_chunks.sort_unstable_by_key(|c| {
-                            std::cmp::Reverse((c.seq, c.block_idx, c.split_idx))
-                        });
+                        new_chunks.sort_unstable_by_key(|c| std::cmp::Reverse((c.seq, c.block_idx, c.split_idx)));
                         mark_incomplete(coverage.as_mut().expect("OMP coverage"), "chunk-budget");
                     }
                 }
@@ -678,16 +680,25 @@ impl Indexer {
 
         if let Some(coverage) = coverage {
             let scanner = retained_scanner(previous.as_ref(), prior_chunks, scanner_state, added);
-            self.omp_pending.insert(key.clone(), OmpReceipt {
-                coverage,
-                scanner,
-                indexed_at: String::new(),
-                chunks: prior_chunks + added as usize,
-                policy: OMP_POLICY.to_string(),
-            });
+            self.omp_pending.insert(
+                key.clone(),
+                OmpReceipt {
+                    coverage,
+                    scanner,
+                    indexed_at: String::new(),
+                    chunks: prior_chunks + added as usize,
+                    policy: OMP_POLICY.to_string(),
+                },
+            );
         } else if let Some(sig) = &sig {
             // Other harnesses retain per-unit resumability, now with an atomic checkpoint.
-            self.state.insert(key.clone(), UnitState { sig: sig.clone(), level: target });
+            self.state.insert(
+                key.clone(),
+                UnitState {
+                    sig: sig.clone(),
+                    level: target,
+                },
+            );
             atomic_json(&self.state_path, &self.state)?;
             write_index_coverage(&self.coverage_path, &self.sources, &self.units, &self.state)?;
         }
@@ -789,17 +800,23 @@ impl Indexer {
                 if omp::file_signature(Path::new(key)).ok().as_ref() != Some(&receipt.coverage.signature) {
                     mark_incomplete(&mut receipt.coverage, "source-changed");
                 }
-                let (src_i, unit) = self.units.iter().find(|(_, u)| &u.key == key)
+                let (src_i, unit) = self
+                    .units
+                    .iter()
+                    .find(|(_, u)| &u.key == key)
                     .context("OMP receipt source missing")?;
                 if !self.sources[*src_i].dependencies_current(unit) {
                     mark_incomplete(&mut receipt.coverage, "provenance-changed");
                 }
                 receipt.indexed_at = chrono::Utc::now().to_rfc3339();
                 if receipt.coverage.complete {
-                    self.state.insert(key.clone(), UnitState {
-                        sig: receipt.coverage.signature.clone(),
-                        level: *Tier::ALL.iter().max().expect("tiers"),
-                    });
+                    self.state.insert(
+                        key.clone(),
+                        UnitState {
+                            sig: receipt.coverage.signature.clone(),
+                            level: *Tier::ALL.iter().max().expect("tiers"),
+                        },
+                    );
                 } else {
                     self.state.remove(key);
                     self.work_remaining = true;
@@ -1005,7 +1022,10 @@ async fn index_sources(
     let mut probe_pending = indexer.first_index && !yes && interactive;
 
     for i in 0..total {
-        if indexer.omp_max_chunks.is_some_and(|budget| indexer.n_chunks as usize >= budget) {
+        if indexer
+            .omp_max_chunks
+            .is_some_and(|budget| indexer.n_chunks as usize >= budget)
+        {
             indexer.work_remaining = true;
             break;
         }
@@ -1140,12 +1160,24 @@ mod tests {
     #[test]
     fn scanner_recovery_cannot_sanitize_retained_history() {
         let unavailable = receipt(ScannerState::Unavailable);
-        assert_eq!(retained_scanner(Some(&unavailable), 2, ScannerState::Scanned, 0), ScannerState::Unavailable);
-        assert_eq!(retained_scanner(Some(&unavailable), 2, ScannerState::Scanned, 1), ScannerState::Mixed);
+        assert_eq!(
+            retained_scanner(Some(&unavailable), 2, ScannerState::Scanned, 0),
+            ScannerState::Unavailable
+        );
+        assert_eq!(
+            retained_scanner(Some(&unavailable), 2, ScannerState::Scanned, 1),
+            ScannerState::Mixed
+        );
         assert_eq!(retained_scanner(None, 2, ScannerState::Scanned, 1), ScannerState::Mixed);
         let scanned = receipt(ScannerState::Scanned);
-        assert_eq!(retained_scanner(Some(&scanned), 3, ScannerState::Scanned, 0), ScannerState::Mixed);
-        assert_eq!(retained_scanner(Some(&scanned), 2, ScannerState::Failed, 1), ScannerState::Mixed);
+        assert_eq!(
+            retained_scanner(Some(&scanned), 3, ScannerState::Scanned, 0),
+            ScannerState::Mixed
+        );
+        assert_eq!(
+            retained_scanner(Some(&scanned), 2, ScannerState::Failed, 1),
+            ScannerState::Mixed
+        );
         assert_eq!(retained_scanner(None, 0, ScannerState::Failed, 1), ScannerState::Failed);
     }
 
@@ -1184,7 +1216,9 @@ mod tests {
         // A full-size but invalid footer exercises Lance's corrupt-manifest error path.
         // Truncating below its footer length instead triggers an upstream arithmetic panic.
         std::fs::write(versions.join("1.manifest"), [0u8; 64]).unwrap();
-        let memory = Memory::Local { path: dir.path().to_path_buf() };
+        let memory = Memory::Local {
+            path: dir.path().to_path_buf(),
+        };
         assert!(memory.state().await.is_err());
     }
 

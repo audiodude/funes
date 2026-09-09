@@ -50,7 +50,10 @@ pub fn file_signature(path: &Path) -> io::Result<String> {
     #[cfg(not(unix))]
     {
         let _ = md;
-        Err(io::Error::new(io::ErrorKind::Unsupported, "OMP stat protocol requires Unix"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "OMP stat protocol requires Unix",
+        ))
     }
 }
 
@@ -95,7 +98,11 @@ fn id(value: Option<&Value>) -> Option<&str> {
 }
 
 fn sidecar_path(session_id: &str) -> Option<PathBuf> {
-    valid_id(session_id).then(|| dataset::funes_dir().join("omp-provenance").join(format!("{session_id}.json")))
+    valid_id(session_id).then(|| {
+        dataset::funes_dir()
+            .join("omp-provenance")
+            .join(format!("{session_id}.json"))
+    })
 }
 
 fn load_provenance(session_id: &str) -> Option<Provenance> {
@@ -122,7 +129,10 @@ fn header(path: &Path) -> io::Result<Value> {
             _ => break,
         }
     }
-    Err(io::Error::new(io::ErrorKind::InvalidData, "missing complete OMP session header"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "missing complete OMP session header",
+    ))
 }
 
 pub fn dependencies_current(path: &Path) -> bool {
@@ -131,9 +141,9 @@ pub fn dependencies_current(path: &Path) -> bool {
     let Some(p) = load_provenance(sid) else { return false };
     p.source_path == path
         && file_signature(path).ok().as_deref() == Some(p.signature.as_str())
-        && p.dependencies.iter().all(|d| {
-            d.signature.is_some() && d.session_id.is_some() && file_signature(&d.path).ok() == d.signature
-        })
+        && p.dependencies
+            .iter()
+            .all(|d| d.signature.is_some() && d.session_id.is_some() && file_signature(&d.path).ok() == d.signature)
 }
 
 fn dependency(path: PathBuf, relation: &str, coverage: &mut Coverage) -> Dependency {
@@ -142,7 +152,12 @@ fn dependency(path: PathBuf, relation: &str, coverage: &mut Coverage) -> Depende
     if signature.is_none() || session_id.is_none() || file_signature(&path).ok() != signature {
         coverage.issue(format!("{relation} dependency unavailable or unstable"));
     }
-    Dependency { path, signature, session_id, relation: relation.into() }
+    Dependency {
+        path,
+        signature,
+        session_id,
+        relation: relation.into(),
+    }
 }
 
 fn persist(p: &Provenance) -> io::Result<()> {
@@ -164,7 +179,12 @@ fn blocks(content: Option<&Value>, coverage: &mut Coverage) -> Vec<Block> {
             coverage.issue("persisted message text was truncated by OMP");
         }
         if !text.is_empty() {
-            blocks.push(Block { block_type: "text".into(), text: text.into(), tool_name: None, tool_use_id: None });
+            blocks.push(Block {
+                block_type: "text".into(),
+                text: text.into(),
+                tool_name: None,
+                tool_use_id: None,
+            });
         }
     }
     let mut out = Vec::new();
@@ -177,11 +197,13 @@ fn blocks(content: Option<&Value>, coverage: &mut Coverage) -> Vec<Block> {
                         Some(s) => text(s, &mut out, coverage),
                         None => coverage.issue("unsupported message text representation"),
                     },
-                    Some("thinking" | "redactedThinking" | "fallback" | "anthropicServerTool" | "toolCall" | "image") => {},
+                    Some(
+                        "thinking" | "redactedThinking" | "fallback" | "anthropicServerTool" | "toolCall" | "image",
+                    ) => {}
                     _ => coverage.issue("unsupported message content part"),
                 }
             }
-        },
+        }
         _ => coverage.issue("unsupported message content representation"),
     }
     out
@@ -189,7 +211,14 @@ fn blocks(content: Option<&Value>, coverage: &mut Coverage) -> Vec<Block> {
 
 /// Parse completed physical records, retaining usable text even when coverage is incomplete.
 fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<Turn>, Coverage, Option<Provenance>) {
-    let mut coverage = Coverage { signature, complete: true, issues: Vec::new(), session_id: String::new(), messages: 0, dependencies: Vec::new() };
+    let mut coverage = Coverage {
+        signature,
+        complete: true,
+        issues: Vec::new(),
+        session_id: String::new(),
+        messages: 0,
+        dependencies: Vec::new(),
+    };
     let mut records = Vec::new();
     for (n, line) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
         if line.last() != Some(&b'\n') {
@@ -212,7 +241,9 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
             coverage.issue("unsupported title preamble version");
         }
         iter.next()
-    } else { first };
+    } else {
+        first
+    };
     let Some(header) = header.filter(|v| v.get("type").and_then(Value::as_str) == Some("session")) else {
         coverage.issue("missing session header");
         return (Vec::new(), coverage, None);
@@ -228,15 +259,29 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
         coverage.issue("unsupported session version; v1 requires OMP-persisted native migration");
         return (Vec::new(), coverage, None);
     }
-    let workdir = header.get("cwd").and_then(Value::as_str).and_then(jsonl::workdir_of_cwd).unwrap_or_else(|| fallback.into());
+    let workdir = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .and_then(jsonl::workdir_of_cwd)
+        .unwrap_or_else(|| fallback.into());
     let mut provenance = Provenance {
-        version: 1, session_id: sid.into(), source_path: path.into(), signature: coverage.signature.clone(),
-        session_version: version, parent_session: None, parent_reference_type: None,
-        previous_session_files: Vec::new(), dependencies: Vec::new(), entries: Vec::new(), coverage: coverage.clone(),
+        version: 1,
+        session_id: sid.into(),
+        source_path: path.into(),
+        signature: coverage.signature.clone(),
+        session_version: version,
+        parent_session: None,
+        parent_reference_type: None,
+        previous_session_files: Vec::new(),
+        dependencies: Vec::new(),
+        entries: Vec::new(),
+        coverage: coverage.clone(),
     };
     if let Some(value) = header.get("previousSessionFiles") {
         match value.as_array() {
-            Some(paths) if paths.iter().all(Value::is_string) => provenance.previous_session_files = paths.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+            Some(paths) if paths.iter().all(Value::is_string) => {
+                provenance.previous_session_files = paths.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+            }
             _ => coverage.issue("invalid previous-session paths"),
         }
     }
@@ -248,31 +293,49 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
             } else if reference.contains('/') || reference.ends_with(".jsonl") {
                 provenance.parent_reference_type = Some("path".into());
                 let parent = Path::new(reference);
-                let parent = if parent.is_absolute() { parent.to_path_buf() } else { path.parent().unwrap_or(Path::new(".")).join(parent) };
-                provenance.dependencies.push(dependency(parent, "header_parent", &mut coverage));
+                let parent = if parent.is_absolute() {
+                    parent.to_path_buf()
+                } else {
+                    path.parent().unwrap_or(Path::new(".")).join(parent)
+                };
+                provenance
+                    .dependencies
+                    .push(dependency(parent, "header_parent", &mut coverage));
             } else {
                 coverage.issue("unsupported parent-session reference");
             }
-        } else { coverage.issue("invalid parent-session reference"); }
+        } else {
+            coverage.issue("invalid parent-session reference");
+        }
     }
     let mut turns = Vec::new();
     let mut seen: HashMap<&str, &Value> = HashMap::new();
-    let mut structural_child = path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.starts_with("__advisor"));
+    let mut structural_child = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.starts_with("__advisor"));
     for record in iter {
         let Some(kind) = record.get("type").and_then(Value::as_str) else {
-            coverage.issue("entry type missing"); continue;
+            coverage.issue("entry type missing");
+            continue;
         };
         let Some(eid) = id(record.get("id")) else {
-            coverage.issue("entry identity missing or invalid"); continue;
+            coverage.issue("entry identity missing or invalid");
+            continue;
         };
         if let Some(previous) = seen.get(eid) {
-            if *previous != record { coverage.issue("conflicting duplicate entry identity"); }
+            if *previous != record {
+                coverage.issue("conflicting duplicate entry identity");
+            }
             continue;
         }
         let parent = match record.get("parentId") {
             Some(Value::Null) => None,
             Some(value) if id(Some(value)).is_some() => id(Some(value)).map(str::to_owned),
-            _ => { coverage.issue("entry parent identity missing or invalid"); None },
+            _ => {
+                coverage.issue("entry parent identity missing or invalid");
+                None
+            }
         };
         if parent.as_deref().is_some_and(|p| !seen.contains_key(p)) {
             coverage.issue("entry parent is missing or not earlier in persisted graph");
@@ -281,51 +344,99 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
         let mut metadata = Map::new();
         for key in ["fromId", "firstKeptEntryId", "providerReplayThroughEntryId", "targetId"] {
             if let Some(value) = record.get(key) {
-                if id(Some(value)).is_none() { coverage.issue("invalid control graph reference"); }
-                else { metadata.insert(key.into(), value.clone()); }
+                if id(Some(value)).is_none() {
+                    coverage.issue("invalid control graph reference");
+                } else {
+                    metadata.insert(key.into(), value.clone());
+                }
             }
         }
-        if kind == "compaction" && id(record.get("firstKeptEntryId")).is_none() || kind == "branch_summary" && id(record.get("fromId")).is_none() {
+        if kind == "compaction" && id(record.get("firstKeptEntryId")).is_none()
+            || kind == "branch_summary" && id(record.get("fromId")).is_none()
+        {
             coverage.issue("missing control graph reference");
         }
         structural_child |= kind == "session_init";
-        let mut entry = Entry { id: eid.into(), parent_id: parent.clone(), kind: kind.into(), metadata };
+        let mut entry = Entry {
+            id: eid.into(),
+            parent_id: parent.clone(),
+            kind: kind.into(),
+            metadata,
+        };
         match kind {
             "message" => {
                 if let Some(message) = record.get("message").filter(|m| m.is_object()) {
                     let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-                    if role.is_empty() { coverage.issue("message role missing"); }
+                    if role.is_empty() {
+                        coverage.issue("message role missing");
+                    }
                     entry.metadata.insert("role".into(), Value::String(role.into()));
                     if let Some(synthetic) = message.get("synthetic").and_then(Value::as_bool) {
                         entry.metadata.insert("synthetic".into(), Value::Bool(synthetic));
                     }
-                    if let Some(attribution) = message.get("attribution").and_then(Value::as_str).filter(|s| matches!(*s, "user" | "agent")) {
-                        entry.metadata.insert("attribution".into(), Value::String(attribution.into()));
+                    if let Some(attribution) = message
+                        .get("attribution")
+                        .and_then(Value::as_str)
+                        .filter(|s| matches!(*s, "user" | "agent"))
+                    {
+                        entry
+                            .metadata
+                            .insert("attribution".into(), Value::String(attribution.into()));
                     }
-                    if let Some(reason) = message.get("stopReason").and_then(Value::as_str)
-                        .filter(|s| matches!(*s, "stop" | "length" | "toolUse" | "error" | "aborted")) {
+                    if let Some(reason) = message
+                        .get("stopReason")
+                        .and_then(Value::as_str)
+                        .filter(|s| matches!(*s, "stop" | "length" | "toolUse" | "error" | "aborted"))
+                    {
                         entry.metadata.insert("stopReason".into(), Value::String(reason.into()));
                     }
-                    if let Some(status) = message.get("retryRecovery").and_then(|r| r.get("status"))
-                        .and_then(Value::as_str).filter(|s| matches!(*s, "recovered" | "superseded")) {
-                        entry.metadata.insert("retryRecoveryStatus".into(), Value::String(status.into()));
+                    if let Some(status) = message
+                        .get("retryRecovery")
+                        .and_then(|r| r.get("status"))
+                        .and_then(Value::as_str)
+                        .filter(|s| matches!(*s, "recovered" | "superseded"))
+                    {
+                        entry
+                            .metadata
+                            .insert("retryRecoveryStatus".into(), Value::String(status.into()));
                     }
                     if matches!(role, "user" | "assistant") {
                         coverage.messages += 1;
                         let retained = blocks(message.get("content"), &mut coverage);
                         if !retained.is_empty() {
                             turns.push(Turn {
-                                session_id: sid.into(), workdir: workdir.clone(), turn_uuid: eid.into(), parent_uuid: parent,
-                                seq: turns.len() as i64, ts: record.get("timestamp").and_then(Value::as_str).unwrap_or("").into(),
-                                role: role.into(), blocks: retained, source_path: path.to_string_lossy().into_owned(), harness: "omp".into(),
+                                session_id: sid.into(),
+                                workdir: workdir.clone(),
+                                turn_uuid: eid.into(),
+                                parent_uuid: parent,
+                                seq: turns.len() as i64,
+                                ts: record.get("timestamp").and_then(Value::as_str).unwrap_or("").into(),
+                                role: role.into(),
+                                blocks: retained,
+                                source_path: path.to_string_lossy().into_owned(),
+                                harness: "omp".into(),
                             });
                         }
                     }
-                } else { coverage.issue("message payload missing"); }
-            },
-            "compaction" | "branch_summary" | "reset_boundary" | "session_init" | "model_change" |
-            "thinking_level_change" | "service_tier_change" | "custom" | "label" | "title_change" |
-            "ttsr_injection" | "credential_pin" | "model_usage" | "mode_change" | "custom_message" => {},
+                } else {
+                    coverage.issue("message payload missing");
+                }
+            }
+            "compaction"
+            | "branch_summary"
+            | "reset_boundary"
+            | "session_init"
+            | "model_change"
+            | "thinking_level_change"
+            | "service_tier_change"
+            | "custom"
+            | "label"
+            | "title_change"
+            | "ttsr_injection"
+            | "credential_pin"
+            | "model_usage"
+            | "mode_change"
+            | "custom_message" => {}
             _ => coverage.issue("unsupported entry type"),
         }
         provenance.entries.push(entry);
@@ -343,13 +454,19 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
         // Artifact directories are the complete owning filename with only the final .jsonl removed.
         let owner = PathBuf::from(format!("{}.jsonl", dir.display()));
         if structural_child || owner.is_file() {
-            provenance.dependencies.push(dependency(owner, "structural_owner", &mut coverage));
+            provenance
+                .dependencies
+                .push(dependency(owner, "structural_owner", &mut coverage));
         }
     }
-    coverage.dependencies = provenance.dependencies.iter().map(|d| CoverageDependency {
-        path: d.path.to_string_lossy().into_owned(),
-        signature: d.signature.clone(),
-    }).collect();
+    coverage.dependencies = provenance
+        .dependencies
+        .iter()
+        .map(|d| CoverageDependency {
+            path: d.path.to_string_lossy().into_owned(),
+            signature: d.signature.clone(),
+        })
+        .collect();
     provenance.coverage = coverage.clone();
     (turns, coverage, Some(provenance))
 }
@@ -375,38 +492,75 @@ pub fn provenance_note(session_id: &str, turn_ids: &[&str]) -> String {
         note.push_str("OMP graph/source provenance unavailable; coverage cannot be established.\n");
         return note;
     };
-    note.push_str(&format!("Source: {} (snapshot {}; parse complete: {}).\n", p.source_path.display(), p.signature, p.coverage.complete));
+    note.push_str(&format!(
+        "Source: {} (snapshot {}; parse complete: {}).\n",
+        p.source_path.display(),
+        p.signature,
+        p.coverage.complete
+    ));
     if let Some(parent) = p.parent_session {
-        note.push_str(&format!("Parent session reference ({}) = {parent:?}.\n", p.parent_reference_type.as_deref().unwrap_or("unknown")));
+        note.push_str(&format!(
+            "Parent session reference ({}) = {parent:?}.\n",
+            p.parent_reference_type.as_deref().unwrap_or("unknown")
+        ));
     }
     for dep in p.dependencies {
-        note.push_str(&format!("{}: {} (session {}). Structural ownership does not establish the immediate spawning agent.\n", dep.relation, dep.path.display(), dep.session_id.as_deref().unwrap_or("unresolved")));
+        note.push_str(&format!(
+            "{}: {} (session {}). Structural ownership does not establish the immediate spawning agent.\n",
+            dep.relation,
+            dep.path.display(),
+            dep.session_id.as_deref().unwrap_or("unresolved")
+        ));
     }
     if !p.coverage.complete {
-        note.push_str(&format!("Incomplete source coverage: {}.\n", p.coverage.issues.join("; ")));
+        note.push_str(&format!(
+            "Incomplete source coverage: {}.\n",
+            p.coverage.issues.join("; ")
+        ));
     }
     if !p.previous_session_files.is_empty() {
-        note.push_str(&format!("Recorded previous source locations: {:?}.\n", p.previous_session_files));
+        note.push_str(&format!(
+            "Recorded previous source locations: {:?}.\n",
+            p.previous_session_files
+        ));
     }
     let by_id: HashMap<&str, &Entry> = p.entries.iter().map(|e| (e.id.as_str(), e)).collect();
     for entry in &p.entries {
         if matches!(entry.kind.as_str(), "compaction" | "branch_summary" | "reset_boundary") {
-            note.push_str(&format!("Archive control {} type={} parent={} links={}.\n", entry.id, entry.kind, entry.parent_id.as_deref().unwrap_or("root"), Value::Object(entry.metadata.clone())));
+            note.push_str(&format!(
+                "Archive control {} type={} parent={} links={}.\n",
+                entry.id,
+                entry.kind,
+                entry.parent_id.as_deref().unwrap_or("root"),
+                Value::Object(entry.metadata.clone())
+            ));
         }
     }
     for entry in &p.entries {
         if turn_ids.contains(&entry.id.as_str()) {
-            note.push_str(&format!("Entry {} parent={} metadata={}.\n", entry.id, entry.parent_id.as_deref().unwrap_or("root"), Value::Object(entry.metadata.clone())));
+            note.push_str(&format!(
+                "Entry {} parent={} metadata={}.\n",
+                entry.id,
+                entry.parent_id.as_deref().unwrap_or("root"),
+                Value::Object(entry.metadata.clone())
+            ));
             let mut parent = entry.parent_id.as_deref();
             let mut hops = 0;
             while let Some(eid) = parent {
                 let Some(ancestor) = by_id.get(eid) else { break };
                 if ancestor.kind != "message" {
-                    note.push_str(&format!("  Graph ancestor {} type={} metadata={}.\n", ancestor.id, ancestor.kind, Value::Object(ancestor.metadata.clone())));
+                    note.push_str(&format!(
+                        "  Graph ancestor {} type={} metadata={}.\n",
+                        ancestor.id,
+                        ancestor.kind,
+                        Value::Object(ancestor.metadata.clone())
+                    ));
                 }
                 parent = ancestor.parent_id.as_deref();
                 hops += 1;
-                if hops >= p.entries.len() { break; }
+                if hops >= p.entries.len() {
+                    break;
+                }
             }
         }
     }
@@ -419,7 +573,11 @@ mod tests {
     use serde_json::json;
 
     fn fixture(records: Vec<Value>) -> Vec<u8> {
-        records.into_iter().map(|v| format!("{v}\n")).collect::<String>().into_bytes()
+        records
+            .into_iter()
+            .map(|v| format!("{v}\n"))
+            .collect::<String>()
+            .into_bytes()
     }
 
     #[test]
@@ -435,8 +593,13 @@ mod tests {
         ]);
         let (turns, c, p) = parse(&bytes, Path::new("/nonexistent/child.jsonl"), "sig".into(), "fallback");
         assert!(c.complete, "{:?}", c.issues);
-        assert_eq!(turns.iter().map(|t| t.turn_uuid.as_str()).collect::<Vec<_>>(), ["u1", "a1", "b1"]);
-        assert!(turns.iter().all(|t| t.session_id == "native-session" && t.blocks.iter().all(|b| b.block_type == "text")));
+        assert_eq!(
+            turns.iter().map(|t| t.turn_uuid.as_str()).collect::<Vec<_>>(),
+            ["u1", "a1", "b1"]
+        );
+        assert!(turns
+            .iter()
+            .all(|t| t.session_id == "native-session" && t.blocks.iter().all(|b| b.block_type == "text")));
         assert_eq!(turns[1].parent_uuid.as_deref(), Some("r1"));
         let encoded = serde_json::to_string(&p.unwrap()).unwrap();
         assert!(!encoded.contains("secret") && !encoded.contains("retained assistant"));
@@ -468,17 +631,28 @@ mod tests {
     fn children_use_header_identity_and_require_structural_owner() {
         let dir = tempfile::tempdir().unwrap();
         let parent = dir.path().join("parent.jsonl");
-        fs::write(&parent, fixture(vec![json!({"type":"session","version":3,"id":"parent"})])).unwrap();
+        fs::write(
+            &parent,
+            fixture(vec![json!({"type":"session","version":3,"id":"parent"})]),
+        )
+        .unwrap();
         let child = dir.path().join("parent/worker.jsonl");
-        let records = |sid: &str| fixture(vec![
-            json!({"type":"session","version":3,"id":sid,"cwd":"/tmp"}),
-            json!({"type":"session_init","id":"init","parentId":null,"systemPrompt":"excluded","task":"excluded"}),
-            json!({"type":"message","id":"m","parentId":"init","message":{"role":"user","content":"child text","synthetic":true,"attribution":"agent"}}),
-        ]);
+        let records = |sid: &str| {
+            fixture(vec![
+                json!({"type":"session","version":3,"id":sid,"cwd":"/tmp"}),
+                json!({"type":"session_init","id":"init","parentId":null,"systemPrompt":"excluded","task":"excluded"}),
+                json!({"type":"message","id":"m","parentId":"init","message":{"role":"user","content":"child text","synthetic":true,"attribution":"agent"}}),
+            ])
+        };
         let (one, c, p) = parse(&records("one"), &child, "sig".into(), "");
         assert!(c.complete, "{:?}", c.issues);
         assert_eq!(p.unwrap().dependencies[0].session_id.as_deref(), Some("parent"));
-        let (two, c, _) = parse(&records("two"), &dir.path().join("missing/worker.jsonl"), "sig".into(), "");
+        let (two, c, _) = parse(
+            &records("two"),
+            &dir.path().join("missing/worker.jsonl"),
+            "sig".into(),
+            "",
+        );
         assert!(!c.complete);
         assert_ne!(one[0].session_id, two[0].session_id);
         assert_eq!(two[0].blocks[0].text, "child text");

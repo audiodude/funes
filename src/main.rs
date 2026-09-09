@@ -28,6 +28,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read the local-only, revision-bound source protocol from stdin.
+    Source,
     /// Recall passages from past sessions (hybrid → rerank → recency → neighbors).
     Recall {
         /// What to recall (free text).
@@ -326,6 +328,9 @@ impl MemoryOpts {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    if matches!(&cli.cmd, Cmd::Source) {
+        return funes::local_source::stdio();
+    }
     let omp_index = matches!(&cli.cmd, Cmd::Index { harness: Some(h), .. } if h == "omp");
     match run(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -348,6 +353,7 @@ async fn main() -> std::process::ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
+        Cmd::Source => unreachable!("source is handled before search command dispatch"),
         Cmd::Recall {
             query,
             k,

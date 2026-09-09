@@ -713,9 +713,9 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
     }
     let filter = format!("session_id = '{}'", esc(&session_id));
     let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
-    let is_omp = batches.iter().any(|b| {
-        scol(b, "harness").is_some_and(|a| (0..b.num_rows()).any(|i| a.value(i) == "omp"))
-    });
+    let is_omp = batches
+        .iter()
+        .any(|b| scol(b, "harness").is_some_and(|a| (0..b.num_rows()).any(|i| a.value(i) == "omp")));
     if is_omp {
         let mut sources = std::collections::BTreeSet::new();
         for batch in &batches {
@@ -745,7 +745,9 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
         );
         for i in 0..batch.num_rows() {
             if is_omp {
-                omp_parents.entry(sval(turn, i)).or_insert_with(|| sval(scol(&batch, "parent_uuid"), i));
+                omp_parents
+                    .entry(sval(turn, i))
+                    .or_insert_with(|| sval(scol(&batch, "parent_uuid"), i));
             }
             rows.push((
                 ival(seq, i),
@@ -769,7 +771,11 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
     if is_omp {
         for turn in &turns {
             if let Some(parent) = omp_parents.get(&turn.turn_uuid) {
-                note.push_str(&format!("Indexed entry {} parent={}.\n", turn.turn_uuid, if parent.is_empty() { "root/unknown" } else { parent }));
+                note.push_str(&format!(
+                    "Indexed entry {} parent={}.\n",
+                    turn.turn_uuid,
+                    if parent.is_empty() { "root/unknown" } else { parent }
+                ));
             }
         }
         let ids: Vec<&str> = turns.iter().map(|t| t.turn_uuid.as_str()).collect();
