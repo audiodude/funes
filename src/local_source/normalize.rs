@@ -367,6 +367,7 @@ struct Event {
     complete: bool,
     invalid: bool,
     confirmation: String,
+    identity: Value,
 }
 impl Event {
     fn new(row: &Value, context: &Context) -> Self {
@@ -386,6 +387,7 @@ impl Event {
             complete: false,
             invalid: false,
             confirmation: String::new(),
+            identity: Value::Null,
         }
     }
 }
@@ -665,6 +667,7 @@ struct Reference {
     offset: u64,
     length: usize,
     hash: String,
+    identity: Value,
 }
 #[derive(Serialize, Deserialize)]
 struct Boundary {
@@ -897,6 +900,7 @@ fn finish(
             return Err("unknown_branch_lineage".into());
         }
         let mut item = json!({"id":digest(format!("{harness}:{session}:{}", reference.id)),"message_id":reference.id,"role":if reference.user {"user"} else {"assistant"},"time":reference.time});
+        item["identity"] = reference.identity.clone();
         if include_text && !oversized {
             item["text"] = Value::String(reread_text(stream, &reference, harness)?);
         }
@@ -1026,14 +1030,23 @@ pub fn parse_page(
         } else {
             row.get("uuid").or_else(|| row.get("id"))
         };
+        let raw_record_digest = if native.filter(|value| !value.is_null()).is_none()
+            || matches!(event.role, Role::User | Role::Assistant | Role::Candidate)
+        {
+            raw_digest(&raw)
+        } else {
+            String::new()
+        };
         event.id = match native.filter(|value| !value.is_null()) {
             Some(native) => py_string(native),
             None => digest(format!(
                 "{session_string}:{}:{record_index}:{}",
                 context.turn.as_deref().unwrap_or(""),
-                raw_digest(&raw)
+                raw_record_digest
             )),
         };
+        event.identity = json!({"native_id":native,"record_index":record_index,
+            "turn_context":context.turn.as_deref().unwrap_or(""),"raw_record_digest":raw_record_digest});
         record_index = record_index.checked_add(1).ok_or("source_capacity")?;
         let node_key = format!("{session_string}:{}", event.id);
         let mut turn = if linked {
@@ -1115,6 +1128,7 @@ pub fn parse_page(
                         offset: text_offset,
                         length: text_length,
                         hash: text_hash,
+                        identity: event.identity.clone(),
                     },
                 )?);
             }
