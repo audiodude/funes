@@ -150,7 +150,7 @@ fn execute(input: &[u8]) -> Result<Value> {
             "identity": "actomasto-v1", "harnesses": {
                 "claude": "claude-schema2", "codex": "codex-0.144.1-schema1", "omp": "omp-session3-schema1"
             }, "local_only": true, "metadata_only": true,
-            "revision_bound": true, "snapshot_enumeration": true
+            "revision_bound": true, "snapshot_enumeration": true, "coverage_freshness": true
         }));
     }
     if request.op == "refresh" {
@@ -380,7 +380,7 @@ fn open_inventory(corpus: &Path, writable: bool) -> Result<Connection> {
         let instance = random_id()?;
         connection.execute_batch("PRAGMA journal_mode=DELETE; BEGIN IMMEDIATE;
             CREATE TABLE metadata (instance TEXT NOT NULL);
-            CREATE TABLE snapshots (sequence INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL);
+            CREATE TABLE snapshots (sequence INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, refreshed_at REAL NOT NULL);
             CREATE TABLE sources (snapshot TEXT NOT NULL, id TEXT NOT NULL, harness TEXT NOT NULL, locator TEXT NOT NULL,
                 revision TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(snapshot,id));
             CREATE INDEX source_lookup ON sources(id,snapshot);
@@ -573,10 +573,14 @@ fn refresh(corpus: &Path, scope: &Scope) -> Result<Value> {
         }
     }
     let snapshot = random_id()?;
+    let refreshed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "source_unavailable")?
+        .as_secs_f64();
     transaction
         .execute(
-            "INSERT INTO snapshots(id,scope) VALUES (?,?)",
-            params![snapshot, scope.id],
+            "INSERT INTO snapshots(id,scope,refreshed_at) VALUES (?,?,?)",
+            params![snapshot, scope.id, refreshed_at],
         )
         .map_err(|_| "source_unavailable")?;
     {
@@ -692,8 +696,26 @@ fn enumerate(connection: &Connection, scope: &Scope, request: &Request) -> Resul
         None
     };
     verify_scope(scope)?;
+    let refreshed_at: f64 = connection
+        .query_row(
+            "SELECT refreshed_at FROM snapshots WHERE scope=? ORDER BY sequence DESC LIMIT 1",
+            [&scope.id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "coverage_unavailable")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "source_unavailable")?
+        .as_secs_f64();
+    let lag_seconds = (now - refreshed_at).max(0.0);
+    let coverage = if now < refreshed_at || lag_seconds > 300.0 {
+        "lagging"
+    } else {
+        "current"
+    };
     Ok(
-        json!({"snapshot": cursor.snapshot, "scope_id": scope.id, "sources": sources, "next_cursor": next_cursor, "coverage": "current"}),
+        json!({"snapshot": cursor.snapshot, "scope_id": scope.id, "sources": sources, "next_cursor": next_cursor,
+               "coverage": coverage, "refreshed_at": refreshed_at, "lag_seconds": lag_seconds}),
     )
 }
 

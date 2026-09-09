@@ -222,21 +222,38 @@ const INJECTED: &[&str] = &[
     "command-name",
     "command-args",
 ];
-fn opening_end(lower: &str, start: usize, tag: &str) -> Option<usize> {
-    let rest = lower.get(start + 1..)?;
-    if !rest.starts_with(tag) {
-        return None;
+// Python re.IGNORECASE matches these four non-ASCII characters against ASCII
+// letters. Preserve its framing contract without changing original byte offsets.
+fn prefix_ignorecase(text: &str, pattern: &str) -> Option<usize> {
+    let mut actual = text.char_indices();
+    let mut end = 0;
+    for expected in pattern.chars() {
+        let (offset, character) = actual.next()?;
+        let folded = match character {
+            'İ' | 'ı' => 'i',
+            'ſ' => 's',
+            'K' => 'k',
+            other => other.to_ascii_lowercase(),
+        };
+        if folded != expected.to_ascii_lowercase() {
+            return None;
+        }
+        end = offset + character.len_utf8();
     }
-    let suffix = &rest[tag.len()..];
+    Some(end)
+}
+fn opening_end(text: &str, start: usize, tag: &str) -> Option<usize> {
+    let rest = text.get(start + 1..)?;
+    let length = prefix_ignorecase(rest, tag)?;
+    let suffix = &rest[length..];
     match suffix.chars().next()? {
-        '>' => Some(start + tag.len() + 2),
-        c if whitespace(c) => suffix.find('>').map(|end| start + tag.len() + 2 + end),
+        '>' => Some(start + length + 2),
+        c if whitespace(c) => suffix.find('>').map(|end| start + length + 2 + end),
         _ => None,
     }
 }
 fn strip_framing(text: String) -> String {
-    let lower = text.to_ascii_lowercase();
-    let leading = lower.trim_start_matches(whitespace);
+    let leading = text.trim_start_matches(whitespace);
     if [
         "# agents.md instructions for ",
         "[request interrupted by user",
@@ -246,19 +263,21 @@ fn strip_framing(text: String) -> String {
         "<environment_context>",
     ]
     .iter()
-    .any(|s| leading.starts_with(s))
+    .any(|s| prefix_ignorecase(leading, s).is_some())
     {
         return String::new();
     }
     let mut result = String::with_capacity(text.len());
     let mut copied = 0;
     let mut scan = 0;
-    while let Some(relative) = lower[scan..].find('<') {
+    while let Some(relative) = text[scan..].find('<') {
         let start = scan + relative;
         let matched = INJECTED.iter().find_map(|tag| {
-            let end = opening_end(&lower, start, tag)?;
+            let end = opening_end(&text, start, tag)?;
             let close = format!("</{tag}>");
-            lower[end..].find(&close).map(|position| end + position + close.len())
+            text[end..].match_indices('<').find_map(|(position, _)| {
+                prefix_ignorecase(&text[end + position..], &close).map(|length| end + position + length)
+            })
         });
         if let Some(end) = matched {
             result.push_str(&text[copied..start]);
@@ -269,8 +288,7 @@ fn strip_framing(text: String) -> String {
         }
     }
     result.push_str(&text[copied..]);
-    let lower = result.to_ascii_lowercase();
-    for (start, _) in lower.match_indices('<') {
+    for (start, _) in result.match_indices('<') {
         for tag in [
             "system-reminder",
             "system-directive",
@@ -278,9 +296,9 @@ fn strip_framing(text: String) -> String {
             "subagent_notification",
             "task-notification",
         ] {
-            let rest = &lower[start + 1..];
-            if let Some(suffix) = rest.strip_prefix(tag) {
-                if suffix.chars().next().is_some_and(|c| c == '>' || whitespace(c)) {
+            let rest = &result[start + 1..];
+            if let Some(length) = prefix_ignorecase(rest, tag) {
+                if rest[length..].chars().next().is_some_and(|c| c == '>' || whitespace(c)) {
                     return String::new();
                 }
             }
