@@ -708,7 +708,12 @@ fn enumerate(connection: &Connection, scope: &Scope, request: &Request) -> Resul
         .map_err(|_| "source_unavailable")?
         .as_secs_f64();
     let lag_seconds = (now - refreshed_at).max(0.0);
-    let coverage = if now < refreshed_at || lag_seconds > 300.0 {
+    let unavailable = scope.roots.iter().any(|(harness, root)| {
+        request.harness.as_ref().is_none_or(|requested| requested == harness) && std::fs::read_dir(root).is_err()
+    });
+    let coverage = if unavailable {
+        "unavailable"
+    } else if now < refreshed_at || lag_seconds > 300.0 {
         "lagging"
     } else {
         "current"

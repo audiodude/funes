@@ -24,6 +24,8 @@ Every request scans its revision-bound original in bounded records; turn paginat
 
 Coverage reports `refreshed_at` (epoch seconds) and `lag_seconds` for the latest independently refreshed inventory. More than 300 seconds without refresh, or a backwards wall clock, reports `coverage:"lagging"` rather than claiming no activity. Source capabilities explicitly include `coverage_freshness:true`. Consumers pause affected conversation work on lag while Git continues. Refresh at least once per minute for normal operation; no active agent session is required.
 
+An enrolled root that is missing or unreadable reports `coverage:"unavailable"` for its harness, not successful empty activity; restoring the root and independently refreshing recovers it. Empty enrollment arrays intentionally enroll nothing. Missing originals remain visible as tombstones until restored or an independently rebuilt corpus replaces the inventory; rebuilding never resets Actomasto's own terminal markers.
+
 ## Legacy identity and normalization
 
 Unit ID is SHA256 of UTF-8 `client:session:user-message-id`; item ID is SHA256 of UTF-8 `client:session:message-id`. Native identifiers and session IDs are original strings. Without a native ID, use SHA256 of UTF-8 `session:turn-context:record-index:raw-record-digest`; raw-record-digest is SHA256 of UTF-8 lowercase hex of original bytes INCLUDING newline. Record index is zero-based, counting complete parsed records, parser context after the record; absent turn-context is empty string. Never normalize JSON before hashing. Metadata preserves native/fallback message IDs for legacy adapter-unit marker continuity. Source IDs/revisions are independent and never used as conversation identities.
