@@ -13,6 +13,7 @@ pub enum Harness {
     Claude,
     Codex,
     Pi,
+    Omp,
     Hermes,
 }
 
@@ -31,31 +32,34 @@ impl Harness {
             Harness::Claude => "claude_code",
             Harness::Codex => "codex",
             Harness::Pi => "pi",
+            Harness::Omp => "omp",
             Harness::Hermes => "hermes",
         }
     }
 
     /// The `--harness` spelling `index` accepts and shows in `--help`
-    /// (`claude`/`codex`/`pi`/`hermes`). Differs from [`Harness::as_str`], the stored facet, only
+    /// (`claude`/`codex`/`pi`/`omp`/`hermes`). Differs from [`Harness::as_str`], the stored facet, only
     /// for Claude (facet `claude_code`).
     pub fn cli_name(&self) -> &'static str {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
             Harness::Pi => "pi",
+            Harness::Omp => "omp",
             Harness::Hermes => "hermes",
         }
     }
 
-    /// Parse a `--harness` override: `claude`/`claude_code`, `codex`, `pi`, or `hermes`.
+    /// Parse an explicit harness override. OMP is never automatically enrolled.
     pub fn parse(s: &str) -> Result<Harness> {
         match s {
             "claude" | "claude_code" => Ok(Harness::Claude),
             "codex" => Ok(Harness::Codex),
             "pi" => Ok(Harness::Pi),
+            "omp" => Ok(Harness::Omp),
             "hermes" => Ok(Harness::Hermes),
             other => Err(anyhow!(
-                "unknown harness {other:?} (expected claude, codex, pi, or hermes)"
+                "unknown harness {other:?} (expected claude, codex, pi, omp, or hermes)"
             )),
         }
     }

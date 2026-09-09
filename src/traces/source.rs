@@ -13,12 +13,15 @@ use super::codex;
 use super::harness::Harness;
 use super::hermes;
 use super::jsonl;
+use super::omp;
 use super::parquet;
 use super::pi;
 use super::Turn;
 use crate::hub;
 
 use anyhow::{Context, Result};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
@@ -45,6 +48,19 @@ pub trait TraceSource {
 
     /// Parse one unit into turns (each [`Turn`] already carries its `session_id` and `workdir`).
     fn read(&self, unit: &Unit) -> Result<Vec<Turn>>;
+
+    fn is_omp(&self) -> bool {
+        false
+    }
+
+    fn omp_coverage(&self, _unit: &Unit) -> Option<omp::Coverage> {
+        None
+    }
+
+    /// Dependencies can change without changing the unit's own shared stat signature.
+    fn dependencies_current(&self, _unit: &Unit) -> bool {
+        true
+    }
 
     /// Whether a `read` error aborts the whole index. Best-effort sources (a JSONL tree, where one
     /// unreadable file shouldn't sink the run) return `false`; a single-artifact source (a parquet
@@ -94,6 +110,7 @@ pub fn open_with_harness(path: &Path, limit: Option<usize>, harness: Option<Harn
             limit,
             harness,
             listing: OnceLock::new(),
+            omp_coverage: RefCell::new(HashMap::new()),
         })
     }
 }
@@ -144,6 +161,7 @@ struct JsonlTree {
     limit: Option<usize>,
     harness: Harness,
     listing: OnceLock<Vec<PathBuf>>,
+    omp_coverage: RefCell<HashMap<String, omp::Coverage>>,
 }
 
 impl JsonlTree {
@@ -176,7 +194,11 @@ impl TraceSource for JsonlTree {
             .into_iter()
             .map(|p| Unit {
                 is_subagent: jsonl::is_subagent(&jsonl::session_id_of(&p)),
-                signature: file_sig(&p),
+                signature: if self.harness == Harness::Omp {
+                    omp::file_signature(&p).ok()
+                } else {
+                    file_sig(&p)
+                },
                 key: p.to_string_lossy().into_owned(),
             })
             .collect();
@@ -197,6 +219,22 @@ impl TraceSource for JsonlTree {
             .collect())
     }
 
+    fn is_omp(&self) -> bool {
+        self.harness == Harness::Omp
+    }
+
+    fn fatal_on_read_error(&self) -> bool {
+        self.is_omp()
+    }
+
+    fn omp_coverage(&self, unit: &Unit) -> Option<omp::Coverage> {
+        self.omp_coverage.borrow().get(&unit.key).cloned()
+    }
+
+    fn dependencies_current(&self, unit: &Unit) -> bool {
+        !self.is_omp() || omp::dependencies_current(Path::new(&unit.key))
+    }
+
     fn read(&self, unit: &Unit) -> Result<Vec<Turn>> {
         let p = Path::new(&unit.key);
         // Each parser derives the workdir facet from the session's recorded cwd; the path-derived
@@ -206,6 +244,11 @@ impl TraceSource for JsonlTree {
             Harness::Claude => claude::turns_from_jsonl_file(p, &jsonl::session_id_of(p), &fallback)?,
             Harness::Codex => codex::turns_from_jsonl_file(p, &fallback)?,
             Harness::Pi => pi::turns_from_jsonl_file(p, &jsonl::session_id_of(p), &fallback)?,
+            Harness::Omp => {
+                let (turns, coverage) = omp::read(p, &fallback)?;
+                self.omp_coverage.borrow_mut().insert(unit.key.clone(), coverage);
+                turns
+            }
             // hermes keeps its sessions in a SQLite state.db, not a JSONL tree, so it's read by a
             // dedicated source and never reaches here.
             Harness::Hermes => anyhow::bail!("hermes sessions are read from state.db, not a JSONL tree"),

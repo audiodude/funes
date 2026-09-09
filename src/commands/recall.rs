@@ -451,6 +451,17 @@ pub async fn recall_hits(
         attach_neighbors(ds, &mut refs, neighbors).await?;
     }
 
+    let mut note = note;
+    let mut omp_sessions: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (hit, _) in &top {
+        if hit.harness == "omp" {
+            omp_sessions.entry(&hit.session_id).or_default().push(&hit.turn_uuid);
+        }
+    }
+    for (session_id, turn_ids) in omp_sessions {
+        note.push_str(&crate::traces::omp::provenance_note(session_id, &turn_ids));
+    }
+
     Ok((note, read.memory_label.clone(), top))
 }
 
@@ -691,15 +702,35 @@ pub async fn get(memory: Memory, session_id: String, range: TurnRange) -> Result
 /// degradation note, the turns — empty when the range holds none — and the session's turn count.
 pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> Result<(String, Vec<Turn>, usize)> {
     let read = open_read(&memory).await?;
-    let note = read.note.clone().unwrap_or_default();
+    let mut note = read.note.clone().unwrap_or_default();
     let ds = &read.ds;
 
-    let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
+    let mut cols = vec!["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
+    for col in ["harness", "source_path", "parent_uuid"] {
+        if has_col(ds, col) {
+            cols.push(col);
+        }
+    }
     let filter = format!("session_id = '{}'", esc(&session_id));
     let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
+    let is_omp = batches.iter().any(|b| {
+        scol(b, "harness").is_some_and(|a| (0..b.num_rows()).any(|i| a.value(i) == "omp"))
+    });
+    if is_omp {
+        let mut sources = std::collections::BTreeSet::new();
+        for batch in &batches {
+            if let Some(paths) = scol(batch, "source_path") {
+                for i in 0..batch.num_rows() {
+                    sources.insert(paths.value(i).to_owned());
+                }
+            }
+        }
+        note.push_str(&format!("Indexed OMP source paths: {sources:?}.\n"));
+    }
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
+    let mut omp_parents = HashMap::new();
     for batch in batches {
         let (turn, ts, role, text) = (
             scol(&batch, "turn_uuid"),
@@ -713,6 +744,9 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
             icol(&batch, "split_idx"),
         );
         for i in 0..batch.num_rows() {
+            if is_omp {
+                omp_parents.entry(sval(turn, i)).or_insert_with(|| sval(scol(&batch, "parent_uuid"), i));
+            }
             rows.push((
                 ival(seq, i),
                 sval(turn, i),
@@ -731,7 +765,17 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
         .unwrap_or_else(|| rows.iter().map(|r| r.0).min().unwrap_or(0));
     let to = range.to.unwrap_or(from + DEFAULT_SPAN - 1);
     let kept = rows.iter().filter(|r| r.0 >= from && r.0 <= to);
-    Ok((note, turns_from_rows(kept), total))
+    let turns = turns_from_rows(kept);
+    if is_omp {
+        for turn in &turns {
+            if let Some(parent) = omp_parents.get(&turn.turn_uuid) {
+                note.push_str(&format!("Indexed entry {} parent={}.\n", turn.turn_uuid, if parent.is_empty() { "root/unknown" } else { parent }));
+            }
+        }
+        let ids: Vec<&str> = turns.iter().map(|t| t.turn_uuid.as_str()).collect();
+        note.push_str(&crate::traces::omp::provenance_note(&session_id, &ids));
+    }
+    Ok((note, turns, total))
 }
 
 /// What narrows a listing.

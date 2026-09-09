@@ -10,6 +10,7 @@ pub mod codex;
 pub mod harness;
 pub mod hermes;
 pub mod jsonl;
+pub mod omp;
 pub mod parquet;
 pub mod pi;
 pub mod repo;
@@ -32,6 +33,6 @@ pub struct Turn {
     pub role: String,
     pub blocks: Vec<Block>,
     pub source_path: String,
-    /// Which coding agent produced this session: `claude_code` | `codex` | `pi` | `hermes`.
+    /// Which coding agent produced this session: `claude_code` | `codex` | `pi` | `omp` | `hermes`.
     pub harness: String,
 }
