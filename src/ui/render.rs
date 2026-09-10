@@ -18,23 +18,41 @@ fn hint_range(seq: i64) -> String {
 
 /// The agent `recall` format: provenance header with score, a `→ get` line carrying `memory_arg`
 /// (the pre-rendered ` --memory <label>` suffix, empty for the built-in guide), the full chunk
-/// text, and truncated neighbor lines per hit. The chunk is never clipped — the ranking scored
+/// text, and neighbor lines per hit (unclipped for OMP). The chunk is never clipped — the ranking scored
 /// all of it, so a preview could hide exactly the span that made it a hit; the chunker's size
 /// cap bounds the payload instead. Byte-stable — the layout is a published contract.
 pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String {
     let mut out = note.to_string();
     for (h, score) in hits {
-        let s8 = &h.session_id[..h.session_id.len().min(8)];
+        let is_omp = h.harness == "omp";
+        // UUIDv7 timestamp prefixes collide across OMP sessions; headings must distinguish them.
+        let display_id = if is_omp {
+            h.session_id.as_str()
+        } else {
+            &h.session_id[..h.session_id.len().min(8)]
+        };
         let _ = writeln!(
             out,
             "[{}] {} {}/{} {}  score={:.3}",
-            h.ts, h.harness, h.workdir, s8, h.block_type, score
+            h.ts, h.harness, h.workdir, display_id, h.block_type, score
         );
         let _ = writeln!(out, "  → get {}{}{}", h.session_id, hint_range(h.seq), memory_arg);
+        if is_omp {
+            let _ = writeln!(out, "[Archived statement, NOT a verified outcome. Citation: [session {}, seq {}, turn {}]. Current applicability and supersession are unknown.]", h.session_id, h.seq, h.turn_uuid);
+        }
         let _ = writeln!(out, "{}", h.text);
         for n in &h.neighbors {
-            let np: String = n.text.chars().take(160).collect();
-            let _ = writeln!(out, "  ~ [{} {} seq{}] {}", n.role, n.block_type, n.seq, np);
+            if is_omp {
+                // A clipped neighbor can omit the caveat that qualifies its reported outcome.
+                let _ = writeln!(
+                    out,
+                    "  ~ [{} {} seq{}] [session {}, seq {}] [Archived statement, not independent verification] {}",
+                    n.role, n.block_type, n.seq, h.session_id, n.seq, n.text
+                );
+            } else {
+                let np: String = n.text.chars().take(160).collect();
+                let _ = writeln!(out, "  ~ [{} {} seq{}] {}", n.role, n.block_type, n.seq, np);
+            }
         }
         let _ = writeln!(out, "---");
     }
@@ -330,6 +348,40 @@ mod tests {
         assert!(out.starts_with("remote down\n[bad-ts]"));
         // The matched chunk is never clipped.
         assert!(out.contains(&long));
+    }
+
+    #[test]
+    fn omp_neighbor_preserves_late_qualifiers_verbatim() {
+        let text = format!(
+            "{} Current tests still require inspection; this is only a reported conclusion.",
+            "A historical claim. ".repeat(12)
+        );
+        let mut h = hit("2026-09-06", "text", "The accepted storage decision.");
+        h.harness = "omp".into();
+        h.neighbors.push(Neighbor {
+            seq: 8,
+            role: "assistant".into(),
+            block_type: "text".into(),
+            text: text.clone(),
+        });
+        let out = recall_agent("", "", &[(h, 1.0)]);
+        assert!(out.contains(&text), "OMP neighbor omitted the qualifier: {out}");
+    }
+
+    #[test]
+    fn omp_headings_distinguish_sessions_with_shared_uuidv7_prefixes() {
+        let heading = |id: &str| {
+            let mut h = hit("2026-09-06", "text", "A recorded decision.");
+            h.harness = "omp".into();
+            h.session_id = id.into();
+            let out = recall_agent("", "", &[(h, 1.0)]);
+            out.lines().next().unwrap().to_owned()
+        };
+        assert_ne!(
+            heading("01990000-0000-7000-8000-000000000001"),
+            heading("01990000-0000-7000-8000-000000000002"),
+            "Distinct OMP sessions must not have indistinguishable source headings"
+        );
     }
 
     #[test]

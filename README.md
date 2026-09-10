@@ -5,6 +5,11 @@ Code, Codex, pi, and Hermes and lets any agent recall the past decisions, ration
 Your memory is a dataset you can publish to the Hugging Face Hub — then any machine, teammate, or
 agent can recall from it.
 
+This maintained fork also provides the local-only [`funes source` protocol](docs/local-source.md)
+for metadata-first, revision-bound reads of original Claude Code, Codex, and OMP turns.
+Actomasto and the OMP bridge select the committed fork revision documented there.
+The upstream installer and `funes update` instructions below do not install that pinned fork build.
+
 ![Asking a published memory why funes is append-only; funes recalls the relevant sessions and a coding agent answers, grounded, naming its sources](docs/img/ask.gif)
 
 *Put a question to a memory and borrow a coding agent to answer it: funes recalls the relevant sessions, hands them over, and you get one grounded answer that names the sessions it drew from — nothing installed. Here it reads the public `huggingface/funes-memory` dataset named right in the command.*

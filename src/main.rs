@@ -28,6 +28,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read the local-only, revision-bound source protocol from stdin.
+    Source,
     /// Recall passages from past sessions (hybrid → rerank → recency → neighbors).
     Recall {
         /// What to recall (free text).
@@ -48,7 +50,7 @@ enum Cmd {
         /// Restrict to a block type: text | thinking | tool_use | tool_result.
         #[arg(long = "type", value_name = "BLOCK_TYPE")]
         block_type: Option<String>,
-        /// Restrict to a harness: claude | codex | pi | hermes.
+        /// Restrict to a harness: claude | codex | pi | hermes | omp.
         #[arg(long)]
         harness: Option<String>,
         #[command(flatten)]
@@ -87,7 +89,7 @@ enum Cmd {
         /// ~/.pi/agent/sessions); `--harness <name>` alone targets one. An automated (non-terminal)
         /// run must name a target.
         path: Option<String>,
-        /// Override harness auto-detection for PATH: claude | codex | pi | hermes.
+        /// Override harness auto-detection: claude | codex | pi | hermes | omp (explicit local PATH only).
         #[arg(long)]
         harness: Option<String>,
         /// Exclude thinking blocks.
@@ -100,6 +102,9 @@ enum Cmd {
         /// an explicit path skips the first-index size confirmation.
         #[arg(long)]
         yes: bool,
+        /// Limit new chunks embedded this invocation (positive; explicit --harness omp only).
+        #[arg(long)]
+        omp_max_chunks: Option<usize>,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -321,8 +326,34 @@ impl MemoryOpts {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    match Cli::parse().cmd {
+async fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    if matches!(&cli.cmd, Cmd::Source) {
+        return funes::local_source::stdio();
+    }
+    let omp_index = matches!(&cli.cmd, Cmd::Index { harness: Some(h), .. } if h == "omp");
+    match run(cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) if e.downcast_ref::<index::IndexBusy>().is_some() => {
+            eprintln!("funes: memory writer busy; retry later");
+            std::process::ExitCode::from(75)
+        }
+        Err(e) => {
+            if omp_index {
+                // Native parser/scanner errors can contain source text; bridge status uses the
+                // exit and Funes-owned receipts, never an error transcript.
+                eprintln!("funes: OMP index failed; coverage remains incomplete");
+            } else {
+                eprintln!("Error: {e:#}");
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    match cli.cmd {
+        Cmd::Source => unreachable!("source is handled before search command dispatch"),
         Cmd::Recall {
             query,
             k,
@@ -423,8 +454,19 @@ async fn main() -> Result<()> {
             no_thinking,
             limit,
             yes,
+            omp_max_chunks,
         } => {
             let harness = harness.map(|h| Harness::parse(&h)).transpose()?;
+            if harness == Some(Harness::Omp) {
+                anyhow::ensure!(
+                    path.as_ref().is_some_and(|p| PathBuf::from(p).exists()),
+                    "--harness omp requires an explicit existing local path"
+                );
+            }
+            anyhow::ensure!(
+                omp_max_chunks.is_none() || (omp_max_chunks != Some(0) && harness == Some(Harness::Omp)),
+                "--omp-max-chunks requires positive N and explicit --harness omp"
+            );
             // A harness-dirs refresh (no explicit path — the per-turn hook and the terminal "keep
             // me fresh" case) is budgeted and text-first; an explicit path or Hub repo is indexed
             // in full.
@@ -480,7 +522,7 @@ async fn main() -> Result<()> {
             if budgeted {
                 index::run_index_budgeted(&roots, no_thinking, limit, yes).await
             } else {
-                index::run_index_roots(&roots, no_thinking, limit, yes).await
+                index::run_index_roots(&roots, no_thinking, limit, yes, omp_max_chunks).await
             }
         }
         Cmd::Status { memory } => {

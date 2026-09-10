@@ -10,13 +10,15 @@
 use crate::chunk::{self, Tier};
 use crate::hub;
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, schema, MODEL};
+use crate::memory::dataset::{self, build_batch, schema};
 use crate::memory::lock;
+use crate::memory::{Memory, MemoryState};
 use crate::scan;
 use crate::traces::harness::Harness;
-use crate::traces::{self, repo, source};
-use anyhow::{anyhow, Context, Result};
+use crate::traces::{self, omp, repo, source};
+use anyhow::{Context, Result};
 use arrow_array::{Array, RecordBatchIterator, StringArray};
+use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteParams};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -24,6 +26,18 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Stable, typed contention result for unattended writers (EX_TEMPFAIL).
+#[derive(Debug)]
+pub struct IndexBusy;
+
+impl std::fmt::Display for IndexBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another funes memory operation is in progress; retry later")
+    }
+}
+
+impl std::error::Error for IndexBusy {}
 
 /// Take the memory lock. An interactive caller (a human at `funes index`/`funes add`) waits out a
 /// brief contention — up to 3 retries, 5s apart — since a memory operation rarely runs long; an
@@ -42,9 +56,7 @@ async fn acquire_lock(interactive: bool) -> Result<lock::MemoryLock> {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
-    Err(anyhow!(
-        "another funes memory operation is in progress; retry in a moment"
-    ))
+    Err(IndexBusy.into())
 }
 
 /// Every chunk id already stored. Re-indexing keeps only the chunks whose id isn't here, so a grown
@@ -154,6 +166,129 @@ fn unit_current(entry: Option<&UnitState>, sig: &str, target: Tier) -> bool {
     entry.is_some_and(|e| e.sig == sig && e.level >= target)
 }
 
+const OMP_POLICY: &str = "omp-text-graph-v2";
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ScannerState {
+    Scanned,
+    Unavailable,
+    Failed,
+    Mixed,
+}
+
+fn merge_scanner(previous: ScannerState, current: ScannerState) -> ScannerState {
+    if previous == current {
+        previous
+    } else {
+        ScannerState::Mixed
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct OmpReceipt {
+    #[serde(flatten)]
+    coverage: omp::Coverage,
+    scanner: ScannerState,
+    indexed_at: String,
+    chunks: usize,
+    policy: String,
+}
+
+/// A scanner becoming available does not retroactively scan already-retained rows. Missing
+/// receipts or mismatched counts mean an interrupted/foreign write: never infer sanitization.
+fn retained_scanner(
+    previous: Option<&OmpReceipt>,
+    prior_chunks: usize,
+    current: ScannerState,
+    added: u64,
+) -> ScannerState {
+    if prior_chunks == 0 {
+        return current;
+    }
+    let prior = match previous {
+        Some(r) if r.chunks == prior_chunks => r.scanner,
+        _ => ScannerState::Mixed,
+    };
+    if added == 0 && current == ScannerState::Scanned {
+        prior
+    } else {
+        merge_scanner(prior, current)
+    }
+}
+
+async fn source_chunk_count(ds: &Dataset, key: &str) -> Result<usize> {
+    let filter = format!("source_path = '{}' AND harness = 'omp'", key.replace('\'', "''"));
+    // Read the actual searchable payload, not only manifest row statistics.
+    let mut scan = ds.scan();
+    scan.project(&["id", "text", "vector"])?;
+    scan.filter(&filter)?;
+    let mut stream = scan.try_into_stream().await?;
+    let mut rows = 0;
+    while let Some(batch) = stream.try_next().await? {
+        rows += batch.num_rows();
+    }
+    Ok(rows)
+}
+
+#[derive(Deserialize, Serialize)]
+struct OmpReceipts {
+    version: u32,
+    units: HashMap<String, OmpReceipt>,
+}
+
+impl Default for OmpReceipts {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            units: HashMap::new(),
+        }
+    }
+}
+
+fn read_omp_receipts(path: &Path) -> Result<OmpReceipts> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let receipts: OmpReceipts = serde_json::from_slice(&bytes).context("invalid OMP coverage receipt file")?;
+            anyhow::ensure!(receipts.version == 1, "unsupported OMP coverage receipt version");
+            Ok(receipts)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(OmpReceipts::default()),
+        Err(e) => Err(e).context("reading OMP coverage receipts"),
+    }
+}
+
+/// Same-directory replacement under the existing memory lock. Sync both the file and its
+/// directory: neither a killed writer nor a crash can expose a partially serialized checkpoint.
+fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path.parent().context("checkpoint has no parent directory")?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(file.as_file_mut(), value)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn receipt_current(receipt: Option<&OmpReceipt>, signature: &str) -> bool {
+    receipt.is_some_and(|r| r.policy == OMP_POLICY && r.coverage.complete && r.coverage.signature == signature)
+}
+
+fn mark_incomplete(coverage: &mut omp::Coverage, issue: &str) {
+    coverage.complete = false;
+    if !coverage.issues.iter().any(|i| i == issue) {
+        coverage.issues.push(issue.to_string());
+    }
+}
+
+fn writable_dataset(state: MemoryState) -> Result<Option<Dataset>> {
+    match state {
+        MemoryState::Ready(ds) => Ok(Some(ds)),
+        MemoryState::Empty => Ok(None),
+        _ => anyhow::bail!("local memory is unavailable"),
+    }
+}
+
 /// Lightweight coverage snapshot written by indexing runs for `status` to read without walking
 /// the transcript trees again.
 #[derive(Serialize, Deserialize, Default)]
@@ -207,8 +342,7 @@ fn read_index_coverage(path: &Path) -> IndexCoverageSnapshot {
 }
 
 fn write_snapshot(path: &Path, snapshot: &IndexCoverageSnapshot) -> Result<()> {
-    std::fs::write(path, serde_json::to_string(snapshot)?)
-        .with_context(|| format!("writing index coverage at {}", path.display()))
+    atomic_json(path, snapshot).context("writing index coverage")
 }
 
 fn write_index_coverage(
@@ -254,6 +388,10 @@ struct Indexer {
     state: HashMap<String, UnitState>,
     state_path: PathBuf,
     coverage_path: PathBuf,
+    omp_receipts: OmpReceipts,
+    omp_receipts_path: PathBuf,
+    omp_pending: HashMap<String, OmpReceipt>,
+    omp_max_chunks: Option<usize>,
     /// The memory didn't exist when this run opened it — the first index.
     first_index: bool,
     /// A human is watching (stdin is a terminal) — probed once here, so every prompt-or-proceed
@@ -317,19 +455,7 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(&dataset::local_memory_dir());
-        let ds = dataset::open(&uri, HashMap::new()).await.ok();
-
-        // Model-pin: refuse to add to a memory built with a different embedding model. The id rides
-        // in the dataset's schema metadata; a pre-metadata memory (no id) is tolerated and guarded
-        // only by the dimension check until it is reindexed.
-        if let Some(ds) = &ds {
-            let schema = arrow_schema::Schema::from(ds.schema());
-            if let Some(em) = schema.metadata().get("embedding_model") {
-                if em != MODEL {
-                    return Err(anyhow!("index built with model {em:?}, refusing to mix with {MODEL:?}"));
-                }
-            }
-        }
+        let ds = writable_dataset(Memory::local().state().await?)?;
 
         let first_index = ds.is_none();
 
@@ -346,6 +472,12 @@ impl Indexer {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
         };
+        let omp_receipts_path = dir.join("omp-coverage.json");
+        let omp_receipts = if first_index || !sources.iter().any(|src| src.is_omp()) {
+            OmpReceipts::default()
+        } else {
+            read_omp_receipts(&omp_receipts_path)?
+        };
 
         let embedder: Box<dyn Embedder> = inference::embedder()?;
         // Best-effort secret redaction: if the scanner isn't installed, indexing continues
@@ -353,8 +485,8 @@ impl Indexer {
         // reach the Hub.
         let scanner = match scan::Trufflehog::find() {
             Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("note: secret redaction disabled — {e}");
+            Err(_) => {
+                eprintln!("note: secret scanner unavailable; local indexing continues unscanned");
                 None
             }
         };
@@ -380,6 +512,10 @@ impl Indexer {
             state,
             state_path,
             coverage_path,
+            omp_receipts,
+            omp_receipts_path,
+            omp_pending: HashMap::new(),
+            omp_max_chunks: None,
             first_index,
             interactive,
             work_remaining: false,
@@ -398,17 +534,27 @@ impl Indexer {
         self.units.len()
     }
 
+    fn current(&self, src_i: usize, unit: &source::Unit, target: Tier) -> bool {
+        let src = &self.sources[src_i];
+        let Some(sig) = &unit.signature else { return false };
+        if !src.dependencies_current(unit) {
+            return false;
+        }
+        if src.is_omp() {
+            receipt_current(self.omp_receipts.units.get(&unit.key), sig)
+        } else {
+            unit_current(self.state.get(&unit.key), sig, target)
+        }
+    }
+
     /// Units still owing work at `tier` — a pure state + signature check, no session read, so a
     /// caller can plan and estimate a run before touching anything. A signature-less (bulk) unit
     /// always counts as pending, as [`Indexer::index_unit`] never skips it.
     fn pending(&self, tier: Tier) -> Vec<usize> {
         (0..self.units.len())
             .filter(|&i| {
-                let unit = &self.units[i].1;
-                match &unit.signature {
-                    Some(sig) => !unit_current(self.state.get(&unit.key), sig, tier),
-                    None => true,
-                }
+                let (src_i, unit) = &self.units[i];
+                !self.current(*src_i, unit, tier)
             })
             .collect()
     }
@@ -434,12 +580,35 @@ impl Indexer {
             (*si, unit.key.clone(), unit.signature.clone())
         };
 
-        if let Some(sig) = &sig {
-            if unit_current(self.state.get(&key), sig, target) {
-                self.n_skipped += 1;
-                return Ok(0);
+        let is_omp = self.sources[src_i].is_omp();
+        if self.current(src_i, &self.units[i].1, target) {
+            if is_omp {
+                let receipt = self.omp_receipts.units[&key].clone();
+                self.omp_pending.insert(key, receipt);
             }
+            self.n_skipped += 1;
+            return Ok(0);
         }
+
+        // Remove the acknowledgement before any potentially durable append. If interrupted,
+        // orphaned rows are rediscovered conservatively as mixed scanner history next run.
+        let previous = if is_omp {
+            let previous = self.omp_receipts.units.remove(&key);
+            atomic_json(&self.omp_receipts_path, &self.omp_receipts)?;
+            self.state.remove(&key);
+            atomic_json(&self.state_path, &self.state)?;
+            previous
+        } else {
+            None
+        };
+        let prior_chunks = if is_omp {
+            match &self.ds {
+                Some(ds) => source_chunk_count(ds, &key).await?,
+                None => 0,
+            }
+        } else {
+            0
+        };
 
         // Best-effort sources retry a failed read next run (no state recorded); a fatal source
         // aborts rather than silently dropping data.
@@ -457,9 +626,18 @@ impl Indexer {
 
         let (sessions, label) = unit_summary(&turns, &key);
         elide_turns(&mut turns);
-        if let Some(scanner) = &self.scanner {
-            redact_turns(&mut turns, scanner, tiers, self.include_thinking)?;
-        }
+        let scanner_state = match &self.scanner {
+            Some(scanner) => match redact_turns(&mut turns, scanner, tiers, self.include_thinking) {
+                Ok(()) => ScannerState::Scanned,
+                Err(_) => {
+                    eprintln!("note: local secret scan failed; indexing continues unscanned");
+                    ScannerState::Failed
+                }
+            },
+            None => ScannerState::Unavailable,
+        };
+        let mut coverage = self.sources[src_i].omp_coverage(&self.units[i].1);
+        anyhow::ensure!(!is_omp || coverage.is_some(), "OMP source returned no coverage");
         let mut chunks = chunk::chunks_from_turns(&turns, tiers, self.include_thinking);
         let repo = self.repo_for(&key);
         if !repo.is_empty() {
@@ -472,7 +650,23 @@ impl Indexer {
             eprintln!("{progress} {label} — no indexable content");
             0
         } else {
-            let new_chunks: Vec<chunk::Chunk> = chunks.into_iter().filter(|c| !self.existing.contains(&c.id)).collect();
+            let mut new_chunks: Vec<chunk::Chunk> =
+                chunks.into_iter().filter(|c| !self.existing.contains(&c.id)).collect();
+            if is_omp {
+                if let Some(budget) = self.omp_max_chunks {
+                    let remaining = budget.saturating_sub(self.n_chunks as usize);
+                    if new_chunks.len() > remaining {
+                        // Newly completed turns win over old backfill within the same source.
+                        // Partition first so a bounded pass does not sort the entire archive.
+                        new_chunks.select_nth_unstable_by_key(remaining, |c| {
+                            std::cmp::Reverse((c.seq, c.block_idx, c.split_idx))
+                        });
+                        new_chunks.truncate(remaining);
+                        new_chunks.sort_unstable_by_key(|c| std::cmp::Reverse((c.seq, c.block_idx, c.split_idx)));
+                        mark_incomplete(coverage.as_mut().expect("OMP coverage"), "chunk-budget");
+                    }
+                }
+            }
             if new_chunks.is_empty() {
                 eprintln!("{progress} {label} — {total_chunks} chunks, all already indexed");
                 0
@@ -484,9 +678,20 @@ impl Indexer {
             }
         };
 
-        // Record state only for signed units, even when they produced no chunks ("remembered when
-        // empty"), and persist after each so an interrupted run is resumable.
-        if let Some(sig) = &sig {
+        if let Some(coverage) = coverage {
+            let scanner = retained_scanner(previous.as_ref(), prior_chunks, scanner_state, added);
+            self.omp_pending.insert(
+                key.clone(),
+                OmpReceipt {
+                    coverage,
+                    scanner,
+                    indexed_at: String::new(),
+                    chunks: prior_chunks + added as usize,
+                    policy: OMP_POLICY.to_string(),
+                },
+            );
+        } else if let Some(sig) = &sig {
+            // Other harnesses retain per-unit resumability, now with an atomic checkpoint.
             self.state.insert(
                 key.clone(),
                 UnitState {
@@ -494,7 +699,7 @@ impl Indexer {
                     level: target,
                 },
             );
-            std::fs::write(&self.state_path, serde_json::to_string_pretty(&self.state)?)?;
+            atomic_json(&self.state_path, &self.state)?;
             write_index_coverage(&self.coverage_path, &self.sources, &self.units, &self.state)?;
         }
         // Count a unit's sessions once per run — later tier passes over it only add chunks.
@@ -524,11 +729,22 @@ impl Indexer {
         let n = new_chunks.len();
         let texts: Vec<&str> = new_chunks.iter().map(|c| c.text.as_str()).collect();
         let t0 = Instant::now();
-        let vectors = embed_batched(self.embedder.as_mut(), &texts, |done| {
+        let progress = |done| {
             let secs = t0.elapsed().as_secs_f64().max(0.001);
             eprint!("\r    embedded {done}/{n}  ({:.0}/s)   ", done as f64 / secs);
             let _ = std::io::stderr().flush();
-        })?;
+        };
+        let vectors = if self.omp_max_chunks.is_some() {
+            // Bound background attention tensors independently of the append budget.
+            let mut vectors = Vec::with_capacity(n);
+            for group in texts.chunks(16) {
+                vectors.extend(self.embedder.embed(group)?);
+                progress(vectors.len());
+            }
+            vectors
+        } else {
+            embed_batched(self.embedder.as_mut(), &texts, progress)?
+        };
         eprintln!(
             "\r    embedded {n} chunks in {:.1}s          ",
             t0.elapsed().as_secs_f64()
@@ -571,6 +787,46 @@ impl Indexer {
                 }
             }
         }
+        if !self.omp_pending.is_empty() {
+            // Reopen as a reader does; never acknowledge an append only visible in our writer
+            // handle. Recall can use brute-force vectors when optional indexes are unavailable.
+            let readable = writable_dataset(Memory::local().state().await?)?;
+            for (key, receipt) in &mut self.omp_pending {
+                let rows = match &readable {
+                    Some(ds) => source_chunk_count(ds, key).await?,
+                    None => 0,
+                };
+                anyhow::ensure!(rows == receipt.chunks, "OMP committed row coverage mismatch");
+                if omp::file_signature(Path::new(key)).ok().as_ref() != Some(&receipt.coverage.signature) {
+                    mark_incomplete(&mut receipt.coverage, "source-changed");
+                }
+                let (src_i, unit) = self
+                    .units
+                    .iter()
+                    .find(|(_, u)| &u.key == key)
+                    .context("OMP receipt source missing")?;
+                if !self.sources[*src_i].dependencies_current(unit) {
+                    mark_incomplete(&mut receipt.coverage, "provenance-changed");
+                }
+                receipt.indexed_at = chrono::Utc::now().to_rfc3339();
+                if receipt.coverage.complete {
+                    self.state.insert(
+                        key.clone(),
+                        UnitState {
+                            sig: receipt.coverage.signature.clone(),
+                            level: *Tier::ALL.iter().max().expect("tiers"),
+                        },
+                    );
+                } else {
+                    self.state.remove(key);
+                    self.work_remaining = true;
+                }
+            }
+            self.omp_receipts.units.extend(self.omp_pending);
+            atomic_json(&self.state_path, &self.state)?;
+            write_index_coverage(&self.coverage_path, &self.sources, &self.units, &self.state)?;
+            atomic_json(&self.omp_receipts_path, &self.omp_receipts)?;
+        }
         println!(
             "{}",
             run_summary(
@@ -606,12 +862,17 @@ pub async fn run_index_roots(
     no_thinking: bool,
     max_sessions: Option<usize>,
     yes: bool,
+    omp_max_chunks: Option<usize>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        omp_max_chunks.is_none() || (omp_max_chunks != Some(0) && roots.iter().all(|(_, h)| *h == Some(Harness::Omp))),
+        "OMP chunk budget requires positive --omp-max-chunks and explicit --harness omp"
+    );
     let sources = roots
         .iter()
         .map(|(path, harness)| source::open_with_harness(path, max_sessions, *harness))
         .collect();
-    index_sources(sources, no_thinking, yes).await
+    index_sources(sources, no_thinking, yes, omp_max_chunks).await
 }
 
 /// Index a Hub trace dataset (`funes index <org/repo>`): resolve its `refs/convert/parquet` shards,
@@ -621,7 +882,7 @@ pub async fn run_index_remote(uri: &str, no_thinking: bool) -> Result<()> {
     let (owner, name, _prefix) = hub::parse_hf(uri)?;
     let src = source::open_remote(&owner, &name, None).await?;
     // A Hub import is an explicit, deliberate command — skip the first-index confirmation.
-    index_sources(vec![src], no_thinking, true).await
+    index_sources(vec![src], no_thinking, true, None).await
 }
 
 /// The wall-clock budget a budgeted run gives itself: it stops at the first whole-session boundary
@@ -672,6 +933,10 @@ pub async fn run_index_seed(root: &Path, harness: Harness) -> Result<()> {
 /// with work left. The owed passes are computed upfront from state alone (no reading), so the plan
 /// and the ETA reflect what this run actually owes.
 async fn run_budgeted(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: bool, finish: Finish) -> Result<()> {
+    anyhow::ensure!(
+        !sources.iter().any(|src| src.is_omp()),
+        "OMP indexing requires an explicit path, not a harness-root sweep"
+    );
     let mut idx = Indexer::open(sources, no_thinking).await?;
 
     let owed: Vec<(Tier, Vec<usize>)> = Tier::ALL
@@ -726,9 +991,15 @@ async fn run_budgeted(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: b
 /// one embedder, `state.json`, and dataset handle across them (state keyed by absolute path /
 /// `hf://…` shard, so incremental works cross-source). On a first interactive index it estimates
 /// the run after the first session and asks before the long haul.
-async fn index_sources(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: bool, yes: bool) -> Result<()> {
+async fn index_sources(
+    sources: Vec<Box<dyn source::TraceSource>>,
+    no_thinking: bool,
+    yes: bool,
+    omp_max_chunks: Option<usize>,
+) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     let mut indexer = Indexer::open(sources, no_thinking).await?;
+    indexer.omp_max_chunks = omp_max_chunks;
     let total = indexer.unit_count();
 
     // Per-source tally. This run indexes every tier, so a unit counts as cached only once it has
@@ -739,10 +1010,7 @@ async fn index_sources(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: 
         let (mut n, mut cached) = (0usize, 0usize);
         for (_, u) in units {
             n += 1;
-            if u.signature
-                .as_ref()
-                .is_some_and(|s| unit_current(indexer.state.get(&u.key), s, target))
-            {
+            if indexer.current(si, u, target) {
                 cached += 1;
             }
         }
@@ -754,6 +1022,13 @@ async fn index_sources(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: 
     let mut probe_pending = indexer.first_index && !yes && interactive;
 
     for i in 0..total {
+        if indexer
+            .omp_max_chunks
+            .is_some_and(|budget| indexer.n_chunks as usize >= budget)
+        {
+            indexer.work_remaining = true;
+            break;
+        }
         // Time from before the read so a first-index estimate covers parse + I/O, not just embedding.
         let t_unit = Instant::now();
         let progress = format!("[{}/{}]", i + 1, total);
@@ -781,7 +1056,7 @@ async fn index_sources(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: 
 /// convenience over [`run_index_roots`] for a single path (tests, benchmarks, one explicit path).
 /// Passes `yes = true`: these callers are non-interactive and must not gate on the first-index prompt.
 pub async fn run_index(path: &Path, no_thinking: bool, max_sessions: Option<usize>) -> Result<()> {
-    run_index_roots(&[(path.to_path_buf(), None)], no_thinking, max_sessions, true).await
+    run_index_roots(&[(path.to_path_buf(), None)], no_thinking, max_sessions, true, None).await
 }
 
 /// A first interactive index estimated at ≥ this many seconds prompts before continuing.
@@ -852,6 +1127,100 @@ fn fmt_eta(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt(scanner: ScannerState) -> OmpReceipt {
+        OmpReceipt {
+            coverage: omp::Coverage {
+                signature: "10:20:30:40".into(),
+                complete: true,
+                issues: vec![],
+                session_id: "session".into(),
+                messages: 2,
+                dependencies: vec![],
+            },
+            scanner,
+            indexed_at: String::new(),
+            chunks: 2,
+            policy: OMP_POLICY.into(),
+        }
+    }
+
+    #[test]
+    fn receipts_require_complete_signature_and_policy() {
+        let mut r = receipt(ScannerState::Scanned);
+        assert!(receipt_current(Some(&r), "10:20:30:40"));
+        assert!(!receipt_current(Some(&r), "10:20:31:40"));
+        mark_incomplete(&mut r.coverage, "chunk-budget");
+        assert!(!receipt_current(Some(&r), "10:20:30:40"));
+        r.coverage.complete = true;
+        r.policy = "old-policy".into();
+        assert!(!receipt_current(Some(&r), "10:20:30:40"));
+    }
+
+    #[test]
+    fn scanner_recovery_cannot_sanitize_retained_history() {
+        let unavailable = receipt(ScannerState::Unavailable);
+        assert_eq!(
+            retained_scanner(Some(&unavailable), 2, ScannerState::Scanned, 0),
+            ScannerState::Unavailable
+        );
+        assert_eq!(
+            retained_scanner(Some(&unavailable), 2, ScannerState::Scanned, 1),
+            ScannerState::Mixed
+        );
+        assert_eq!(retained_scanner(None, 2, ScannerState::Scanned, 1), ScannerState::Mixed);
+        let scanned = receipt(ScannerState::Scanned);
+        assert_eq!(
+            retained_scanner(Some(&scanned), 3, ScannerState::Scanned, 0),
+            ScannerState::Mixed
+        );
+        assert_eq!(
+            retained_scanner(Some(&scanned), 2, ScannerState::Failed, 1),
+            ScannerState::Mixed
+        );
+        assert_eq!(retained_scanner(None, 0, ScannerState::Failed, 1), ScannerState::Failed);
+    }
+
+    #[test]
+    fn atomic_receipts_preserve_other_sources_and_incomplete_obligations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omp-coverage.json");
+        let mut receipts = OmpReceipts::default();
+        receipts.units.insert("/one".into(), receipt(ScannerState::Scanned));
+        atomic_json(&path, &receipts).unwrap();
+        let mut receipts = read_omp_receipts(&path).unwrap();
+        let mut partial = receipt(ScannerState::Unavailable);
+        mark_incomplete(&mut partial.coverage, "source-changed");
+        receipts.units.insert("/two".into(), partial);
+        atomic_json(&path, &receipts).unwrap();
+        let receipts = read_omp_receipts(&path).unwrap();
+        assert!(receipt_current(receipts.units.get("/one"), "10:20:30:40"));
+        assert!(!receipt_current(receipts.units.get("/two"), "10:20:30:40"));
+        assert_eq!(receipts.units["/two"].coverage.issues, ["source-changed"]);
+    }
+
+    #[test]
+    fn corrupt_receipts_are_not_treated_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omp-coverage.json");
+        assert!(read_omp_receipts(&path).unwrap().units.is_empty());
+        std::fs::write(&path, b"{").unwrap();
+        assert!(read_omp_receipts(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn corrupt_existing_memory_is_not_a_first_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join("chunks.lance/_versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        // A full-size but invalid footer exercises Lance's corrupt-manifest error path.
+        // Truncating below its footer length instead triggers an upstream arithmetic panic.
+        std::fs::write(versions.join("1.manifest"), [0u8; 64]).unwrap();
+        let memory = Memory::Local {
+            path: dir.path().to_path_buf(),
+        };
+        assert!(memory.state().await.is_err());
+    }
 
     /// A source whose enumeration yields fixed unit keys, or fails — for `collect_units` tests.
     struct MockSource {
