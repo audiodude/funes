@@ -1,0 +1,38 @@
+{
+  "date": "2026-09-11",
+  "assistance": "OpenAI Codex",
+  "base_revision": "f03735130e19ae9aa5acb671afa84be18782d50e",
+  "changes": {
+    "compatible_lockfile_packages_resolved": 215,
+    "hf_hub": "1.0.0",
+    "lance": "11.0.0",
+    "arrow": "58.4.0",
+    "rmcp": "1.8.0",
+    "source_protocol": 1,
+    "api_adjustment": "Borrow repository IDs for stable hf-hub create/delete repository builders."
+  },
+  "verification": {
+    "cargo_fmt": "passed",
+    "cargo_clippy_locked": "passed with four chunks_exact_to_as_chunks warnings in unchanged inference/normalization code",
+    "cargo_test_locked": {"reported_passed": 316, "failed": 0, "library": 272, "cli": 1, "source_normalization": 15},
+    "cargo_clippy_onnx": "cargo clippy --locked --all-targets --no-default-features --features onnx passed with chunks_exact_to_as_chunks warnings in unchanged normalization code",
+    "actomasto_pytest": {"passed": 210, "failed": 0, "skipped": 0},
+    "native_omp_consumer_smoke": "OMP 18.1.17 synthetic completed turn preserved full text and provenance; aborted turn remained pending; restart produced no replay; ineligible intervals emitted no units."
+  },
+  "build_environment": {
+    "cargo": "1.98.0",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_DEV_OPT_LEVEL": "1",
+    "CARGO_PROFILE_DEV_INCREMENTAL": "false",
+    "RUSTFLAGS": "-C link-arg=-fuse-ld=lld",
+    "RUST_MIN_STACK": "16777216",
+    "HF_FUNES_TEST_TOKEN": "empty; live tests disabled"
+  },
+  "limits": [
+    "Five gated live Hub tests return early and are included in Cargo's reported pass count; no remote publication or remote-memory coverage is claimed.",
+    "Standard parser tests use repository-committed public fixtures; all newly authored cross-project smoke fixtures are synthetic. No private transcripts were read.",
+    "The tested working tree was built before the dependency commit. Consumers separately rebuild and verify the resulting committed revision.",
+    "No hosted generation, live installation, enrollment, push, publication, or deployment."
+  ]
+}
