@@ -40,6 +40,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Container builds can lack a Git identity visible to Cargo build scripts.
+  # Embed the exact checked-out workflow revision through build.rs's explicit fallback.
+  FUNES_BUILD_REVISION: ${{ github.sha }}
 
 jobs:
   # Dispatch-only: work out the release version (strip +dev, then bump). Nothing is written or
