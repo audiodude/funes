@@ -1,15 +1,12 @@
 //! `funes update`: replace the running binary in place with the latest release, and the
 //! version check behind `funes status`'s "update available" notice.
 //!
-//! The root `VERSION` marker resolves latest to a tagged directory containing `VERSION`,
+//! GitHub's latest release resolves to a tagged release containing `VERSION`,
 //! `SHA256SUMS`, and the binaries. The checksum and tagged version are verified before a binary is
 //! made executable. Replacement uses a same-filesystem rename, so the live process keeps its old
 //! inode and the next run picks up the new binary.
 
-use crate::hub;
 use anyhow::{anyhow, bail, Context, Result};
-use hf_hub::buckets::BucketDownload;
-use hf_hub::HFBucket;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::{File, Permissions};
@@ -19,12 +16,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-/// The public bucket (`huggingface/funes`) holding the latest binaries and the `VERSION` marker.
-const BUCKET_OWNER: &str = "huggingface";
-const BUCKET_NAME: &str = "funes";
-
-/// Repo, for the build-from-source pointer on platforms with no prebuilt binary.
-const REPO: &str = "https://github.com/huggingface/funes";
+/// GitHub Releases is the sole software distribution target. Hugging Face remains a supported
+/// memory backend, but release binaries are never deployed there.
+const REPO: &str = "https://github.com/audiodude/funes";
+const RELEASES_ROOT: &str = "https://github.com/audiodude/funes/releases";
 
 /// How long the CLI `funes status` version check waits before giving up (silently). Short so an
 /// offline or slow Hub barely delays status; the update command itself has no such cap.
@@ -56,10 +51,7 @@ pub async fn run(force: bool) -> Result<()> {
     })?;
 
     let current = env!("CARGO_PKG_VERSION");
-    let bucket = release_bucket(true)?;
-    let latest = fetch_latest_version(&bucket)
-        .await
-        .context("checking the latest funes version")?;
+    let latest = fetch_latest_version(None).context("checking the latest funes version")?;
     let tag = format!("v{latest}");
 
     // Compare when both parse; if either is unreadable, proceed rather than block an update.
@@ -90,16 +82,10 @@ pub async fn run(force: bool) -> Result<()> {
     let tagged_version = staging.path().join("VERSION");
 
     println!("Downloading funes {latest} ({asset})…");
-    bucket
-        .download_files()
-        .files(vec![
-            BucketDownload::new(format!("{tag}/{asset}"), &staged),
-            BucketDownload::new(format!("{tag}/SHA256SUMS"), &manifest),
-            BucketDownload::new(format!("{tag}/VERSION"), &tagged_version),
-        ])
-        .send()
-        .await
-        .with_context(|| format!("downloading {tag} from the {BUCKET_OWNER}/{BUCKET_NAME} bucket"))?;
+    download_release_file(&format!("download/{tag}/{asset}"), &staged, None)?;
+    download_release_file(&format!("download/{tag}/SHA256SUMS"), &manifest, None)?;
+    download_release_file(&format!("download/{tag}/VERSION"), &tagged_version, None)
+        .with_context(|| format!("downloading {tag} from GitHub Releases"))?;
 
     let release_version = read_release_version(&tagged_version).with_context(|| format!("validating {tag}/VERSION"))?;
     if release_version != latest {
@@ -231,11 +217,7 @@ fn verify_runs(path: &Path) -> Result<std::process::Output> {
 /// offline, or the check fails. Never errors and never blocks for long — a short timeout and
 /// any failure just yield no notice, so the check can't break or stall status.
 pub async fn upgrade_notice() -> Option<String> {
-    let bucket = release_bucket(false).ok()?;
-    let latest = match tokio::time::timeout(NOTICE_TIMEOUT, fetch_latest_version(&bucket)).await {
-        Ok(Ok(v)) => v,
-        _ => return None,
-    };
+    let latest = fetch_latest_version(Some(NOTICE_TIMEOUT.as_secs())).ok()?;
     notice_for(&latest, env!("CARGO_PKG_VERSION"))
 }
 
@@ -254,24 +236,33 @@ fn notice_for(latest_raw: &str, current_raw: &str) -> Option<String> {
     })
 }
 
-/// An [`HFBucket`] handle for the funes release bucket, with the standard HF token if one is
-/// set (the bucket is public, so a token isn't required). `retries` is false for the fail-fast
-/// status check, true for the update's default.
-fn release_bucket(retries: bool) -> Result<HFBucket> {
-    Ok(hub::client(hub::hf_token().as_deref(), retries)?.bucket(BUCKET_OWNER, BUCKET_NAME))
+/// Download one public GitHub release asset. `max_seconds` keeps the status notice fail-fast;
+/// explicit updates have no artificial cap and use curl's normal retry/error behavior.
+fn download_release_file(relative: &str, destination: &Path, max_seconds: Option<u64>) -> Result<()> {
+    let url = format!("{RELEASES_ROOT}/{relative}");
+    let mut command = Command::new("curl");
+    command.args(["-fsSL", "--retry", "2"]);
+    if let Some(seconds) = max_seconds {
+        command.args(["--max-time", &seconds.to_string()]);
+    }
+    let status = command
+        .args(["--output"])
+        .arg(destination)
+        .arg(&url)
+        .status()
+        .with_context(|| format!("running curl to download {url}"))?;
+    if !status.success() {
+        bail!("download failed for {url}");
+    }
+    Ok(())
 }
 
-/// Download the bucket's `VERSION` marker (the latest published release) into a scratch dir and
-/// return it trimmed.
-async fn fetch_latest_version(bucket: &HFBucket) -> Result<String> {
+/// Download the latest GitHub release's `VERSION` marker and return it trimmed.
+fn fetch_latest_version(max_seconds: Option<u64>) -> Result<String> {
     let scratch = tempfile::tempdir().context("creating a temp dir for the VERSION marker")?;
     let path = scratch.path().join("VERSION");
-    bucket
-        .download_files()
-        .files(vec![BucketDownload::new("VERSION", &path)])
-        .send()
-        .await
-        .context("downloading the VERSION marker from the bucket")?;
+    download_release_file("latest/download/VERSION", &path, max_seconds)
+        .context("downloading the VERSION marker from GitHub Releases")?;
     read_release_version(&path).context("reading the VERSION marker")
 }
 

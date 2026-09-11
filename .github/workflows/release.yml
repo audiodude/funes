@@ -351,25 +351,6 @@ jobs:
             --title "$TAG" \
             --generate-notes
 
-      # Publish the tagged release before advancing the root VERSION pointer. Root binaries remain
-      # available for clients released before tagged checksum verification was introduced.
-      - name: Publish binaries and installer to the Hugging Face bucket
-        env:
-          HF_TOKEN: ${{ secrets.HF_FUNES_RELEASE_TOKEN }}
-        run: |
-          TAG="${{ needs.compute.outputs.tag || github.ref_name }}"
-          python3 -m venv "$RUNNER_TEMP/hfvenv"
-          "$RUNNER_TEMP/hfvenv/bin/pip" install -q -U "huggingface_hub>=1.21"
-          HF="$RUNNER_TEMP/hfvenv/bin/hf"
-          ROOT="hf://buckets/huggingface/funes"
-
-          "$HF" buckets sync ./artifacts "$ROOT/$TAG" --ignore-existing
-          for ASSET in funes-x86_64-linux funes-aarch64-linux funes-arm64-apple-darwin; do
-            "$HF" buckets cp "./artifacts/$ASSET" "$ROOT/$ASSET"
-          done
-          "$HF" buckets cp ./artifacts/VERSION "$ROOT/VERSION"
-          "$HF" buckets cp scripts/install.sh "$ROOT/install.sh"
-
       # Dispatch only: push a branch advancing main's version marker to `<version>+dev`. The org
       # blocks Actions from opening PRs, so the workflow stops at the branch and surfaces a one-click
       # "create PR" link in the run summary; a maintainer opens that PR and merges it.

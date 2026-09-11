@@ -23,7 +23,11 @@ while [ "$#" -gt 0 ]; do
         *) url=$1; shift ;;
     esac
 done
-relative=${url#*/resolve/}
+relative=${url#*/releases/}
+case "$relative" in
+    latest/download/*) relative=${relative#latest/download/} ;;
+    download/v*) relative=${relative#download/} ;;
+esac
 cp "$FIXTURE_ROOT/$relative" "$output"
 SH
 chmod +x "$fakebin/curl"

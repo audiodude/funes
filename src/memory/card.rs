@@ -98,7 +98,7 @@ fn render(ctx: &CardCtx) -> String {
          Get funes:\n\
          \n\
          ```bash\n\
-         curl -fsSL https://huggingface.co/buckets/huggingface/funes/resolve/install.sh | sh\n\
+         curl -fsSL https://raw.githubusercontent.com/audiodude/funes/main/scripts/install.sh | sh\n\
          ```\n\
          \n\
          {stats}\n\

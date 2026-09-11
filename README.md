@@ -33,7 +33,7 @@ verifies its tagged release checksum and version, and puts it on your PATH (`~/.
 default):
 
 ```bash
-curl -fsSL https://huggingface.co/buckets/huggingface/funes/resolve/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/audiodude/funes/main/scripts/install.sh | sh
 ```
 
 Then add it to your agent:
@@ -48,8 +48,8 @@ memory bound) publishes at each session boundary. From here you just work. See
 [docs/add.md](docs/add.md) for the agents, memory binding, and what a run does; `funes status` tells
 you whether recall is reading your own memory yet.
 
-Tagged binaries and their `SHA256SUMS` manifest are also available in the
-[release bucket](https://huggingface.co/buckets/huggingface/funes):
+Tagged binaries and their `SHA256SUMS` manifest are available from
+[GitHub Releases](https://github.com/audiodude/funes/releases):
 
 | Platform | Binary |
 | --- | --- |

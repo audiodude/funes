@@ -1,7 +1,7 @@
 #!/bin/sh
-# Install the funes binary from the Hugging Face bucket (huggingface/funes).
+# Install the funes binary from GitHub Releases (audiodude/funes).
 #
-#   curl -fsSL https://huggingface.co/buckets/huggingface/funes/resolve/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/audiodude/funes/main/scripts/install.sh | sh
 #
 # Detects the platform, downloads the matching prebuilt binary, and installs it
 # onto your PATH. Flags (pass after `sh -s --` when piping):
@@ -9,8 +9,7 @@
 #   -v <tag>   release tag to fetch (default: latest;           env: FUNES_VERSION)
 set -eu
 
-REPO="huggingface/funes"
-BUCKET="huggingface/funes"
+REPO="audiodude/funes"
 BINDIR="${FUNES_INSTALL_DIR:-$HOME/.local/bin}"
 REQUESTED_VERSION="${FUNES_VERSION:-latest}"
 
@@ -110,9 +109,9 @@ tmpdir=$(mktemp -d "$BINDIR/.funes-install.XXXXXX") || {
 }
 trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 
-root="https://huggingface.co/buckets/$BUCKET/resolve"
+root="https://github.com/$REPO/releases"
 if [ "$REQUESTED_VERSION" = latest ]; then
-    if ! fetch "$root/VERSION" "$tmpdir/latest-version"; then
+    if ! fetch "$root/latest/download/VERSION" "$tmpdir/latest-version"; then
         echo "funes: could not resolve the latest release." >&2
         exit 1
     fi
@@ -130,7 +129,7 @@ if ! valid_version "$version"; then
 fi
 
 tag="v$version"
-release="$root/$tag"
+release="$root/download/$tag"
 if ! fetch "$release/VERSION" "$tmpdir/release-version" ||
    ! fetch "$release/SHA256SUMS" "$tmpdir/SHA256SUMS"; then
     echo "funes: release metadata is incomplete for $tag." >&2
