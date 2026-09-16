@@ -47,3 +47,21 @@ Initial integration runtime: `69387f12dca29c2c8e939b0d9890e5768cc2067c`. [Actoma
 Re-run source regressions with `cargo test --locked --lib --bin funes --test local_source_normalize`; consumer regressions require `FUNES_TEST_BIN=/absolute/fork/funes uv run pytest -q` in Actomasto. All source fixtures are authored synthetic data. No live-memory installation, enrollment, deployment, or posting was performed.
 
 The September 2026 dependency refresh uses stable `hf-hub` 1.0.0, updates compatible locked dependencies, and retains Lance 11.0.0 and source protocol 1. Actomasto's 210 tests and native OMP 18.1.17 completed/aborted-turn consumption passed against the refreshed build with synthetic originals; completed turns preserved text and provenance, aborted turns remained pending, and restart and eligibility checks emitted no replay or excluded units. Consumers must pin the committed build revision they verify. Local-only commits must be built from the supplied worktree with `cargo build --locked`; they cannot be fetched from the public fork until separately published. No live Hub publication or hosted generation was exercised for this refresh.
+
+### September 16, 2026 compatible dependency refresh
+
+The `update-local-20260916` branch starts from maintained-fork `origin/main` at
+`e1e398c`; fetching and pulling main required no source changes. `cargo update`
+refreshed 25 locked packages within the existing manifest constraints, including
+Clap 4.6.7, Rustls 0.23.45, and Quinn 0.11.12, and removed `tinyvec_macros`.
+This includes the six lockfile updates from `update-local-20260912`; no parser
+changes or unrelated upstream features were imported. Lance remains pinned to
+11.0.0, `hf-hub` remains 1.0.0, and local source protocol 1 and `actomasto-v1`
+capabilities are unchanged.
+
+Dependency resolution succeeded; builds, linting, and tests are deferred to the
+local rollout and the earlier verification results above do not cover this
+lockfile. Build the committed revision with `cargo build --locked`, then run the
+source regressions and consumer checks described above before activating it.
+GitHub source publication does not publish a release or a Hugging Face artifact;
+this refresh does not authorize either, and creates no release tag.
