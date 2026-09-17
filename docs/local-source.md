@@ -65,3 +65,30 @@ lockfile. Build the committed revision with `cargo build --locked`, then run the
 source regressions and consumer checks described above before activating it.
 GitHub source publication does not publish a release or a Hugging Face artifact;
 this refresh does not authorize either, and creates no release tag.
+
+### September 17, 2026 upstream and dependency refresh
+
+The `update-local-20260917` branch starts from maintained-fork `origin/main` at
+`e1e398c` and preserves the completed `update-local-20260916-evening` branch at
+`6a96776`. Pulling origin main required no changes. Upstream main through
+`0612fce1a05450366bf2160f3dae5dcfcd3d48ce` adds the Linux BLAS exponential
+underflow fix, boundary/softmax regressions, and a five-iteration ragged-batch
+backend benchmark. Masked attention weights now underflow to zero instead of
+leaving tiny weights that can cause subnormal arithmetic stalls. The only merge
+conflicts were the package version in the manifest and lockfile; the fork keeps
+`1.4.0+dev` rather than upstream's `1.3.1+dev`.
+
+`cargo update` advanced `unicode-ident` from 1.0.25 to 1.0.26 within the existing
+manifest constraints. Lance stays pinned to 11.0.0 and `hf-hub` remains 1.0.0.
+OMP parsing, local source protocol 1, and `actomasto-v1` capabilities are unchanged.
+The inference change affects extremely small exponential results on Linux;
+upstream's added regressions and consumer checks still need to run against this
+committed revision before rollout.
+
+Dependency resolution succeeded. All builds, tests, formatting, linting, and
+runtime checks are explicitly deferred to the integration owner; historical
+results above do not verify this revision. Use system `protoc`, run
+`cargo build --locked`, then the source and consumer regressions described above.
+The source regression command includes the new BLAS unit tests. No local service
+or configuration was changed, and no release tag, deployment, or Hugging Face
+publication is part of this refresh.
