@@ -757,7 +757,7 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     ) {
         return Ok(event);
     }
-    if !message["content"].is_array() && !(message["role"] == "user" && message["content"].is_string()) {
+    if !(message["content"].is_array() || message["role"] == "user" && message["content"].is_string()) {
         return Err(SCHEMA);
     }
     let text = text_blocks(&message["content"], "text", "thinking toolCall image")?;
@@ -1064,7 +1064,7 @@ fn finish(
     }
     chain.reverse();
     let invalid = turn.invalid
-        || !turn.session.as_str().is_some_and(|session| !session.is_empty())
+        || turn.session.as_str().is_none_or(|session| session.is_empty())
         || !matches!((turn.start, turn.end), (Some(start), Some(end)) if start <= end)
         || items.first().is_none_or(|item| item["role"] != "user");
     value["invalid"] = json!(invalid);

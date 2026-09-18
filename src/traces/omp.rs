@@ -444,7 +444,7 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
     for entry in &provenance.entries {
         for key in ["fromId", "firstKeptEntryId", "providerReplayThroughEntryId", "targetId"] {
             if entry.metadata.get(key).and_then(Value::as_str).is_some_and(|v| {
-                !(entry.kind == "branch_summary" && key == "fromId" && v == "root") && !seen.contains_key(v)
+                !(entry.kind == "branch_summary" && key == "fromId" && v == "root" || seen.contains_key(v))
             }) {
                 coverage.issue("control graph reference is missing from retained archive");
             }
