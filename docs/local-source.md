@@ -32,7 +32,23 @@ Unit ID is SHA256 of UTF-8 `client:session:user-message-id`; item ID is SHA256 o
 
 Each ordinary item also carries `identity:{native_id,record_index,turn_context,raw_record_digest}`. `native_id` preserves the original JSON identifier or null; `record_index` is its original zero-based position; `turn_context` is the parser context after that record; `raw_record_digest` is the SHA256 of original lowercase hex bytes including newline. These are metadata, not source text. Actomasto checks that these inputs reproduce each message identity before accepting the turn. Missing session identity remains invalid metadata; its legacy hash input is the literal Python spelling `None`, not JSON `null`.
 
-Harness mappings are the existing Actomasto `claude-schema2`, `codex-0.144.1-schema1`, `omp-session3-schema1` contracts: Claude positive origin human/typed provenance and linked parents with end_turn completion; Codex canonical response_item user confirmed by matching user_message plus exact active turn association and task_complete; OMP v3 explicit user attribution, message timestamps (milliseconds), linked parents and stop with completedAt. Framing/injected records, unknown authorship, reset/compaction/synthetic boundaries and excluded tool time/cwd boundaries retain existing exclusions. Linked shared ancestors are not emitted twice by consumers. Missing metadata remains invalid, never inferred from text. Future times remain retryable, not terminal.
+Harness mappings are the existing Actomasto `claude-schema2`, `codex-0.144.1-schema1`, `omp-session3-schema1` contracts: Claude positive origin human/typed provenance and linked parents with end_turn completion; Codex canonical response_item user confirmed by matching user_message or native UserMessage completion plus exact active turn association and task_complete; OMP v3 explicit user attribution, message timestamps (milliseconds), linked parents and stop with completedAt. Framing/injected records, unknown authorship, reset/compaction/synthetic boundaries and excluded tool time/cwd boundaries retain existing exclusions. Linked shared ancestors are not emitted twice by consumers. Missing metadata remains invalid, never inferred from text. Future times remain retryable, not terminal.
+
+The Codex capability label preserves the identity contract, not a single CLI
+version: observed versions `0.142.5`, `0.144.1`, and `0.154.0-alpha.6.2` are
+supported. Ordinal-bearing records and native `item_completed` / `UserMessage`
+confirmations are accepted only with matching session, active turn, and exact
+raw text. CLI and VSCode sessions require `thread_source: "user"`; unknown
+provenance facets still fail closed. Image-bearing messages whose generated
+canonical wrappers do not exactly match the user confirmation remain excluded;
+matching text suffixes are not sufficient.
+
+OMP child `session_init` and agent-attributed prompts are provenance barriers,
+not human input. Known usage/recovery metadata and excluded `bashExecution` /
+`fileMention` records no longer reject an otherwise supported stream; excluded
+records still contribute lineage and time boundaries. Unknown schemas and
+missing originals remain errors. No enrollment, tombstones, or durable identities
+are changed by this compatibility repair.
 
 ## Consumer durability and permissions
 
