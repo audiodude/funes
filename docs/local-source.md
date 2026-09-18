@@ -81,14 +81,19 @@ conflicts were the package version in the manifest and lockfile; the fork keeps
 `cargo update` advanced `unicode-ident` from 1.0.25 to 1.0.26 within the existing
 manifest constraints. Lance stays pinned to 11.0.0 and `hf-hub` remains 1.0.0.
 OMP parsing, local source protocol 1, and `actomasto-v1` capabilities are unchanged.
-The inference change affects extremely small exponential results on Linux;
-upstream's added regressions and consumer checks still need to run against this
-committed revision before rollout.
+The inference change affects extremely small exponential results on Linux.
 
-Dependency resolution succeeded. All builds, tests, formatting, linting, and
-runtime checks are explicitly deferred to the integration owner; historical
-results above do not verify this revision. Use system `protoc`, run
-`cargo build --locked`, then the source and consumer regressions described above.
-The source regression command includes the new BLAS unit tests. No local service
-or configuration was changed, and no release tag, deployment, or Hugging Face
-publication is part of this refresh.
+The integration owner built source revision
+`7519c97c6bcdb23c70417d60d1a4df0c97a15241` with system `protoc`, the documented
+optimized dev profile, and the committed build revision explicitly set.
+`cargo test --locked --lib --bin funes --test local_source_normalize` passed
+291 tests, including the added BLAS regressions. Actomasto passed 210 tests
+against that executable; native OMP 18.2.5 complete/abort consumption, bridge
+installation, and native MCP retrieval/live-reader checks also passed.
+The bridge's
+[rollout record](https://github.com/audiodude/omp-funes-bridge/blob/update-local-20260917/verification/dependencies-20260917.json)
+records the binary hash and local activation. The binary remains pinned to the
+tested source commit; this subsequent documentation update does not require
+recompilation. Live historical coverage and collector failures remain explicitly
+unresolved. No release tag or Hugging Face artifact was published.
+Update and verification assisted by OpenAI Codex.
