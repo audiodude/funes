@@ -500,3 +500,243 @@ fn iso_timestamps_match_python_microseconds_and_explicit_offsets() {
     rows[0]["timestamp"] = json!("1970-01-01T00:00:01");
     assert_eq!(parse(&rows, "claude", 10.0, true)["turns"][0]["invalid"], true);
 }
+
+fn codex_item_conversation(version: &str, source: &str) -> Vec<Value> {
+    let mut rows = conversation("codex");
+    rows[0]["payload"]["cli_version"] = json!(version);
+    rows[0]["payload"]["source"] = json!(source);
+    rows[3]["payload"]["id"] = json!("u");
+    rows[3]["payload"]["internal_chat_message_metadata_passthrough"] =
+        json!({"turn_id":"t","create_time":2.0,"content_item_kinds":["user.text"]});
+    rows[4]["payload"] = json!({
+        "type":"item_completed","thread_id":"s","turn_id":"t","completed_at_ms":2000,
+        "item":{"type":"UserMessage","id":"ui-u","client_id":"client","content":[
+            {"type":"text","text":"Question","text_elements":[]}
+        ]}
+    });
+    rows[5]["payload"]["internal_chat_message_metadata_passthrough"] =
+        json!({"turn_id":"t","content_item_kinds":["unknown"]});
+    rows.insert(
+        5,
+        codex(
+            "event_msg",
+            2.5,
+            json!({"type":"item_completed","thread_id":"s","turn_id":"t","completed_at_ms":3000,
+                "item":{"type":"AgentMessage","id":"ui-a","phase":"final_answer","content":[{"text":"EXCLUDED duplicate"}]}}),
+        ),
+    );
+    rows.insert(
+        7,
+        codex(
+            "token_usage_record",
+            3.5,
+            json!({"response_id":"r","root_turn_id":"t","session_id":"s","thread_id":"s","turn_id":"t",
+                "thread_token_usage":{},"turn_token_usage":{},"usage":{}}),
+        ),
+    );
+    for (ordinal, row) in rows.iter_mut().enumerate() {
+        row["ordinal"] = json!(ordinal);
+    }
+    rows
+}
+
+#[test]
+fn codex_native_completed_items_confirm_users_without_duplicating_assistant_text() {
+    for (version, source) in [("0.142.5", "cli"), ("0.144.1", "cli"), ("0.154.0-alpha.6.2", "vscode")] {
+        let rows = codex_item_conversation(version, source);
+        let mut full = parse(&rows, "codex", 10.0, true);
+        assert_eq!(full["status"], "complete");
+        assert_eq!(full["turns"][0]["invalid"], false);
+        assert_eq!(full["turns"][0]["message_ids"], json!(["u", "a"]));
+        assert_eq!(full["turns"][0]["bytes"], 14);
+        assert_eq!(full["turns"][0]["items"][0]["text"], "Question");
+        assert_eq!(full["turns"][0]["items"][1]["text"], "Answer");
+        assert!(!full.to_string().contains("EXCLUDED"));
+        assert_eq!(full["turns"][0]["items"][0]["identity"]["record_index"], 3);
+        assert_eq!(full["turns"][0]["items"][0]["identity"]["turn_context"], "t");
+        let metadata = parse(&rows, "codex", 10.0, false);
+        for item in full["turns"][0]["items"].as_array_mut().unwrap() {
+            item.as_object_mut().unwrap().remove("text");
+        }
+        assert_eq!(metadata, full);
+        // UI item completion is not task completion, even for a final answer.
+        let unfinished = parse(&rows[..rows.len() - 1], "codex", 10.0, true);
+        assert_eq!(unfinished["turns"], json!([]));
+        assert_eq!(unfinished["pending_turns"], 1);
+    }
+}
+
+#[test]
+fn codex_item_confirmation_keeps_session_turn_and_raw_text_provenance_gates() {
+    let rows = codex_item_conversation("0.154.0-alpha.6.2", "vscode");
+    let mut wrong_thread = rows.clone();
+    wrong_thread[4]["payload"]["thread_id"] = json!("other");
+    let mut wrong_turn = rows.clone();
+    wrong_turn[4]["payload"]["turn_id"] = json!("other");
+    let mut wrong_text = rows.clone();
+    wrong_text[4]["payload"]["item"]["content"][0]["text"] = json!("Other");
+    let mut agent_source = rows.clone();
+    agent_source[0]["payload"]["thread_source"] = json!("agent");
+    let mut injected = rows.clone();
+    injected[3]["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+        json!(["environments.environment_context"]);
+    let mut stale_candidate = rows.clone();
+    stale_candidate.splice(
+        4..4,
+        [
+            codex("event_msg", 2.1, json!({"type":"task_started","turn_id":"other"})),
+            codex("turn_context", 2.1, json!({"turn_id":"other","cwd":"/synthetic"})),
+        ],
+    );
+    stale_candidate[6]["payload"]["turn_id"] = json!("other");
+    for rejected in [
+        wrong_thread,
+        wrong_turn,
+        wrong_text,
+        agent_source,
+        injected,
+        stale_candidate,
+    ] {
+        assert_eq!(parse(&rejected, "codex", 10.0, true)["turns"], json!([]));
+    }
+}
+
+#[test]
+fn codex_new_schema_support_remains_closed_to_unknown_fields_and_items() {
+    let rows = codex_item_conversation("0.144.1", "cli");
+    let mut envelope = rows.clone();
+    envelope[0]["future_provenance"] = json!("PRIVATE");
+    let mut ordinal = rows.clone();
+    ordinal[0]["ordinal"] = json!("0");
+    let mut event = rows.clone();
+    event[4]["payload"]["item"]["type"] = json!("FutureMessage");
+    let mut block = rows.clone();
+    block[4]["payload"]["item"]["content"][0]["type"] = json!("future_text");
+    let mut span = rows.clone();
+    span[4]["payload"]["item"]["content"][0]["text_elements"] =
+        json!([{"byte_range":{"start":0,"end":100},"placeholder":"Question"}]);
+    for rejected in [envelope, ordinal, event, block, span] {
+        let result = parse(&rejected, "codex", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+    let mut provenance = rows.clone();
+    provenance[3]["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+        json!(["future.origin"]);
+    assert_eq!(
+        parse(&provenance, "codex", 10.0, true)["status"],
+        "unknown_provenance_schema"
+    );
+}
+
+#[test]
+fn codex_image_confirmation_never_accepts_a_matching_text_suffix() {
+    let mut rows = codex_item_conversation("0.144.1", "cli");
+    rows[3]["payload"]["content"] = json!([
+        {"type":"input_text","text":"Question"},
+        {"type":"input_image","image_url":"data:image/png;base64,synthetic"}
+    ]);
+    rows[3]["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+        json!(["user.text", "user.image"]);
+    rows[4]["payload"]["item"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"image","image_url":"data:image/png;base64,synthetic"}));
+    let confirmed = parse(&rows, "codex", 10.0, true);
+    assert_eq!(confirmed["turns"][0]["items"][0]["text"], "Question");
+    assert_eq!(confirmed["turns"][0]["bytes"], 14);
+    // Native local-image preparation injects these wrappers before the user's
+    // text. Until exact framing provenance is modeled, do not suffix-match it.
+    rows[3]["payload"]["content"] = json!([
+        {"type":"input_text","text":"<image name=[Image #1] path=\"/synthetic/image.png\">"},
+        {"type":"input_image","image_url":"data:image/png;base64,synthetic"},
+        {"type":"input_text","text":"</image>"},
+        {"type":"input_text","text":"Question"}
+    ]);
+    rows[3]["payload"]["internal_chat_message_metadata_passthrough"]
+        .as_object_mut()
+        .unwrap()
+        .remove("content_item_kinds");
+    rows[4]["payload"]["item"]["content"][1] = json!({"type":"local_image","path":"/synthetic/image.png"});
+    let unconfirmed = parse(&rows, "codex", 10.0, true);
+    assert_eq!(unconfirmed["status"], "complete");
+    assert_eq!(unconfirmed["turns"], json!([]));
+}
+
+#[test]
+fn omp_child_initialization_and_agent_string_prompts_never_become_human_turns() {
+    let mut rows = conversation("omp");
+    rows.insert(
+        1,
+        json!({"type":"session_init","id":"init","parentId":null,"timestamp":0,
+            "systemPrompt":"PRIVATE SYSTEM","task":"PRIVATE TASK","tools":["read"],"agent":"worker",
+            "modelRole":"default","resolvedModel":"test/model","readOnly":true,"readSummarize":false,
+            "outputSchema":{},"outputSchemaMode":"strict","spawns":""}),
+    );
+    rows[2]["parentId"] = json!("init");
+    rows[2]["message"]["attribution"] = json!("agent");
+    rows[2]["message"]["content"] = json!("PRIVATE TASK");
+    let child = parse(&rows, "omp", 10.0, true);
+    assert_eq!(child["status"], "complete");
+    assert_eq!(child["turns"], json!([]));
+    rows.push(omp("human", json!("a"), "user", json!(5000), json!("Question"), ""));
+    rows.push(omp(
+        "reply",
+        json!("human"),
+        "assistant",
+        json!(6000),
+        json!([{"type":"text","text":"Answer"}]),
+        "stop",
+    ));
+    rows[5]["message"]["completedAt"] = json!(7000);
+    let result = parse(&rows, "omp", 10.0, true);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["turns"][0]["message_ids"], json!(["human", "reply"]));
+    assert_eq!(result["turns"][0]["invalid"], false);
+    assert!(!result.to_string().contains("PRIVATE"));
+}
+
+#[test]
+fn omp_auxiliary_messages_preserve_lineage_and_boundaries_without_private_payloads() {
+    let mut rows = conversation("omp");
+    rows.splice(
+        2..2,
+        [
+            json!({"type":"message","id":"shell","parentId":"u","timestamp":2,
+                "message":{"role":"bashExecution","timestamp":2000,"command":"PRIVATE COMMAND",
+                    "output":"PRIVATE OUTPUT","exitCode":0,"cancelled":false,"truncated":false,
+                    "excludeFromContext":false}}),
+            json!({"type":"message","id":"file","parentId":"shell","timestamp":2,
+                "message":{"role":"fileMention","timestamp":2000,
+                    "files":[{"path":"/private","content":"PRIVATE FILE"}]}}),
+            json!({"type":"model_usage","id":"usage","parentId":"file","timestamp":2,
+                "model":"test","provider":"test","api":"test","purpose":"summary","role":"default",
+                "stopReason":"stop","usage":{}}),
+            json!({"type":"message","id":"tool","parentId":"usage","timestamp":2,
+                "message":{"role":"toolResult","timestamp":2000,"content":[{"type":"text","text":"PRIVATE TOOL"}],
+                    "details":{},"toolCallId":"call","toolName":"test","isError":false,"prunedAt":2000}}),
+            json!({"type":"message","id":"error","parentId":"tool","timestamp":2.5,
+                "message":{"role":"assistant","timestamp":2500,"completedAt":2600,"content":[],
+                    "stopReason":"error","errorStatus":429,
+                    "stopDetails":{"type":"error","category":"rate_limit","explanation":"PRIVATE DIAGNOSTIC"},
+                    "retryRecovery":{"kind":"auto-retry","status":"recovered","attempt":1,
+                        "recoveredAt":"1970-01-01T00:00:03Z","recovery":"wait","note":"PRIVATE NOTE",
+                        "supersededBy":{"timestamp":3000,"provider":"test","model":"test"}}}}),
+        ],
+    );
+    rows[7]["parentId"] = json!("error");
+    rows[7]["message"]["inputTransformations"] = json!([]);
+    let result = parse(&rows, "omp", 10.0, true);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["turns"][0]["message_ids"], json!(["u", "error", "a"]));
+    assert_eq!(result["turns"][0]["boundaries"].as_array().unwrap().len(), 7);
+    assert_eq!(result["turns"][0]["invalid"], false);
+    assert!(!result.to_string().contains("PRIVATE"));
+    rows[2]["message"]["timestamp"] = json!(5000);
+    assert_eq!(parse(&rows, "omp", 4.0, true)["status"], "deferred_future");
+    rows[2]["message"]["timestamp"] = json!(2000);
+    rows[2]["message"]["future_content"] = json!("PRIVATE");
+    let unknown = parse(&rows, "omp", 10.0, true);
+    assert_eq!(unknown["status"], "unknown_content_schema");
+    assert_eq!(unknown["turns"], json!([]));
+}

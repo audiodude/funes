@@ -474,21 +474,68 @@ fn claude(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     Ok(event)
 }
 
+// Native item-completed events repeat the user input, not an assistant response.
+// Hash its literal text before framing removal, just like legacy user_message.
+fn codex_user_confirmation(content: &Value) -> Result<String, &'static str> {
+    let blocks = content.as_array().ok_or(SCHEMA)?;
+    let mut hash = Sha256::new();
+    let mut first = true;
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                let text = block["text"].as_str().ok_or(SCHEMA)?;
+                if !allowed_keys(block, "type text text_elements") {
+                    return Err(SCHEMA);
+                }
+                if let Some(elements) = block.get("text_elements") {
+                    for element in elements.as_array().ok_or(SCHEMA)? {
+                        let range = &element["byte_range"];
+                        let start = range["start"].as_u64().ok_or(SCHEMA)?;
+                        let end = range["end"].as_u64().ok_or(SCHEMA)?;
+                        if !allowed_keys(element, "byte_range placeholder")
+                            || !allowed_keys(range, "start end")
+                            || !(element["placeholder"].is_null() || element["placeholder"].is_string())
+                            || start > end
+                            || end > text.len() as u64
+                            || !text.is_char_boundary(start as usize)
+                            || !text.is_char_boundary(end as usize)
+                        {
+                            return Err(SCHEMA);
+                        }
+                    }
+                }
+                if !first {
+                    hash.update(b"\n");
+                }
+                first = false;
+                hash.update(text.as_bytes());
+            }
+            Some("image") if allowed_keys(block, "type image_url") && block["image_url"].is_string() => {}
+            Some("local_image") if allowed_keys(block, "type path") && block["path"].is_string() => {}
+            _ => return Err(SCHEMA),
+        }
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
 fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let payload = &row["payload"];
-    if !payload.is_object() || !allowed_keys(row, "type timestamp payload") {
+    if !payload.is_object()
+        || !allowed_keys(row, "type timestamp payload ordinal")
+        || row.get("ordinal").is_some_and(|ordinal| ordinal.as_u64().is_none())
+    {
         return Err(SCHEMA);
     }
     let mut event = Event::new(row, context);
     let kind = &row["type"];
     if kind == "session_meta" {
-        if payload["cli_version"] != "0.144.1" {
+        if !one_of(&payload["cli_version"], "0.142.5 0.144.1 0.154.0-alpha.6.2") {
             return Err("unsupported_version");
         }
         if !allowed_keys(payload, "base_instructions cli_version context_window cwd git history_mode id model_provider originator session_id source thread_source timestamp") { return Err("unknown_session_schema"); }
         context.session = payload["id"].clone();
         context.cwd = payload["cwd"].clone();
-        context.source_ok = payload["source"] == "cli" && payload["thread_source"] == "user";
+        context.source_ok = one_of(&payload["source"], "cli vscode") && payload["thread_source"] == "user";
         if !context.session.is_string() || !context.cwd.is_string() {
             return Err(SCHEMA);
         }
@@ -498,6 +545,15 @@ fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         return Err("missing_session_header");
     }
     if kind == "world_state" {
+        return Ok(event);
+    }
+    if kind == "token_usage_record" {
+        if !allowed_keys(
+            payload,
+            "response_id root_turn_id session_id thread_id thread_token_usage turn_id turn_token_usage usage",
+        ) {
+            return Err(SCHEMA);
+        }
         return Ok(event);
     }
     if kind == "turn_context" {
@@ -516,6 +572,28 @@ fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         else if subtype == "user_message" {
             event.confirmation = digest(payload["message"].as_str().ok_or(SCHEMA)?);
             event.role = Role::Confirm;
+        } else if subtype == "item_completed" {
+            if !allowed_keys(payload, "type thread_id turn_id item started_at_ms completed_at_ms") {
+                return Err(SCHEMA);
+            }
+            let item = &payload["item"];
+            if item["type"] == "UserMessage" {
+                if !allowed_keys(item, "type id content client_id") || !item["id"].is_string() {
+                    return Err(SCHEMA);
+                }
+                event.confirmation = codex_user_confirmation(&item["content"])?;
+                event.role = if payload["thread_id"] == context.session
+                    && payload["turn_id"].is_string()
+                    && payload["turn_id"] == context.active_turn
+                    && payload["turn_id"].as_str() == context.turn.as_deref()
+                {
+                    Role::Confirm
+                } else {
+                    Role::Reset
+                };
+            } else if !one_of(&item["type"], "AgentMessage CommandExecution Extension FileChange McpToolCall Reasoning WebSearch") {
+                return Err(SCHEMA);
+            }
         } else if subtype == "task_complete" {
             event.role = Role::Boundary;
             event.complete = true;
@@ -544,7 +622,32 @@ fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let blocks = payload["content"].as_array().ok_or(SCHEMA)?;
     let text = text_blocks(&payload["content"], "input_text output_text", "input_image image")?;
     let metadata = &payload["internal_chat_message_metadata_passthrough"];
-    if metadata.is_object() && !allowed_keys(metadata, "turn_id") {
+    if metadata.is_object() {
+        if !allowed_keys(metadata, "turn_id create_time content_item_kinds")
+            || metadata
+                .get("create_time")
+                .is_some_and(|value| timestamp(value, false).is_none())
+        {
+            return Err("unknown_provenance_schema");
+        }
+        if let Some(kinds) = metadata.get("content_item_kinds") {
+            let kinds = kinds.as_array().ok_or("unknown_provenance_schema")?;
+            if kinds.len() != blocks.len()
+                || kinds.iter().any(|kind| {
+                    !one_of(
+                        kind,
+                        "user.text user.image unknown plugins.recommendations environments.environment_context",
+                    )
+                })
+            {
+                return Err("unknown_provenance_schema");
+            }
+            if payload["role"] == "user" && kinds.iter().any(|kind| !one_of(kind, "user.text user.image")) {
+                event.role = Role::Reset;
+                return Ok(event);
+            }
+        }
+    } else if !metadata.is_null() {
         return Err("unknown_provenance_schema");
     }
     let associated = metadata.is_object()
@@ -595,6 +698,24 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         context.cwd = row["cwd"].clone();
         return Ok(event);
     }
+    if kind == "session_init" {
+        if !truth(&context.session) {
+            return Err("missing_session_header");
+        }
+        if !allowed_keys(row, "type id parentId timestamp agent modelRole outputSchema outputSchemaMode readOnly readSummarize resolvedModel spawns systemPrompt task tools")
+            || !row["id"].is_string()
+            || row.get("parentId").is_none()
+            || !(row["parentId"].is_null() || row["parentId"].is_string())
+            || !row["systemPrompt"].is_string()
+            || !row["task"].is_string()
+            || !row["tools"].as_array().is_some_and(|tools| tools.iter().all(Value::is_string))
+        {
+            return Err(SCHEMA);
+        }
+        // Child initialization is a provenance barrier, never a human prompt.
+        event.role = Role::Reset;
+        return Ok(event);
+    }
     if !truth(&context.session) {
         return Err("missing_session_header");
     }
@@ -602,23 +723,41 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         event.role = Role::Reset;
         return Ok(event);
     }
-    if one_of(kind, "title title_change model_change thinking_level_change custom custom_message credential_pin label session_info ttsr_injection") { return Ok(event); }
+    if one_of(kind, "title title_change model_change model_usage thinking_level_change custom custom_message credential_pin label session_info ttsr_injection") { return Ok(event); }
     if kind != "message" || ["id", "parentId", "message"].iter().any(|key| row.get(key).is_none()) {
         return Err(SCHEMA);
     }
     let message = &row["message"];
-    if !message.is_object() || !one_of(&message["role"], "user assistant toolResult system developer") {
+    if !message.is_object()
+        || !one_of(
+            &message["role"],
+            "user assistant toolResult system developer bashExecution fileMention",
+        )
+    {
         return Err(SCHEMA);
     }
     event.time = timestamp(&message["timestamp"], true);
     if message.get("cwd").is_some() || row.get("cwd").is_some() {
         return Err("unknown_project_schema");
     }
-    if !allowed_keys(row, "type id parentId timestamp message") || !allowed_keys(message, "api attribution completedAt content contextSnapshot details duration errorId errorMessage isError model provider providerPayload responseId role steering stopReason timestamp toolCallId toolName ttft usage useless") { return Err(SCHEMA); }
-    if one_of(&message["role"], "toolResult system developer") {
+    if !allowed_keys(row, "type id parentId timestamp message") {
+        return Err(SCHEMA);
+    }
+    let allowed = match message["role"].as_str() {
+        Some("bashExecution") => "role command output exitCode cancelled truncated timestamp excludeFromContext",
+        Some("fileMention") => "role files timestamp",
+        _ => "api attribution completedAt content contextSnapshot details duration errorId errorMessage errorStatus inputTransformations isError model provider providerPayload prunedAt responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft usage useless",
+    };
+    if !allowed_keys(message, allowed) {
+        return Err(SCHEMA);
+    }
+    if one_of(
+        &message["role"],
+        "toolResult system developer bashExecution fileMention",
+    ) {
         return Ok(event);
     }
-    if !message["content"].is_array() {
+    if !message["content"].is_array() && !(message["role"] == "user" && message["content"].is_string()) {
         return Err(SCHEMA);
     }
     let text = text_blocks(&message["content"], "text", "thinking toolCall image")?;
@@ -1078,7 +1217,11 @@ pub fn parse_page(
             continue;
         } else if role == Role::Confirm {
             match candidate.take() {
-                Some(mut confirmed) if confirmed.event.confirmation == event.confirmation => {
+                Some(mut confirmed)
+                    if confirmed.event.confirmation == event.confirmation
+                        && confirmed.event.session == event.session
+                        && confirmed.event.identity["turn_context"].as_str() == context.turn.as_deref() =>
+                {
                     confirmed.event.role = Role::User;
                     event = confirmed.event;
                     text_bytes = confirmed.bytes;
