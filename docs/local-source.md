@@ -136,22 +136,19 @@ The existing indexing path still persists its graph metadata.
 `stop-words` 0.10.0 → 0.10.1. Lance remains pinned to 11.0.0 and `hf-hub`
 remains 1.0.0.
 
-Dependency resolution succeeded; all builds, tests, formatting, linting, and
-runtime verification are deferred to the integration owner. Historical results
-above do not verify this merge. Build only after committing, using system
-`protoc` and `cargo build --locked --release`; `build.rs` embeds the current
-full Git revision, which consumers must pin. A pre-existing `CARGO_TARGET_DIR`
-can reuse compiled dependencies when the toolchain, profile, features and
-compiler flags match; do not clean it or reuse a binary without rebuilding and
-checking its `source` capabilities revision. Use a separate cache if other
-worktrees are building concurrently.
+Revision `0c443bf8d22ec0a0a1c731681b8efefdeeb3e189` was built with system
+`protoc`, the default BLAS backend, an optimized dev profile (opt-level 1,
+debug info and incremental compilation disabled), and lld. Its exact build
+revision passed the bridge capability gate. Reusing a target cache still requires
+rebuilding and checking `source` capabilities; source commits are not binaries.
 
-Run `cargo test --locked --lib --bin funes --test local_source_normalize`, then
-`cargo test --locked --test funes_jsonl_index --test index_check --test index_recall --test reindex_incremental`.
-Exercise `index --check` on synthetic `.funes.jsonl` and explicit OMP fixtures
-with a disposable home, verify rejected units and no persistent writes, and run
-the bridge and Actomasto consumer checks against the same executable. The
-upstream merge changes indexing and recall behavior, so source-protocol tests
-alone are insufficient. No local service or configuration was changed. The fork's
-removed Hugging Face publication step stays removed; pushing this source branch
-does not create a release tag, publish an artifact, or deploy anything.
+Verification passed 314 tests across the library, binary, `local_source_normalize`,
+`funes_jsonl_index`, `index_check`, `index_recall`, and `reindex_incremental`.
+Direct CLI checks accepted complete OMP input, rejected malformed input, and
+left a disposable Funes home empty. Normal OMP indexing produced usable receipts.
+Actomasto passed 221 tests against this binary. Native OMP 18.2.8 completed and
+aborted turns passed consumer checks, and the bridge passed installation,
+indexing, native MCP recall/get, and warm-reader refresh probes.
+Formatting and linting were not rerun. The removed Hugging Face publication step
+stays removed; only the source branch was pushed, without a release tag or artifact.
+Verification assisted by OpenAI Codex.
