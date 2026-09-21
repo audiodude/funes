@@ -10,6 +10,7 @@
 
 use super::claude;
 use super::codex;
+use super::funes_jsonl;
 use super::harness::Harness;
 use super::hermes;
 use super::jsonl;
@@ -19,7 +20,7 @@ use super::pi;
 use super::Turn;
 use crate::hub;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,11 @@ pub trait TraceSource {
 
     /// Parse one unit into turns (each [`Turn`] already carries its `session_id` and `workdir`).
     fn read(&self, unit: &Unit) -> Result<Vec<Turn>>;
+
+    /// Parse a unit for a dry run, without publishing source-specific metadata.
+    fn read_for_check(&self, unit: &Unit) -> Result<Vec<Turn>> {
+        self.read(unit)
+    }
 
     fn is_omp(&self) -> bool {
         false
@@ -78,41 +84,64 @@ pub trait TraceSource {
     fn unit_keys(&self) -> Result<Vec<String>>;
 }
 
-/// Pick the source for `path`: a `*.parquet` file is a parquet trace dataset, a hermes `state.db`
-/// (or the `~/.hermes` dir holding it) is its SQLite session store, and anything else is a JSONL
-/// transcript tree whose harness is auto-detected. `limit` caps how many sessions are read
-/// (`None` = all) — used to bound a benchmark's build time.
-pub fn open(path: &Path, limit: Option<usize>) -> Box<dyn TraceSource> {
+/// Pick the source for `path`: a `*.parquet` file is a parquet trace dataset, a `.funes.jsonl` file
+/// (or a directory holding them) is a turns file, a hermes `state.db` (or the `~/.hermes` dir
+/// holding it) is its SQLite session store, and anything else is a JSONL transcript tree whose
+/// harness is auto-detected. `limit` caps how many sessions are read (`None` = all) — used to bound
+/// a benchmark's build time.
+pub fn open(path: &Path, limit: Option<usize>) -> Result<Box<dyn TraceSource>> {
     open_with_harness(path, limit, None)
 }
 
 /// Like [`open`], but a `Some` `harness` forces the JSONL tree's harness (the CLI's `--harness`)
-/// instead of detecting it. A `*.parquet` path is a parquet dataset regardless.
-pub fn open_with_harness(path: &Path, limit: Option<usize>, harness: Option<Harness>) -> Box<dyn TraceSource> {
+/// instead of detecting it. A `*.parquet` path is a parquet dataset regardless; a turns file
+/// carries its harness in each turn and refuses the override.
+pub fn open_with_harness(path: &Path, limit: Option<usize>, harness: Option<Harness>) -> Result<Box<dyn TraceSource>> {
     let is_parquet = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("parquet"));
     if is_parquet {
-        Box::new(ParquetDataset {
+        return Ok(Box::new(ParquetDataset {
             path: path.to_path_buf(),
             limit,
-        })
-    } else if harness == Some(Harness::Hermes) || is_hermes_path(path) {
+        }));
+    }
+    // A path funes doesn't know by name is listed once, here, and the source that wins keeps the
+    // listing; a known harness dir is listed lazily by its own source.
+    let listing =
+        (Harness::from_known_dir(path).is_none() && !is_hermes_path(path)).then(|| jsonl::iter_jsonl_files(path));
+    let holds_turns = listing
+        .as_ref()
+        .is_some_and(|l| l.iter().any(|p| funes_jsonl::is_turns_file(p)));
+    if holds_turns {
+        if harness.is_some() {
+            bail!(
+                "`--harness` does not apply to {}: a funes JSONL turn names its own harness",
+                path.display()
+            );
+        }
+        return Ok(Box::new(funes_jsonl::FunesJsonl::new(
+            path,
+            listing.unwrap_or_default(),
+            limit,
+        )));
+    }
+    Ok(if harness == Some(Harness::Hermes) || is_hermes_path(path) {
         Box::new(HermesDb {
             path: hermes_db_path(path),
             limit,
         })
     } else {
-        let harness = harness.unwrap_or_else(|| detect_harness(path));
+        let harness = harness.unwrap_or_else(|| detect_harness(path, listing.as_deref()));
         Box::new(JsonlTree {
             root: path.to_path_buf(),
             limit,
             harness,
-            listing: OnceLock::new(),
+            listing: listing.map_or_else(OnceLock::new, OnceLock::from),
             omp_coverage: RefCell::new(HashMap::new()),
         })
-    }
+    })
 }
 
 /// Whether `path` addresses hermes' SQLite store — the `state.db` file itself, or the `~/.hermes`
@@ -135,14 +164,12 @@ fn hermes_db_path(path: &Path) -> PathBuf {
 }
 
 /// Detect a JSONL tree's harness: a known session dir wins (a cheap tail match), else sniff the
-/// first transcript's first record — only then is the tree walked (see [`Harness::detect`]).
-fn detect_harness(root: &Path) -> Harness {
+/// first record of the `listing`'s first transcript (see [`Harness::detect`]).
+fn detect_harness(root: &Path, listing: Option<&[PathBuf]>) -> Harness {
     if let Some(h) = Harness::from_known_dir(root) {
         return h;
     }
-    let first = jsonl::iter_jsonl_files(root)
-        .first()
-        .and_then(|p| jsonl::first_record(p));
+    let first = listing.and_then(|l| l.first()).and_then(|p| jsonl::first_record(p));
     Harness::detect(root, first.as_ref())
 }
 
@@ -254,6 +281,15 @@ impl TraceSource for JsonlTree {
             Harness::Hermes => anyhow::bail!("hermes sessions are read from state.db, not a JSONL tree"),
         };
         Ok(turns)
+    }
+
+    fn read_for_check(&self, unit: &Unit) -> Result<Vec<Turn>> {
+        if self.is_omp() {
+            let path = Path::new(&unit.key);
+            Ok(omp::check(path, &claude::workdir_of(path))?)
+        } else {
+            self.read(unit)
+        }
     }
 }
 
@@ -499,9 +535,39 @@ mod tests {
 
     #[test]
     fn open_dispatches_by_extension() {
-        assert!(open(Path::new("/x/data.parquet"), None).describe().contains("parquet"));
-        assert!(open(Path::new("/x/DATA.PARQUET"), None).describe().contains("parquet"));
-        assert!(open(Path::new("/x/projects"), None).describe().contains("transcripts"));
+        assert!(open(Path::new("/x/data.parquet"), None)
+            .unwrap()
+            .describe()
+            .contains("parquet"));
+        assert!(open(Path::new("/x/DATA.PARQUET"), None)
+            .unwrap()
+            .describe()
+            .contains("parquet"));
+        assert!(open(Path::new("/x/projects"), None)
+            .unwrap()
+            .describe()
+            .contains("transcripts"));
+    }
+
+    #[test]
+    fn open_routes_turns_files_and_refuses_a_harness_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("thread.funes.jsonl");
+        std::fs::write(&file, b"").unwrap();
+        assert!(open(&file, None).unwrap().describe().contains("funes JSONL"));
+        assert!(open(dir.path(), None).unwrap().describe().contains("funes JSONL"));
+        let nested = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(nested.path().join("a/b")).unwrap();
+        std::fs::write(nested.path().join("a/b/t.funes.jsonl"), b"").unwrap();
+        assert!(open(nested.path(), None).unwrap().describe().contains("funes JSONL"));
+        let err = open_with_harness(&file, None, Some(Harness::Claude))
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("--harness"), "{err}");
+        // A tree without one stays a transcript tree.
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join("s.jsonl"), b"{}\n").unwrap();
+        assert!(open(tree.path(), None).unwrap().describe().contains("transcripts"));
     }
 
     #[test]
@@ -512,12 +578,12 @@ mod tests {
         let f = dir.path().join("sess.jsonl");
         std::fs::write(&f, b"{}\n").unwrap();
 
-        let units = open(dir.path(), None).units().unwrap();
+        let units = open(dir.path(), None).unwrap().units().unwrap();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].key, f.to_string_lossy());
         assert!(units[0].signature.is_some());
 
-        let pq = open(Path::new("/x/data.parquet"), None).units().unwrap();
+        let pq = open(Path::new("/x/data.parquet"), None).unwrap().units().unwrap();
         assert_eq!(pq.len(), 1);
         assert!(pq[0].signature.is_none());
     }
@@ -528,7 +594,7 @@ mod tests {
         for name in ["sess-a.jsonl", "agent-x.jsonl", "sess-b.jsonl", "agent-y.jsonl"] {
             std::fs::write(dir.path().join(name), b"{}\n").unwrap();
         }
-        let units = open(dir.path(), None).units().unwrap();
+        let units = open(dir.path(), None).unwrap().units().unwrap();
         // Whatever the mtimes, every main precedes every subagent.
         let first_sub = units.iter().position(|u| u.is_subagent).expect("has a subagent unit");
         assert!(units[..first_sub].iter().all(|u| !u.is_subagent));
@@ -542,10 +608,10 @@ mod tests {
         for i in 0..5 {
             std::fs::write(dir.path().join(format!("s{i}.jsonl")), b"{}\n").unwrap();
         }
-        assert_eq!(open(dir.path(), Some(2)).units().unwrap().len(), 2);
-        assert_eq!(open(dir.path(), None).units().unwrap().len(), 5);
+        assert_eq!(open(dir.path(), Some(2)).unwrap().units().unwrap().len(), 2);
+        assert_eq!(open(dir.path(), None).unwrap().units().unwrap().len(), 5);
         // The listing stays whole under a limit.
-        assert_eq!(open(dir.path(), Some(2)).unit_keys().unwrap().len(), 5);
+        assert_eq!(open(dir.path(), Some(2)).unwrap().unit_keys().unwrap().len(), 5);
     }
 
     #[test]
@@ -555,8 +621,8 @@ mod tests {
         let nested = root.join("-a-project");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let wide = open_with_harness(&root, None, Some(Harness::Claude));
-        let narrow = open_with_harness(&nested, None, Some(Harness::Claude));
+        let wide = open_with_harness(&root, None, Some(Harness::Claude)).unwrap();
+        let narrow = open_with_harness(&nested, None, Some(Harness::Claude)).unwrap();
         let inside = nested.join("s.jsonl").to_string_lossy().into_owned();
         let elsewhere = root.join("-b-project/s.jsonl").to_string_lossy().into_owned();
         assert!(wide.owns(&inside) && wide.owns(&elsewhere));
@@ -564,22 +630,27 @@ mod tests {
         assert!(narrow.owns(&inside) && !narrow.owns(&elsewhere));
 
         let db = dir.path().join("state.db");
-        let hermes = open_with_harness(&db, None, Some(Harness::Hermes));
+        let hermes = open_with_harness(&db, None, Some(Harness::Hermes)).unwrap();
         assert!(hermes.owns(&format!("{}#s1", db.display())));
         assert!(!hermes.owns(&format!("{}#s1", dir.path().join("other.db").display())));
         assert!(!hermes.owns("s1"));
-        assert!(!open(&dir.path().join("d.parquet"), None).owns(&inside));
+        assert!(!open(&dir.path().join("d.parquet"), None).unwrap().owns(&inside));
     }
 
     #[test]
     fn open_routes_hermes_state_db_and_dir() {
         // The state.db file, and the ~/.hermes dir that holds it, both route to the hermes source.
         assert!(open(Path::new("/x/.hermes/state.db"), None)
+            .unwrap()
             .describe()
             .contains("hermes"));
-        assert!(open(Path::new("/x/.hermes"), None).describe().contains("state.db"));
+        assert!(open(Path::new("/x/.hermes"), None)
+            .unwrap()
+            .describe()
+            .contains("state.db"));
         // `--harness hermes` forces the hermes source even for an unrelated-looking path.
         assert!(open_with_harness(Path::new("/x/whatever"), None, Some(Harness::Hermes))
+            .unwrap()
             .describe()
             .contains("hermes"));
     }
@@ -600,7 +671,7 @@ mod tests {
         )
         .unwrap();
 
-        let src = open(&db, None);
+        let src = open(&db, None).unwrap();
         let units = src.units().unwrap();
         assert_eq!(units.len(), 2);
         // Keyed by location, most-recent-activity first: s1's high-water id is 3 (ids 1,3) > s2's 2.
@@ -614,7 +685,10 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].harness, "hermes");
         // --limit keeps the recent N sessions, and leaves the listing whole.
-        assert_eq!(open(&db, Some(1)).units().unwrap().len(), 1);
-        assert_eq!(open(&db, Some(1)).unit_keys().unwrap(), vec![key("s1"), key("s2")]);
+        assert_eq!(open(&db, Some(1)).unwrap().units().unwrap().len(), 1);
+        assert_eq!(
+            open(&db, Some(1)).unwrap().unit_keys().unwrap(),
+            vec![key("s1"), key("s2")]
+        );
     }
 }

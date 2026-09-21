@@ -1,7 +1,7 @@
 //! Explicit OMP ingestion: persisted user/assistant text, never the active-context projection.
 //! Graph-only sidecars keep controls and excluded messages out of the searchable text schema.
 
-use super::{jsonl, Block, Turn};
+use super::{jsonl, Block, Turn, FORMAT_VERSION};
 use crate::memory::dataset;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -259,9 +259,9 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
         coverage.issue("unsupported session version; v1 requires OMP-persisted native migration");
         return (Vec::new(), coverage, None);
     }
-    let workdir = header
-        .get("cwd")
-        .and_then(Value::as_str)
+    let cwd = header.get("cwd").and_then(Value::as_str).map(str::to_owned);
+    let workdir = cwd
+        .as_deref()
         .and_then(jsonl::workdir_of_cwd)
         .unwrap_or_else(|| fallback.into());
     let mut provenance = Provenance {
@@ -405,7 +405,9 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
                         let retained = blocks(message.get("content"), &mut coverage);
                         if !retained.is_empty() {
                             turns.push(Turn {
+                                format: FORMAT_VERSION,
                                 session_id: sid.into(),
+                                cwd: cwd.clone(),
                                 workdir: workdir.clone(),
                                 turn_uuid: eid.into(),
                                 parent_uuid: parent,
@@ -471,13 +473,27 @@ fn parse(bytes: &[u8], path: &Path, signature: String, fallback: &str) -> (Vec<T
     (turns, coverage, Some(provenance))
 }
 
-pub fn read(path: &Path, fallback: &str) -> io::Result<(Vec<Turn>, Coverage)> {
+fn read_unpersisted(path: &Path, fallback: &str) -> io::Result<(Vec<Turn>, Coverage, Option<Provenance>)> {
     let signature = file_signature(path)?;
     let bytes = fs::read(path)?;
     let (turns, mut coverage, provenance) = parse(&bytes, path, signature, fallback);
     if file_signature(path)? != coverage.signature {
         coverage.issue("source changed during read");
     }
+    Ok((turns, coverage, provenance))
+}
+
+/// Validate an OMP transcript without writing its graph sidecar.
+pub fn check(path: &Path, fallback: &str) -> io::Result<Vec<Turn>> {
+    let (turns, coverage, _) = read_unpersisted(path, fallback)?;
+    if !coverage.complete {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, coverage.issues.join("; ")));
+    }
+    Ok(turns)
+}
+
+pub fn read(path: &Path, fallback: &str) -> io::Result<(Vec<Turn>, Coverage)> {
+    let (turns, coverage, provenance) = read_unpersisted(path, fallback)?;
     if let Some(mut provenance) = provenance {
         provenance.coverage = coverage.clone();
         persist(&provenance)?;

@@ -108,3 +108,50 @@ results above do not verify this revision. Use system `protoc`, run
 The source regression command includes the new BLAS unit tests. No local service
 or configuration was changed, and no release tag, deployment, or Hugging Face
 publication is part of this refresh.
+
+### September 21, 2026 upstream and dependency refresh
+
+The `update-local-20260921` branch starts from maintained-fork `origin/main` at
+`94edc7b`; pulling main required no changes. Upstream
+`https://github.com/huggingface/funes` is merged through
+`f120a742ce485668e0ca2744cc1d3819564d5c43`. This adds the
+[`.funes.jsonl` input format](funes-jsonl.md), `index --check`, arbitrary harness
+facets in recall, per-turn cwd/repo resolution, duplicate-chunk suppression within
+one append, and release-workflow hardening. The fork retains version `1.4.0+dev`,
+its OMP indexing budgets and scanner receipts, revision-bound local source
+protocol 1, and the existing Codex/OMP provenance compatibility fixes. The new
+serialized turn format is independent of the local source protocol; it does not
+enroll third-party exports as Actomasto originals.
+
+OMP turns now carry their recorded cwd through the shared turn model, preserving
+repository facets after the upstream indexing refactor. `index --check` also
+supports explicit OMP input without writing graph sidecars; incomplete OMP
+coverage rejects the checked unit rather than reporting a clean partial parse.
+The existing indexing path still persists its graph metadata.
+
+`cargo update` refreshed seven packages within the existing manifest constraints:
+`cc` 1.4.6 → 1.4.7, `find-msvc-tools` 0.1.12 → 0.1.13,
+`generator` 0.8.9 → 0.8.10, `hyper-rustls` 0.27.9 → 0.27.10,
+`libredox` 0.1.24 → 0.1.25, `rand` 0.10.2 → 0.10.3, and
+`stop-words` 0.10.0 → 0.10.1. Lance remains pinned to 11.0.0 and `hf-hub`
+remains 1.0.0.
+
+Dependency resolution succeeded; all builds, tests, formatting, linting, and
+runtime verification are deferred to the integration owner. Historical results
+above do not verify this merge. Build only after committing, using system
+`protoc` and `cargo build --locked --release`; `build.rs` embeds the current
+full Git revision, which consumers must pin. A pre-existing `CARGO_TARGET_DIR`
+can reuse compiled dependencies when the toolchain, profile, features and
+compiler flags match; do not clean it or reuse a binary without rebuilding and
+checking its `source` capabilities revision. Use a separate cache if other
+worktrees are building concurrently.
+
+Run `cargo test --locked --lib --bin funes --test local_source_normalize`, then
+`cargo test --locked --test funes_jsonl_index --test index_check --test index_recall --test reindex_incremental`.
+Exercise `index --check` on synthetic `.funes.jsonl` and explicit OMP fixtures
+with a disposable home, verify rejected units and no persistent writes, and run
+the bridge and Actomasto consumer checks against the same executable. The
+upstream merge changes indexing and recall behavior, so source-protocol tests
+alone are insufficient. No local service or configuration was changed. The fork's
+removed Hugging Face publication step stays removed; pushing this source branch
+does not create a release tag, publish an artifact, or deploy anything.
