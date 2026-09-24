@@ -405,7 +405,7 @@ fn claude(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     }
     if !one_of(
         &row["version"],
-        "2.1.220 2.1.221 2.1.223 2.1.224 2.1.226 2.1.227 2.1.228 2.1.229 2.1.231 2.1.232 2.1.233 2.1.260 2.1.263",
+        "2.1.220 2.1.221 2.1.223 2.1.224 2.1.226 2.1.227 2.1.228 2.1.229 2.1.231 2.1.232 2.1.233 2.1.260 2.1.263 2.1.280",
     ) {
         return Err("unsupported_version");
     }
@@ -521,10 +521,25 @@ fn codex_user_confirmation(content: &Value) -> Result<String, &'static str> {
 fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let payload = &row["payload"];
     if !payload.is_object()
-        || !allowed_keys(row, "type timestamp payload ordinal")
+        || !allowed_keys(row, "type timestamp payload ordinal metadata")
         || row.get("ordinal").is_some_and(|ordinal| ordinal.as_u64().is_none())
     {
         return Err(SCHEMA);
+    }
+    if let Some(metadata) = row.get("metadata") {
+        // Client tool-output bookkeeping is not human-authored evidence.
+        // Do not accept it on messages where it could alter attribution.
+        if row["type"] != "response_item"
+            || payload["type"] != "function_call_output"
+            || !metadata.is_object()
+            || !allowed_keys(metadata, "client_authored fallback_token_limit_override")
+            || metadata.get("client_authored").is_some_and(|v| !v.is_boolean())
+            || metadata
+                .get("fallback_token_limit_override")
+                .is_some_and(|v| v.as_u64().is_none())
+        {
+            return Err(SCHEMA);
+        }
     }
     let mut event = Event::new(row, context);
     let kind = &row["type"];
@@ -591,6 +606,10 @@ fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
                 } else {
                     Role::Reset
                 };
+            } else if item["type"] == "ImageView" {
+                if !allowed_keys(item, "type id path") || !item["id"].is_string() || !item["path"].is_string() {
+                    return Err(SCHEMA);
+                }
             } else if !one_of(&item["type"], "AgentMessage CommandExecution Extension FileChange McpToolCall Reasoning WebSearch") {
                 return Err(SCHEMA);
             }
@@ -746,9 +765,14 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let allowed = match message["role"].as_str() {
         Some("bashExecution") => "role command output exitCode cancelled truncated timestamp excludeFromContext",
         Some("fileMention") => "role files timestamp",
-        _ => "api attribution completedAt content contextSnapshot details duration errorId errorMessage errorStatus inputTransformations isError model provider providerPayload prunedAt responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft usage useless",
+        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError model provider providerPayload prunedAt responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
     };
     if !allowed_keys(message, allowed) {
+        return Err(SCHEMA);
+    }
+    if message.get("upstreamModel").is_some_and(|v| !v.is_string())
+        || message.get("credentialId").is_some_and(|v| v.as_u64().is_none())
+    {
         return Err(SCHEMA);
     }
     if one_of(

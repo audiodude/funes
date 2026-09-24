@@ -740,3 +740,81 @@ fn omp_auxiliary_messages_preserve_lineage_and_boundaries_without_private_payloa
     assert_eq!(unknown["status"], "unknown_content_schema");
     assert_eq!(unknown["turns"], json!([]));
 }
+
+#[test]
+fn current_claude_and_omp_metadata_preserve_complete_turn_evidence() {
+    for harness in ["claude", "omp"] {
+        let mut rows = conversation(harness);
+        if harness == "claude" {
+            for row in &mut rows {
+                row["version"] = json!("2.1.280");
+            }
+        } else {
+            rows[2]["message"]["upstreamModel"] = json!("provider-model");
+            rows[2]["message"]["credentialId"] = json!(42);
+        }
+        let result = parse(&rows, harness, 10.0, true);
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["turns"][0]["invalid"], false);
+        assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+        assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+        assert_eq!(result["turns"][0]["items"][1]["text"], "Answer");
+        assert!(!result.to_string().contains("credentialId"));
+        assert!(!result.to_string().contains("provider-model"));
+        if harness == "omp" {
+            for field in ["upstreamModel", "credentialId"] {
+                let mut malformed = rows.clone();
+                malformed[2]["message"][field] = json!({"attribution": "user"});
+                let rejected = parse(&malformed, harness, 10.0, true);
+                assert_eq!(rejected["status"], "unknown_content_schema");
+                assert_eq!(rejected["turns"], json!([]));
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_image_view_and_client_tool_metadata_are_not_evidence() {
+    let mut rows = conversation("codex");
+    let mut output = codex(
+        "response_item",
+        2.5,
+        json!({
+            "type": "function_call_output", "call_id": "tool", "output": "PRIVATE TOOL OUTPUT"
+        }),
+    );
+    output["metadata"] = json!({"client_authored": true, "fallback_token_limit_override": 2000});
+    rows.insert(5, output);
+    rows.insert(
+        6,
+        codex(
+            "event_msg",
+            2.6,
+            json!({
+                "type": "item_completed", "thread_id": "s", "turn_id": "t",
+                "item": {"type": "ImageView", "id": "image", "path": "/PRIVATE.png"}
+            }),
+        ),
+    );
+    let result = parse(&rows, "codex", 10.0, true);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["turns"][0]["invalid"], false);
+    assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+    assert_eq!(result["turns"][0]["items"][1]["text"], "Answer");
+    assert_eq!(result["turns"][0]["items"].as_array().unwrap().len(), 2);
+    assert!(!result.to_string().contains("PRIVATE"));
+
+    let mut forged_message = rows.clone();
+    forged_message[3]["metadata"] = rows[5]["metadata"].clone();
+    let mut unknown_metadata = rows.clone();
+    unknown_metadata[5]["metadata"]["attribution"] = json!("user");
+    let mut malformed_metadata = rows.clone();
+    malformed_metadata[5]["metadata"]["client_authored"] = json!("true");
+    let mut unknown_image = rows.clone();
+    unknown_image[6]["payload"]["item"]["content"] = json!("PRIVATE");
+    for rejected in [forged_message, unknown_metadata, malformed_metadata, unknown_image] {
+        let result = parse(&rejected, "codex", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+}

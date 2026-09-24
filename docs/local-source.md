@@ -50,6 +50,15 @@ records still contribute lineage and time boundaries. Unknown schemas and
 missing originals remain errors. No enrollment, tombstones, or durable identities
 are changed by this compatibility repair.
 
+Current compatibility also includes Claude `2.1.280`, Codex `ImageView`
+completion records, and client-authored function-call-output bookkeeping
+(`client_authored` and `fallback_token_limit_override`). That bookkeeping is
+accepted only on tool outputs, never on user/assistant messages. OMP accepts
+string `upstreamModel` and unsigned-integer `credentialId` metadata. These fields
+are excluded from evidence; unknown fields, malformed types, attribution rules,
+and completion gates still fail closed. This does not restore deleted originals
+or clear inventory tombstones.
+
 ## Consumer durability and permissions
 
 Actomasto checks gates before all requests and before durable updates. It maps every cwd boundary to the unique deepest discovered repository, including ineligible nested repositories; applies whole interval and per-message eligibility; checks existing source_markers and `adapter-unit:*` markers before read; applies whole-turn secret/blocklist filters before persistence or transmission. It records a terminal marker only after durable exclusion or enqueue. Enumeration cursor advances only after all source turns are durably handled; pending or unavailable activity is revisited on subsequent passes without changing collection/expiry times. Full metadata re-enumeration is safe with exact unit deduplication. No adapter stream offsets/inodes are converted into cursors. Configuration/database migration preserves old terminal markers and pending timestamps, initializes conversation health closed, and rejects old binaries via database/config versioning.
