@@ -59,6 +59,14 @@ are excluded from evidence; unknown fields, malformed types, attribution rules,
 and completion gates still fail closed. This does not restore deleted originals
 or clear inventory tombstones.
 
+OMP 18.3.1 assistant `requestControls` records are provider replay bookkeeping,
+not conversation evidence. The accepted shape is an unsigned `messageIndex`,
+optional `tools` with string-array `declared`/`deferred`/`active` fields, and
+optional `effort` with `topLevel`/`tail` values of null or
+`low`/`medium`/`high`/`xhigh`/`max`. Unknown fields, malformed values, missing
+required nested fields, and non-assistant carriers remain rejected. Completion,
+human attribution, lineage, and project/time boundary gates are unchanged.
+
 ## Consumer durability and permissions
 
 Actomasto checks gates before all requests and before durable updates. It maps every cwd boundary to the unique deepest discovered repository, including ineligible nested repositories; applies whole interval and per-message eligibility; checks existing source_markers and `adapter-unit:*` markers before read; applies whole-turn secret/blocklist filters before persistence or transmission. It records a terminal marker only after durable exclusion or enqueue. Enumeration cursor advances only after all source turns are durably handled; pending or unavailable activity is revisited on subsequent passes without changing collection/expiry times. Full metadata re-enumeration is safe with exact unit deduplication. No adapter stream offsets/inodes are converted into cursors. Configuration/database migration preserves old terminal markers and pending timestamps, initializes conversation health closed, and rejects old binaries via database/config versioning.

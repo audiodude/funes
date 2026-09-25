@@ -774,6 +774,61 @@ fn current_claude_and_omp_metadata_preserve_complete_turn_evidence() {
 }
 
 #[test]
+fn omp_request_controls_preserve_evidence_without_exposing_provider_bookkeeping() {
+    for controls in [
+        json!({"messageIndex": 1}),
+        json!({"messageIndex": 1, "tools": {"declared": ["PRIVATE"], "deferred": [], "active": ["PRIVATE"]}}),
+        json!({"messageIndex": 1, "effort": {"topLevel": null, "tail": "xhigh"}}),
+        json!({"messageIndex": 1, "tools": {"declared": [], "deferred": [], "active": []}, "effort": {"topLevel": "high", "tail": null}}),
+    ] {
+        let mut rows = conversation("omp");
+        rows[2]["message"]["requestControls"] = controls;
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["turns"][0]["invalid"], false);
+        assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+        assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+        assert_eq!(result["turns"][0]["items"][1]["text"], "Answer");
+        assert!(!result.to_string().contains("PRIVATE"));
+        assert!(!result.to_string().contains("requestControls"));
+    }
+}
+
+#[test]
+fn omp_request_controls_reject_unknown_shapes_and_non_assistant_carriers() {
+    for controls in [
+        Value::Null,
+        json!([]),
+        json!({}),
+        json!({"messageIndex": -1}),
+        json!({"messageIndex": 1.5}),
+        json!({"messageIndex": 1, "attribution": "user"}),
+        json!({"messageIndex": 1, "tools": null}),
+        json!({"messageIndex": 1, "tools": {"declared": [], "deferred": []}}),
+        json!({"messageIndex": 1, "tools": {"declared": [42], "deferred": [], "active": []}}),
+        json!({"messageIndex": 1, "tools": {"declared": [], "deferred": [], "active": [], "attribution": "user"}}),
+        json!({"messageIndex": 1, "effort": null}),
+        json!({"messageIndex": 1, "effort": {"topLevel": "high"}}),
+        json!({"messageIndex": 1, "effort": {"topLevel": "unknown", "tail": null}}),
+        json!({"messageIndex": 1, "effort": {"topLevel": null, "tail": null, "attribution": "user"}}),
+    ] {
+        let mut rows = conversation("omp");
+        rows[2]["message"]["requestControls"] = controls;
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+    for role in ["user", "toolResult", "system", "developer"] {
+        let mut rows = conversation("omp");
+        rows[1]["message"]["role"] = json!(role);
+        rows[1]["message"]["requestControls"] = json!({"messageIndex": 1});
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+}
+
+#[test]
 fn codex_image_view_and_client_tool_metadata_are_not_evidence() {
     let mut rows = conversation("codex");
     let mut output = codex(

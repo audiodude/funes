@@ -765,7 +765,7 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let allowed = match message["role"].as_str() {
         Some("bashExecution") => "role command output exitCode cancelled truncated timestamp excludeFromContext",
         Some("fileMention") => "role files timestamp",
-        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError model provider providerPayload prunedAt responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
+        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError model provider providerPayload prunedAt requestControls responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
     };
     if !allowed_keys(message, allowed) {
         return Err(SCHEMA);
@@ -774,6 +774,35 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         || message.get("credentialId").is_some_and(|v| v.as_u64().is_none())
     {
         return Err(SCHEMA);
+    }
+    if let Some(controls) = message.get("requestControls") {
+        // Provider replay bookkeeping is assistant-only metadata, never evidence.
+        if message["role"] != "assistant"
+            || !allowed_keys(controls, "messageIndex tools effort")
+            || controls["messageIndex"].as_u64().is_none()
+        {
+            return Err(SCHEMA);
+        }
+        if let Some(tools) = controls.get("tools") {
+            if !allowed_keys(tools, "declared deferred active")
+                || ["declared", "deferred", "active"].iter().any(|key| {
+                    !tools[key].as_array().is_some_and(|names| names.iter().all(Value::is_string))
+                })
+            {
+                return Err(SCHEMA);
+            }
+        }
+        if let Some(effort) = controls.get("effort") {
+            if !allowed_keys(effort, "topLevel tail")
+                || ["topLevel", "tail"].iter().any(|key| {
+                    !effort.get(key).is_some_and(|value| {
+                        value.is_null() || one_of(value, "low medium high xhigh max")
+                    })
+                })
+            {
+                return Err(SCHEMA);
+            }
+        }
     }
     if one_of(
         &message["role"],
