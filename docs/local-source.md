@@ -161,3 +161,26 @@ indexing, native MCP recall/get, and warm-reader refresh probes.
 Formatting and linting were not rerun. The removed Hugging Face publication step
 stays removed; only the source branch was pushed, without a release tag or artifact.
 Verification assisted by OpenAI Codex.
+
+### September 25, 2026 compatible dependency refresh
+
+The `update-all-20260925` branch preserves `update-all-20260924` at `c6396271`
+and the later current-schema normalization changes at `1c4e2fc2`. Both source
+worktrees were clean. Fetching maintained-fork `origin/main` and upstream
+`huggingface/funes` main required no merge: upstream remains at `8c7c5ca`
+(after stable v1.3.3), already included in the fork.
+
+`cargo update` refreshed twelve compatible locked packages, including
+`encoding_rs` 0.8.42, `hyper-util` 0.1.21, `rustls-platform-verifier` 0.7.1,
+`smallvec` 1.16.2, and the WebAssembly bindings, and removed the unused
+`multiversion`/`multiversion-macros` 0.9.0 dependency pair. Lance remains pinned
+to 11.0.0; the manifest, local source protocol 1, and `actomasto-v1` identity
+remain unchanged. Current Claude, Codex, and OMP metadata normalization is
+retained.
+
+Verify the committed build with `cargo test --locked --lib --bin funes --test
+local_source_normalize`, then exercise `source` capabilities and a synthetic
+refresh/enumerate/turns/read round trip before consumer activation. Earlier
+verification above does not cover this lockfile. This source refresh does not
+switch installations or services, publish a release or Hugging Face artifact,
+or upload memory.
