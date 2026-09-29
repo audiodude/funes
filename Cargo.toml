@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/huggingface/funes"
 
 [dependencies]
+libc = "0.2"  # geteuid: whose files funes will run
 # The `onnx` backend (feature below): embeddings + rerank on the ONNX Runtime. Off by default —
 # ort ships prebuilt against glibc 2.38, above the glibc 2.35 floor releases target (Ubuntu 22.04).
 fastembed = { version = "5", optional = true }
@@ -14,6 +15,7 @@ arrow-array = "58"               # RecordBatch types (must match lance's arrow v
 arrow-schema = "58"              # Schema/Field/DataType for building batches
 arrow-select = "58"              # filter_record_batch: drop secret-bearing rows before a push
 # huggingface = hf:// reads/writes (Xet-cached).
+# 11 and 12 leak an IVF scratch dir per index build; on 13.0.0 drop `sweep_shuffle_leftovers`.
 lance = { version = "=11.0.0", default-features = false, features = ["huggingface"] }  # Dataset open/scan/append + create_index, local and over hf://
 lance-io = { version = "=11.0.0", default-features = false, features = ["huggingface"] }  # hf:// object store + WrappingObjectStore
 lance-index = "=11.0.0"          # FTS/IVF index params + FullTextSearchQuery
@@ -23,8 +25,7 @@ object_store = "=0.13.2"         # the ObjectStore trait the capture wrapper imp
 async-trait = "0.1"              # for the ObjectStore impl in src/memory/capture_store.rs
 bytes = "1"                      # captured write payloads
 chrono = "0.4"                   # recency weighting
-rusqlite = { version = "0.32", features = ["bundled"] }  # read hermes' ~/.hermes/state.db; bundled = SQLite compiled in, no runtime dep
-serde_yaml = "0.9"               # merge funes' hooks into hermes' ~/.hermes/config.yaml
+rusqlite = { version = "0.32", features = ["bundled"] }  # local source inventory
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }  # sync: OnceCell/Mutex cache the recall models
 futures = "0.3"
 anyhow = "1"
@@ -36,7 +37,7 @@ sha1 = "0.10"                    # chunk id = sha1(...)[:16]
 sha2 = "0.10"                    # verify release binaries before the installer/updater executes them
 hex = "0.4"
 walkdir = "2"                    # recursive *.jsonl walk
-rmcp = { version = "1", features = ["server", "macros", "transport-io", "schemars"] }  # MCP stdio server
+rmcp = { version = "3", features = ["server", "macros", "transport-io", "schemars"] }  # MCP stdio server
 tempfile = "3"                   # temp dir for the pre-publish secret scan; temp files/dirs in tests
 hf-hub = { version = "1.0.0", features = ["rustls-tls", "blocking"] }  # native create_commit + parent_commit CAS + Xet upload; blocking: model download in the blas backend
 # Optional handle on the transitively-pulled openssl-sys (native-tls, via lance).

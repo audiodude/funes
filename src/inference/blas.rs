@@ -5,10 +5,11 @@
 //! trait impls — is shared, cross-platform source. Gated behind the `blas` feature.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use safetensors::SafeTensors;
+use anyhow::{anyhow, bail, Context, Result};
+use safetensors::tensor::Metadata;
 use tokenizers::utils::padding::pad_encodings;
 use tokenizers::{Encoding, PaddingParams, Tokenizer, TruncationParams};
 
@@ -186,8 +187,7 @@ mod seam {
     #[multiversion::multiversion(targets("x86_64+avx512f+avx512bw+avx512dq", "x86_64+avx2+fma"))]
     pub fn vmax(x: &[f32]) -> f32 {
         let mut acc = [f32::MIN; LANES];
-        let chunks = x.chunks_exact(LANES);
-        let rem = chunks.remainder();
+        let (chunks, rem) = x.as_chunks::<LANES>();
         for c in chunks {
             for (a, v) in acc.iter_mut().zip(c) {
                 *a = a.max(*v);
@@ -201,8 +201,7 @@ mod seam {
     #[multiversion::multiversion(targets("x86_64+avx512f+avx512bw+avx512dq", "x86_64+avx2+fma"))]
     pub fn vsum(x: &[f32]) -> f32 {
         let mut acc = [0f32; LANES];
-        let chunks = x.chunks_exact(LANES);
-        let rem = chunks.remainder();
+        let (chunks, rem) = x.as_chunks::<LANES>();
         for c in chunks {
             for (a, v) in acc.iter_mut().zip(c) {
                 *a += *v;
@@ -652,21 +651,81 @@ fn local_snapshot(repo: &str) -> Option<PathBuf> {
     None
 }
 
+/// The f32 tensors of `dir/model.safetensors`, one tensor at a time. Reading the file whole would
+/// hold its bytes and the f32 copies of them side by side — 2.2 GB for the reranker's 1.1 GB of
+/// weights, on a run that keeps 1.2 GB — so only the header is buffered and each tensor is
+/// converted through a small window.
 fn load_weights(dir: &Path) -> Result<HashMap<String, Vec<f32>>> {
-    let bytes = std::fs::read(dir.join("model.safetensors"))?;
-    let st = SafeTensors::deserialize(&bytes)?;
-    let mut w = HashMap::new();
-    for (name, view) in st.tensors() {
-        if view.dtype() == safetensors::Dtype::F32 {
-            let f: Vec<f32> = view
-                .data()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            w.insert(name, f);
-        }
+    /// Bytes read per conversion. A multiple of 4, so no f32 straddles two reads.
+    const WINDOW: usize = 1 << 20;
+    /// What safetensors itself accepts, so a corrupt length cannot ask for an unbounded allocation.
+    const MAX_HEADER: u64 = 100_000_000;
+
+    let path = dir.join("model.safetensors");
+    let mut file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+
+    // A safetensors file is an 8-byte little-endian header length, that many bytes of JSON naming
+    // each tensor, then the tensor data the header's offsets index into.
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len)
+        .with_context(|| format!("reading the header length of {}", path.display()))?;
+    let head_len = u64::from_le_bytes(len);
+    if head_len > MAX_HEADER || head_len + 8 > size {
+        bail!(
+            "{} declares a {head_len}-byte header, which its {size} bytes cannot hold",
+            path.display()
+        );
     }
-    Ok(w)
+    let mut head = vec![0u8; head_len as usize];
+    file.read_exact(&mut head)
+        .with_context(|| format!("reading the header of {}", path.display()))?;
+    // Deserializing `Metadata` runs safetensors' own validation: the offsets tile the data from zero
+    // and each tensor's shape and dtype account for exactly its byte range.
+    let meta: Metadata =
+        serde_json::from_slice(&head).with_context(|| format!("parsing the header of {}", path.display()))?;
+
+    // The one thing the header cannot answer on its own: the data has to be as long as it accounts for.
+    let data_start = 8 + head_len;
+    let accounted = meta.tensors().values().map(|i| i.data_offsets.1).max().unwrap_or(0) as u64;
+    let data_len = size - data_start;
+    if accounted != data_len {
+        bail!(
+            "{} carries {data_len} bytes of tensor data, its header accounts for {accounted}",
+            path.display()
+        );
+    }
+
+    let mut tensors: Vec<(String, usize, usize)> = meta
+        .tensors()
+        .into_iter()
+        .filter(|(_, i)| i.dtype == safetensors::Dtype::F32)
+        .map(|(name, i)| (name, i.data_offsets.0, i.data_offsets.1))
+        .collect();
+    // Front to back, so the reads below never seek backwards over the file.
+    tensors.sort_by_key(|(_, start, _)| *start);
+
+    let mut weights = HashMap::with_capacity(tensors.len());
+    let mut window = vec![0u8; WINDOW];
+    let mut at = 0usize;
+    for (name, start, end) in tensors {
+        if at != start {
+            file.seek(SeekFrom::Start(data_start + start as u64))
+                .with_context(|| format!("seeking to {name} in {}", path.display()))?;
+        }
+        let mut vals: Vec<f32> = Vec::with_capacity((end - start) / 4);
+        let mut left = end - start;
+        while left > 0 {
+            let take = left.min(WINDOW);
+            file.read_exact(&mut window[..take])
+                .with_context(|| format!("reading {name} from {}", path.display()))?;
+            vals.extend(window[..take].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)));
+            left -= take;
+        }
+        at = end;
+        weights.insert(name, vals);
+    }
+    Ok(weights)
 }
 
 fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
@@ -821,6 +880,83 @@ impl Reranker for BlasReranker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-built safetensors file: every f32 tensor comes back whole whatever order the header
+    /// lists it in, a tensor of another dtype is skipped, and a file whose header and data disagree
+    /// is refused instead of read.
+    #[test]
+    fn load_weights_streams_every_f32_tensor_and_refuses_a_bad_file() {
+        fn file(dir: &Path, header: &str, data: &[u8]) {
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(data);
+            std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+        }
+        let mut data = Vec::new();
+        data.extend(1.0f32.to_le_bytes()); // "second", listed first in the header
+        data.extend((-2.5f32).to_le_bytes());
+        data.extend(7i64.to_le_bytes()); // an i64 tensor, skipped
+        data.extend(0.5f32.to_le_bytes()); // "first", listed last
+        let header = r#"{"__metadata__":{"format":"pt"},"second":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"skipped":{"dtype":"I64","shape":[1],"data_offsets":[8,16]},"first":{"dtype":"F32","shape":[1],"data_offsets":[16,20]}}"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        file(dir.path(), header, &data);
+        let w = load_weights(dir.path()).unwrap();
+        assert_eq!(w.len(), 2, "only the f32 tensors are loaded: {:?}", w.keys());
+        assert_eq!(w["second"], vec![1.0, -2.5]);
+        assert_eq!(w["first"], vec![0.5]);
+
+        // A shape its byte range cannot hold, and a gap between two tensors: safetensors' own
+        // validation catches both while the header is deserialized. `{err:#}` to see its message
+        // under the context this adds.
+        let bad = tempfile::tempdir().unwrap();
+        file(
+            bad.path(),
+            r#"{"t":{"dtype":"F32","shape":[64],"data_offsets":[0,4]}}"#,
+            &data[..4],
+        );
+        let err = format!("{:#}", load_weights(bad.path()).unwrap_err());
+        assert!(
+            err.contains("invalid shape, data type, or offset"),
+            "a shape its bytes cannot hold must be refused, got: {err}"
+        );
+
+        let gap = tempfile::tempdir().unwrap();
+        let two = r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[8,12]}}"#;
+        file(gap.path(), two, &data[..12]);
+        let err = format!("{:#}", load_weights(gap.path()).unwrap_err());
+        assert!(
+            err.contains("invalid offset for tensor"),
+            "a gap in the data must be refused, got: {err}"
+        );
+
+        // Data the header does not account for. The header alone cannot catch this, so the loader
+        // checks it against the file's length.
+        let extra = tempfile::tempdir().unwrap();
+        file(
+            extra.path(),
+            r#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &data[..8],
+        );
+        let err = format!("{:#}", load_weights(extra.path()).unwrap_err());
+        assert!(
+            err.contains("8 bytes of tensor data") && err.contains("accounts for 4"),
+            "a longer data section must be refused, got: {err}"
+        );
+
+        // And a truncated one, which the same check catches from the other side.
+        let short = tempfile::tempdir().unwrap();
+        file(
+            short.path(),
+            r#"{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#,
+            &data[..4],
+        );
+        let err = format!("{:#}", load_weights(short.path()).unwrap_err());
+        assert!(
+            err.contains("4 bytes of tensor data") && err.contains("accounts for 8"),
+            "a truncated data section must be refused, got: {err}"
+        );
+    }
 
     /// Padded columns carry a -1e30 mask into the softmax. Should `exp` return FLT_MIN for them
     /// instead of 0, the `*= 1/sum` step scales that into the 1e-40 range, leaving every masked

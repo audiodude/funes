@@ -1,15 +1,37 @@
-//! `funes add <agent>` / `funes remove <agent>`: the per-agent integrations, one module each, plus
-//! the small helpers they share for installing and removing themselves.
+//! `funes add <agent>` / `funes remove <agent>`: the registry ([`registry`]) that resolves an agent
+//! id to an installed integration and runs it, plus the two helpers it needs. Every agent is an
+//! integration script; funes's knowledge of one is the lookup.
 
-pub mod claude;
-pub mod codex;
-pub mod hermes;
-pub mod hooks;
-pub mod pi;
+pub mod registry;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Command;
+
+use crate::traces::spool;
+
+/// What a read says when this funes and an install on this machine disagree, one `note:` line per
+/// case, or `None`: a hook asked for a spool nothing writes (an install from before the spool), or a
+/// registered integration speaks another contract (an install by another binary). The cure is the
+/// same, `funes add <id>` again — and funes knows no agent here, only what asked and what is
+/// registered.
+///
+/// `memory` is the one the caller serves, when it knows it: the MCP server's own, since the agent
+/// launched it with the binding `funes add` recorded. A bare `funes add <id>` would bind anew, so
+/// the cure names the memory when it can and asks for it when it cannot.
+pub fn stale_install_notice(memory: Option<&str>) -> Option<String> {
+    let line = |id: &str| {
+        let cure = match memory {
+            Some(memory) => format!("Re-run `funes add {id} {memory}` to update it."),
+            None => format!("Re-run `funes add {id}`, naming the memory it is bound to, to update it."),
+        };
+        format!("the {id} integration does not match this version of funes. {cure}")
+    };
+    let mut lines: Vec<String> = spool::missing().iter().map(|id| line(id)).collect();
+    if let Ok(root) = registry::default_root() {
+        lines.extend(registry::mismatched(&root).iter().map(|(id, _)| line(id)));
+    }
+    (!lines.is_empty()).then(|| lines.iter().map(|line| format!("note: {line}\n")).collect())
+}
 
 /// Render an argv as a copy/paste-safe POSIX shell command.
 pub(crate) fn shell_command<S: AsRef<str>>(program: &str, args: &[S]) -> String {
@@ -32,80 +54,17 @@ fn shell_arg(arg: &str) -> String {
     }
 }
 
-/// What happened when an agent CLI was asked to remove one funes registration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RemoveCommand {
-    /// The command succeeded, including CLIs that report an already-absent registration as success.
-    Removed,
-    /// The command reported the registration was already absent.
-    Absent,
-    /// The agent CLI is not installed or not on `PATH`.
-    MissingCli,
-}
-
-/// Run an agent CLI's remove command. Removal is idempotent: a non-zero status whose output
-/// contains one of `absent_markers` is treated as already removed. Other failures retain their
-/// diagnostics and fail rather than claiming a partial uninstall succeeded.
-pub(crate) fn run_remove(program: &str, args: &[&str], absent_markers: &[&str]) -> Result<RemoveCommand> {
-    let command = shell_command(program, args);
-    let output = match Command::new(program).args(args).output() {
-        Ok(output) => output,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RemoveCommand::MissingCli),
-        Err(e) => return Err(anyhow::Error::new(e).context(format!("running `{command}`"))),
-    };
-    if output.status.success() {
-        return Ok(RemoveCommand::Removed);
-    }
-
-    let detail = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if absent_markers.iter().any(|marker| detail.contains(marker)) {
-        return Ok(RemoveCommand::Absent);
-    }
-    let detail = detail.trim();
-    let suffix = if detail.is_empty() {
-        String::new()
-    } else {
-        format!(": {detail}")
-    };
-    bail!("`{command}` failed (exit {:?}){suffix}", output.status.code())
-}
-
-/// Remove one exact funes-owned file. Missing is already removed.
-pub(crate) fn remove_file(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e).context(format!("removing {}", path.display()))),
-    }
-}
-
 /// Remove one exact funes-owned tree without following a symlink at the tree root.
 pub(crate) fn remove_tree(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => remove_file(path),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("removing {}", path.display()))),
+        },
         Ok(_) => std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(anyhow::Error::new(e).context(format!("inspecting {}", path.display()))),
-    }
-}
-
-/// Prune an integration parent only when it is now empty.
-pub(crate) fn remove_empty_dir(path: &Path) -> Result<()> {
-    match std::fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(anyhow::Error::new(e).context(format!("removing empty {}", path.display()))),
     }
 }
 

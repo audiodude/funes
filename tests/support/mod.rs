@@ -1,32 +1,14 @@
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+// Shared by the test binaries that drive `funes`; each uses the subset it needs.
+#![allow(dead_code)]
 
-pub fn fake_cli(root: &Path, name: &str) -> PathBuf {
-    let bin = root.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let path = bin.join(name);
-    fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FUNES_TEST_CLI_LOG\"\n").unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    bin
-}
+use std::path::PathBuf;
+use std::process::Output;
 
-pub fn run_remove(home: &Path, bin: &Path, log: &Path, agent: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_funes"))
-        .args(["remove", agent])
-        .env("HOME", home)
-        .env("PATH", bin)
-        // Every variable that would point funes at something real: `CODEX_HOME` answers when funes
-        // asks Codex where its home is, and `FUNES_HOME` names the memory. A developer running the
-        // suite with either set would otherwise have their own integration removed.
-        .env_remove("CODEX_HOME")
-        .env_remove("FUNES_HOME")
-        .env("FUNES_TEST_CLI_LOG", log)
-        .output()
-        .unwrap()
+/// The model cache the embedder and reranker read, for a run whose `$HOME` is fake.
+pub fn hf_home() -> PathBuf {
+    std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("a home")).join(".cache/huggingface"))
 }
 
 pub fn assert_success(output: &Output) {

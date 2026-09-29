@@ -152,7 +152,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           targets: ${{ matrix.target }}
 
@@ -166,7 +166,7 @@ jobs:
 
       # Faster, lower-memory linker — keeps the heavy lance link in budget. The action runs as
       # root inside the container (no sudo) and downloads with wget, installed above.
-      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
+      - uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621 # v1
 
       # aarch64 is cross-compiled inside the same 22.04 container, so its sysroot pins the same
       # glibc 2.35 floor. gcc-aarch64-linux-gnu links the binary and (via the cc crate) builds
@@ -243,7 +243,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: dtolnay/rust-toolchain@46817827a5bfabe028bf34e1cce71fd40e2ff697 # 1.95.0
         with:
           targets: aarch64-apple-darwin
 

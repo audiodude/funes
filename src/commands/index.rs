@@ -1,9 +1,10 @@
-//! The `index` command: read a [`crate::traces::source::TraceSource`] → parse → chunk → embed → write to a
-//! local Lance dataset. One generic loop drives every source — a JSONL tree today, new formats by
-//! implementing the trait — indexing each of its units in a single append.
+//! The `index` command: read a [`crate::traces::source::TraceSource`] → parse → chunk → write to a
+//! local Lance dataset → embed. One generic loop drives every source — a JSONL tree today, new
+//! formats by implementing the trait — writing each of its units in a single append, unembedded;
+//! the vectors are filled afterwards from what the memory says is still pending.
 //!
-//! Incremental on two levels: skip a unit whose stamp (size:mtime) is unchanged *and* which
-//! state.json records as already indexed to the run's target tier; and within a re-read unit add
+//! Incremental on two levels: skip a unit whose stamp (length, mtime, inode) is unchanged *and* which
+//! state.json records as already indexed to the top tier; and within a re-read unit add
 //! only chunks whose id is new — a grown session (the same memory) contributes just its new turns,
 //! nothing is re-embedded or deleted.
 
@@ -14,15 +15,16 @@ use crate::memory::dataset::{self, build_batch, schema};
 use crate::memory::lock;
 use crate::memory::{Memory, MemoryState};
 use crate::scan;
-use crate::traces::harness::Harness;
+use crate::traces::spool;
 use crate::traces::{self, omp, repo, source};
+use crate::ui;
 use anyhow::{Context, Result};
-use arrow_array::{Array, RecordBatchIterator, StringArray};
+use arrow_array::{Array, RecordBatchIterator, StringArray, UInt64Array};
 use futures::TryStreamExt;
-use lance::dataset::{Dataset, WriteParams};
+use lance::dataset::{Dataset, WriteParams, ROW_ID};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,7 +81,16 @@ async fn stored_ids(ds: &Dataset) -> Result<HashSet<String>> {
     Ok(ids)
 }
 
-/// Elide every block's inline base64 `data:` URI payloads, before [`redact_turns`] scans them: a
+/// A batch's string column, row by row.
+fn str_column<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> Result<Vec<&'a str>> {
+    let col = batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .with_context(|| format!("missing or non-string column {name}"))?;
+    Ok((0..batch.num_rows()).map(|i| col.value(i)).collect())
+}
+
+/// Elide every block's inline base64 `data:` URI payloads, before [`redact_units`] scans them: a
 /// screenshot's entropy trips detectors on values that are not secrets, and excising one of those
 /// plants a marker mid-payload that strands the rest of it in the store. Runs whether or not a
 /// scanner is installed — the payload is unrecallable either way.
@@ -91,65 +102,110 @@ fn elide_turns(turns: &mut [traces::Turn]) {
     }
 }
 
-/// Redact secrets from a session's turns *before* chunking — so a long key that chunking would
-/// split across pieces is whole when scanned, and never reaches the embedding, the local memory, or
-/// (via push) the Hub. Scans exactly the blocks the pass will store ([`chunk::block_selected`]), so
+/// Redact secrets from `units`' turns *before* chunking — so a long key that chunking would split
+/// across pieces is whole when scanned, and never reaches the embedding, the local memory, or (via
+/// push) the Hub. One scanner run covers every unit given: the spawn costs ~1 s, the scan itself
+/// milliseconds. Scans exactly the blocks the pass will store ([`chunk::block_selected`]), so
 /// deferred tiers aren't scanned now and a tier-major backfill doesn't re-scan each session per
 /// tier. Best-effort: removes a secret whose value byte-matches the stored text (the common case,
 /// real newlines); anything that resists is caught downstream by the fail-closed push gate.
-/// Reports to stderr what it removed.
-fn redact_turns(
-    turns: &mut [traces::Turn],
+/// Reports to stderr what it removed, per unit.
+fn redact_units(
+    units: &mut [&mut [traces::Turn]],
     scanner: &dyn scan::SecretScanner,
     tiers: &[Tier],
     include_thinking: bool,
 ) -> Result<()> {
-    let removed: Vec<String> = {
-        let mut blocks: Vec<&mut traces::Block> = turns
-            .iter_mut()
-            .flat_map(|t| t.blocks.iter_mut())
-            .filter(|b| chunk::block_selected(&b.block_type, tiers, include_thinking))
-            .collect();
-        if blocks.is_empty() {
-            return Ok(());
+    let n_units = units.len();
+    let mut blocks: Vec<(usize, &mut traces::Block)> = Vec::new();
+    for (u, turns) in units.iter_mut().enumerate() {
+        for b in turns.iter_mut().flat_map(|t| t.blocks.iter_mut()) {
+            if chunk::block_selected(&b.block_type, tiers, include_thinking) {
+                blocks.push((u, b));
+            }
         }
-        let per_block = {
-            let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
-            scan::scan_blocks(&texts, scanner)?
-        };
-        let mut removed = Vec::new();
-        for (b, findings) in blocks.iter_mut().zip(&per_block) {
-            let r = scan::excise(&b.text, findings);
-            removed.extend(r.removed_detectors);
-            b.text = r.text;
-        }
-        removed
-    };
-    if removed.is_empty() {
+    }
+    if blocks.is_empty() {
         return Ok(());
     }
-    let sid = turns.first().map(|t| t.session_id.as_str()).unwrap_or("?");
-    eprintln!(
-        "    redacted {} secret(s) in {sid}: {}",
-        removed.len(),
-        scan::summary(removed.iter().map(String::as_str))
-    );
+    let per_block = {
+        let texts: Vec<&str> = blocks.iter().map(|(_, b)| b.text.as_str()).collect();
+        scan::scan_blocks(&texts, scanner)?
+    };
+    let mut removed: Vec<Vec<String>> = (0..n_units).map(|_| Vec::new()).collect();
+    for ((u, b), findings) in blocks.into_iter().zip(&per_block) {
+        let r = scan::excise(&b.text, findings);
+        removed[u].extend(r.removed_detectors);
+        b.text = r.text;
+    }
+    for (turns, removed) in units.iter().zip(removed) {
+        if removed.is_empty() {
+            continue;
+        }
+        let sid = turns.first().map(|t| t.session_id.as_str()).unwrap_or("?");
+        eprintln!(
+            "    redacted {} secret(s) in {sid}: {}",
+            removed.len(),
+            scan::summary(removed.iter().map(String::as_str))
+        );
+    }
     Ok(())
 }
 
-/// A unit's turns chunked at `tiers` as the memory stores them — data URIs elided and, with a
-/// `scanner`, secrets redacted first, since both change the text a block splits into.
-fn chunks_of(
-    turns: &mut [traces::Turn],
+/// Make a batch of units' turns what the memory stores — data URIs elided and, with a `scanner`,
+/// secrets redacted, the batch in one scanner run — before any of them is chunked, since both
+/// change the text a block splits into.
+fn sanitize_units(
+    units: &mut [&mut [traces::Turn]],
     tiers: &[Tier],
     include_thinking: bool,
     scanner: Option<&scan::Trufflehog>,
-) -> Result<Vec<chunk::Chunk>> {
-    elide_turns(turns);
-    if let Some(scanner) = scanner {
-        redact_turns(turns, scanner, tiers, include_thinking)?;
+) -> Result<()> {
+    for turns in units.iter_mut() {
+        elide_turns(turns);
     }
-    Ok(chunk::chunks_from_turns(turns, tiers, include_thinking))
+    if let Some(scanner) = scanner {
+        redact_units(units, scanner, tiers, include_thinking)?;
+    }
+    Ok(())
+}
+
+/// Units a batch consumes: those read are scanned for secrets in one scanner spawn (~1 s) rather
+/// than one per unit, so a directory of hundreds of session files is scanned in seconds, not
+/// minutes.
+const SCAN_BATCH: usize = 32;
+
+/// Block text a batch holds before it is scanned: bounds the memory a batch of bulk units (a Hub
+/// shard holds thousands of sessions) takes, where the unit count alone would not.
+const SCAN_BATCH_BYTES: usize = 64 << 20;
+
+/// Read units from the front of `units` until a batch fills — [`SCAN_BATCH`] consumed, or
+/// [`SCAN_BATCH_BYTES`] of block text read, whichever comes first. `read(n, unit)` gives the
+/// `n`th unit's turns, or `None` for one the batch has no use for (already indexed, rejected).
+/// Either way the unit is consumed and counts, so whatever a backlog holds, a caller's check
+/// between batches is never more than a batch away. Returns one entry per unit consumed, in
+/// order.
+fn take_batch<T>(
+    units: &[T],
+    mut read: impl FnMut(usize, &T) -> Result<Option<Vec<traces::Turn>>>,
+) -> Result<Vec<Option<Vec<traces::Turn>>>> {
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    for (n, unit) in units.iter().enumerate() {
+        let turns = read(n, unit)?;
+        if let Some(turns) = &turns {
+            bytes += turns
+                .iter()
+                .flat_map(|t| &t.blocks)
+                .map(|b| b.text.len())
+                .sum::<usize>();
+        }
+        batch.push(turns);
+        if batch.len() >= SCAN_BATCH || bytes >= SCAN_BATCH_BYTES {
+            break;
+        }
+    }
+    Ok(batch)
 }
 
 /// The secret scanner, if installed. Best-effort: without one, indexing continues unredacted — the
@@ -179,18 +235,65 @@ fn unit_summary(turns: &[traces::Turn], key: &str) -> (u64, String) {
     (sids.len() as u64, label)
 }
 
-/// What `state.json` records per unit: the change-stamp last seen and the highest [`Tier`] it has
-/// been indexed to.
+/// This build, recorded with a refusal: what funes refuses is a property of its own validation, so
+/// an upgrade must reconsider what an older one turned away.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What `state.json` records per unit: the change-stamp last seen, and then either the highest
+/// [`Tier`] it has been indexed to or the build that refused to read it.
 #[derive(Serialize, Deserialize, Clone)]
 struct UnitState {
     sig: String,
-    level: Tier,
+    /// The highest tier indexed; `None` when nothing was, which only a refusal leaves behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    level: Option<Tier>,
+    /// The funes version that refused this content, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refused: Option<String>,
 }
 
-/// Whether a recorded unit is current for a run targeting `target`: its stamp still matches and it
-/// has already reached at least that tier. A lower recorded tier still needs a pass.
-fn unit_current(entry: Option<&UnitState>, sig: &str, target: Tier) -> bool {
-    entry.is_some_and(|e| e.sig == sig && e.level >= target)
+/// Whether a recorded unit is current: its stamp still matches and every row is written, which the
+/// top tier records. A lower recorded tier still owes its deeper rows.
+fn unit_current(entry: Option<&UnitState>, sig: &str) -> bool {
+    entry.is_some_and(|e| same_sig(&e.sig, sig) && e.level == Some(Tier::ToolResult))
+}
+
+/// Whether a recorded stamp is the file's current one. A stamp an older funes recorded carries
+/// the mtime to the second and no inode, and still matches a file it agrees with that far; the
+/// next record of the unit is written in full.
+fn same_sig(recorded: &str, current: &str) -> bool {
+    recorded == current
+        || (recorded.matches(':').count() == 1
+            && current.strip_prefix(recorded).is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Whether this build already refused this exact content: re-reading buys nothing until the unit
+/// changes or funes does.
+fn unit_refused(entry: Option<&UnitState>, sig: &str) -> bool {
+    entry.is_some_and(|e| same_sig(&e.sig, sig) && e.refused.as_deref() == Some(VERSION))
+}
+
+/// Whether a unit at `level` is a spool file to drop. funes owns the spool: a bundle writes into it
+/// and never reads back, so what stays there is exactly what is still owed. A turns directory
+/// someone else owns keeps its files, and so does a run that left the thinking out: the spool copy
+/// is the only place it can still be indexed from.
+fn drains(key: &str, level: Tier, include_thinking: bool) -> bool {
+    include_thinking
+        && level >= *Tier::ALL.iter().max().expect("Tier::ALL is non-empty")
+        && spool::is_spool(Path::new(key))
+}
+
+/// Drop a drained spool file — the bytes `sig` stamps, and only those. A bundle may replace the
+/// file at any moment, so it is claimed first: renamed aside, atomically against the bundle's own
+/// rename over the name, then judged. A replacement that got in first is put back for the next run.
+fn drain(key: &str, sig: &str) -> Result<()> {
+    let path = Path::new(key);
+    let claimed = PathBuf::from(format!("{key}.draining{}", std::process::id()));
+    std::fs::rename(path, &claimed).with_context(|| format!("claiming {key}"))?;
+    if source::file_sig(&claimed).as_deref() == Some(sig) {
+        return std::fs::remove_file(&claimed).with_context(|| format!("removing {}", claimed.display()));
+    }
+    std::fs::rename(&claimed, path).with_context(|| format!("returning {key} to the spool"))
 }
 
 const OMP_POLICY: &str = "omp-text-graph-v2";
@@ -321,6 +424,8 @@ fn writable_dataset(state: MemoryState) -> Result<Option<Dataset>> {
 #[derive(Serialize, Deserialize, Default)]
 struct IndexCoverageSnapshot {
     pending: HashSet<String>,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    native_omp: HashSet<String>,
 }
 
 pub(crate) struct IndexCoverage {
@@ -338,6 +443,13 @@ fn retire_vanished_units(path: &Path, sources: &[Box<dyn source::TraceSource>]) 
         let held: HashSet<String> = keys.into_iter().collect();
         snapshot.pending.retain(|key| !src.owns(key) || held.contains(key));
     }
+    // A spool `funes remove` took with its integration is nobody's to list, and what it owed is
+    // owed no more.
+    snapshot.pending.retain(|key| {
+        let path = Path::new(key);
+        !spool::names_spool(path) || path.exists()
+    });
+    snapshot.native_omp.retain(|key| snapshot.pending.contains(key));
     write_snapshot(path, &snapshot)
 }
 
@@ -346,13 +458,14 @@ fn update_index_coverage<'a>(
     units: impl IntoIterator<Item = &'a source::Unit>,
     state: &HashMap<String, UnitState>,
 ) -> IndexCoverageSnapshot {
-    let target = *Tier::ALL.iter().max().expect("Tier::ALL is non-empty");
     for unit in units {
         // A unit with no signature can never be known up to date.
         let Some(sig) = &unit.signature else {
             continue;
         };
-        if unit_current(state.get(&unit.key), sig, target) {
+        // A refused unit owes nothing a run could deliver, so it is not counted as pending.
+        let entry = state.get(&unit.key);
+        if unit_current(entry, sig) || unit_refused(entry, sig) {
             snapshot.pending.remove(&unit.key);
         } else {
             snapshot.pending.insert(unit.key.clone());
@@ -361,11 +474,16 @@ fn update_index_coverage<'a>(
     snapshot
 }
 
+/// Drop retired native harness keys, but retain explicitly enrolled OMP obligations.
 fn read_index_coverage(path: &Path) -> IndexCoverageSnapshot {
-    std::fs::read_to_string(path)
+    let mut snapshot: IndexCoverageSnapshot = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    snapshot
+        .pending
+        .retain(|key| traces::funes_jsonl::is_turns_file(Path::new(key)) || snapshot.native_omp.contains(key));
+    snapshot
 }
 
 fn write_snapshot(path: &Path, snapshot: &IndexCoverageSnapshot) -> Result<()> {
@@ -382,20 +500,22 @@ fn write_index_coverage(
         .iter()
         .filter(|(si, unit)| sources[*si].owns(&unit.key))
         .map(|(_, unit)| unit);
-    let snapshot = update_index_coverage(read_index_coverage(path), owned, state);
+    let mut snapshot = update_index_coverage(read_index_coverage(path), owned, state);
+    snapshot.native_omp.retain(|key| snapshot.pending.contains(key));
+    for (si, unit) in units {
+        if sources[*si].is_omp() && snapshot.pending.contains(&unit.key) {
+            snapshot.native_omp.insert(unit.key.clone());
+        }
+    }
     write_snapshot(path, &snapshot)
 }
 
-/// Native sessions that the most recent indexing sweep found short of a complete index. `None`
-/// means no sweep has written a readable snapshot yet; status omits the line rather than doing an
-/// unbounded recursive transcript scan.
+/// Source sessions with rows still owed, as recorded by the last indexing sweep.
 pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
-    std::fs::read_to_string(dataset::funes_dir().join("index-coverage.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<IndexCoverageSnapshot>(&text).ok())
-        .map(|snapshot| IndexCoverage {
-            pending: snapshot.pending.len(),
-        })
+    let path = dataset::funes_dir().join("index-coverage.json");
+    path.is_file().then(|| IndexCoverage {
+        pending: read_index_coverage(&path).pending.len(),
+    })
 }
 
 /// A set-up indexer: it holds the memory lock, embedder, dataset, redaction scanner, and incremental
@@ -405,7 +525,7 @@ pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
 struct Indexer {
     uri: String,
     ds: Option<Dataset>,
-    /// [`stored_ids`] at open plus everything appended this run — the dedup baseline for new chunks.
+    /// [`stored_ids`] at open plus everything written this run — the dedup baseline for new chunks.
     existing: HashSet<String>,
     embedder: Box<dyn Embedder>,
     scanner: Option<scan::Trufflehog>,
@@ -418,7 +538,9 @@ struct Indexer {
     omp_receipts: OmpReceipts,
     omp_receipts_path: PathBuf,
     omp_pending: HashMap<String, OmpReceipt>,
+    omp_previous: HashMap<String, OmpReceipt>,
     omp_max_chunks: Option<usize>,
+    batch_scanner: ScannerState,
     /// The memory didn't exist when this run opened it — the first index.
     first_index: bool,
     /// A human is watching (stdin is a terminal) — probed once here, so every prompt-or-proceed
@@ -427,27 +549,25 @@ struct Indexer {
     /// The caller stopped early with passes still owed, so the summary must not claim the memory is
     /// up to date.
     work_remaining: bool,
-    /// Units (by index) already counted in `n_sessions` this run, so a tier-major caller's repeat
-    /// passes over one unit don't recount its sessions.
-    counted: HashSet<usize>,
     _lock: lock::MemoryLock,
     /// The sources and their units, enumerated once at open so the change-stamps are a stable
-    /// snapshot; a caller drives them by index via [`Indexer::index_unit`].
+    /// snapshot; a caller drives them by index via [`Indexer::read_batch`].
     sources: Vec<Box<dyn source::TraceSource>>,
     units: Vec<(usize, source::Unit)>,
     n_sessions: u64,
     n_skipped: u64,
     n_chunks: u64,
-    /// Units (by index) whose read failed this run — reported once, and not retried by a later
-    /// tier pass; no state is recorded, so the next run retries them.
+    n_embedded: u64,
+    /// Units (by index) whose read failed this run — reported once. Signed units also keep their
+    /// refusal in state until their content or this build changes.
     rejected: HashSet<usize>,
 }
 
-/// Enumerate every source's units (each source orders its own — recency-desc, subagents last),
-/// tagged with the source index. When several sources are indexed at once (e.g. every known
-/// harness), one that fails to enumerate — say a hermes state.db this build can't read — is warned
-/// and skipped instead of aborting the rest; a lone source stays fatal, since its failure is then
-/// the whole result. But if the skips left nothing to index and at least one source errored, that's
+/// Enumerate every source's units (each source orders its own — recency-desc), tagged with the
+/// source index. When several sources are indexed at once (e.g. every known
+/// harness), one that fails to enumerate — say a spool holding a file that is not a turns file — is
+/// warned and skipped instead of aborting the rest; a lone source stays fatal, since its failure is
+/// then the whole result. But if the skips left nothing to index and at least one source errored, that's
 /// a failure, not a silent success — whereas an all-empty run with no errors is a legitimate no-op.
 fn collect_units(sources: &[Box<dyn source::TraceSource>]) -> Result<Vec<(usize, source::Unit)>> {
     let isolate = sources.len() > 1;
@@ -489,12 +609,12 @@ impl Indexer {
 
         let first_index = ds.is_none();
 
-        // Incremental state: path -> {size:mtime stamp, tier}; an unreadable or old-schema file →
+        // Incremental state: path -> {change stamp, level/refusal}; an unreadable or old-schema file →
         // empty. A first index (memory missing) owes everything, whatever an old state.json says — a
         // stale one would silently skip every unit against the empty memory.
         let state_path = dir.join("state.json");
         let coverage_path = dir.join("index-coverage.json");
-        let state = if first_index {
+        let mut state: HashMap<String, UnitState> = if first_index {
             HashMap::new()
         } else {
             std::fs::read_to_string(&state_path)
@@ -518,6 +638,16 @@ impl Indexer {
         };
 
         let units = collect_units(&sources)?;
+        if !no_thinking {
+            // A retained spool's completion stamp may have omitted thinking.
+            for (_, unit) in &units {
+                if state.get(&unit.key).is_some_and(|entry| entry.refused.is_none())
+                    && spool::is_spool(Path::new(&unit.key))
+                {
+                    state.remove(&unit.key);
+                }
+            }
+        }
         // A unit can be deleted between sweeps.
         retire_vanished_units(&coverage_path, &sources)?;
         write_index_coverage(&coverage_path, &sources, &units, &state)?;
@@ -536,17 +666,19 @@ impl Indexer {
             omp_receipts,
             omp_receipts_path,
             omp_pending: HashMap::new(),
+            omp_previous: HashMap::new(),
             omp_max_chunks: None,
+            batch_scanner: ScannerState::Unavailable,
             first_index,
             interactive,
             work_remaining: false,
-            counted: HashSet::new(),
             _lock,
             sources,
             units,
             n_sessions: 0,
             n_skipped: 0,
             n_chunks: 0,
+            n_embedded: 0,
             rejected: HashSet::new(),
         })
     }
@@ -556,7 +688,7 @@ impl Indexer {
         self.units.len()
     }
 
-    fn current(&self, src_i: usize, unit: &source::Unit, target: Tier) -> bool {
+    fn current(&self, src_i: usize, unit: &source::Unit) -> bool {
         let src = &self.sources[src_i];
         let Some(sig) = &unit.signature else { return false };
         if !src.dependencies_current(unit) {
@@ -565,67 +697,115 @@ impl Indexer {
         if src.is_omp() {
             receipt_current(self.omp_receipts.units.get(&unit.key), sig)
         } else {
-            unit_current(self.state.get(&unit.key), sig, target)
+            unit_current(self.state.get(&unit.key), sig) || unit_refused(self.state.get(&unit.key), sig)
         }
     }
 
-    /// Units still owing work at `tier` — a pure state + signature check, no session read, so a
+    /// Units still owing their rows — a pure state + signature check, no session read, so a
     /// caller can plan and estimate a run before touching anything. A signature-less (bulk) unit
-    /// always counts as pending, as [`Indexer::index_unit`] never skips it.
-    fn pending(&self, tier: Tier) -> Vec<usize> {
+    /// always counts as pending, as [`Indexer::read_unit`] never skips it.
+    fn pending(&self) -> Vec<usize> {
         (0..self.units.len())
             .filter(|&i| {
                 let (src_i, unit) = &self.units[i];
-                !self.current(*src_i, unit, tier)
+                !self.current(*src_i, unit)
             })
             .collect()
     }
 
-    /// Index unit `i` at `tiers` — the one primitive a caller loops over, choosing the tiers and
-    /// when to stop. Skips a unit already indexed to the top of `tiers`; a signature-less (bulk)
-    /// unit is never skipped — it is re-read every run, and its chunk-id dedup makes that a no-op.
-    /// Otherwise reads the unit, redacts, chunks those tiers, keeps only chunks whose id isn't
-    /// already stored, embeds them in a single append, and stamps the unit's state. Returns the
-    /// new-chunk count (0 when skipped, unreadable, or already indexed).
-    ///
-    /// `progress` is the caller's label for the per-unit output line (e.g. `"text [1/3]"`) — the
-    /// caller owns the counter because only it knows the iteration (which tier, how many owed).
-    ///
-    /// Add-only-new: a grown session is the same memory — embed and add only its new turns, never
-    /// re-embedding or deleting what's unchanged. (A rewritten turn lands under new ids.) A unit's
-    /// turns are written in one append, so a bulk source (many sessions in one unit) stays a single
-    /// Lance fragment rather than one per session.
-    async fn index_unit(&mut self, i: usize, tiers: &[Tier], progress: &str) -> Result<u64> {
-        let target = *tiers.iter().max().expect("a pass covers at least one tier");
+    /// Record a unit's state and persist it, so an interrupted run resumes where it stopped.
+    fn record(&mut self, key: &str, state: UnitState) -> Result<()> {
+        self.state.insert(key.to_string(), state);
+        atomic_json(&self.state_path, &self.state)?;
+        write_index_coverage(&self.coverage_path, &self.sources, &self.units, &self.state)
+    }
+
+    /// Read a unit unless its signed state is current or refused.
+    fn read_unit(&mut self, i: usize, progress: &str) -> Result<Option<Vec<traces::Turn>>> {
         let (src_i, key, sig) = {
             let (si, unit) = &self.units[i];
             (*si, unit.key.clone(), unit.signature.clone())
         };
 
         let is_omp = self.sources[src_i].is_omp();
-        if self.current(src_i, &self.units[i].1, target) {
+        if self.current(src_i, &self.units[i].1) {
             if is_omp {
                 let receipt = self.omp_receipts.units[&key].clone();
                 self.omp_pending.insert(key, receipt);
             }
             self.n_skipped += 1;
-            return Ok(0);
+            return Ok(None);
         }
         if self.rejected.contains(&i) {
-            return Ok(0);
+            return Ok(None);
         }
-
-        // Remove the acknowledgement before any potentially durable append. If interrupted,
-        // orphaned rows are rediscovered conservatively as mixed scanner history next run.
-        let previous = if is_omp {
-            let previous = self.omp_receipts.units.remove(&key);
+        if is_omp {
+            // Reading publishes graph dependencies; invalidate coverage before either graph or
+            // row writes, so interruption cannot pair an old receipt with a new dependency graph.
+            if let Some(previous) = self.omp_receipts.units.remove(&key) {
+                self.omp_previous.insert(key.clone(), previous);
+            }
             atomic_json(&self.omp_receipts_path, &self.omp_receipts)?;
             self.state.remove(&key);
             atomic_json(&self.state_path, &self.state)?;
-            previous
-        } else {
-            None
+        }
+
+        let src = &self.sources[src_i];
+        match src.read(&self.units[i].1) {
+            Ok(turns) => Ok(Some(turns)),
+            Err(e) if !src.fatal_on_read_error() => {
+                eprintln!("{progress} {key} — rejected: {e}");
+                self.rejected.insert(i);
+                if let Some(sig) = &sig {
+                    self.record(
+                        &key,
+                        UnitState {
+                            sig: sig.clone(),
+                            level: None,
+                            refused: Some(VERSION.to_string()),
+                        },
+                    )?;
+                }
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Read and sanitize a batch of units, with one scanner run. Returns one entry per unit
+    /// consumed: its turns, or `None` when skipped or refused.
+    fn read_batch(
+        &mut self,
+        units: &[usize],
+        label: impl Fn(usize) -> String,
+    ) -> Result<Vec<Option<Vec<traces::Turn>>>> {
+        let mut read = take_batch(units, |n, &i| self.read_unit(i, &label(n)))?;
+        let mut all: Vec<&mut [traces::Turn]> = read.iter_mut().flatten().map(Vec::as_mut_slice).collect();
+        self.batch_scanner = match sanitize_units(&mut all, &Tier::ALL, self.include_thinking, self.scanner.as_ref()) {
+            Ok(()) if self.scanner.is_some() => ScannerState::Scanned,
+            Ok(()) => ScannerState::Unavailable,
+            Err(_) if self.sources.iter().all(|src| src.is_omp()) => {
+                eprintln!("note: local secret scan failed; indexing continues unscanned");
+                ScannerState::Failed
+            }
+            Err(error) => return Err(error),
         };
+        Ok(read)
+    }
+
+    /// Write all tiers of unit `i` from sanitized `turns`, keeping only new chunks in one append.
+    /// Record that its rows are in the memory before draining its spool file; the memory itself
+    /// carries any embeddings still owed. A bulk source stays one fragment per unit.
+    async fn write_unit(&mut self, i: usize, turns: &[traces::Turn], progress: &str) -> Result<u64> {
+        let (key, sig) = {
+            let unit = &self.units[i].1;
+            (unit.key.clone(), unit.signature.clone())
+        };
+        let src_i = self.units[i].0;
+        let is_omp = self.sources[src_i].is_omp();
+        let mut coverage = self.sources[src_i].omp_coverage(&self.units[i].1);
+        anyhow::ensure!(!is_omp || coverage.is_some(), "OMP source returned no coverage");
+        let previous = self.omp_previous.remove(&key);
         let prior_chunks = if is_omp {
             match &self.ds {
                 Some(ds) => source_chunk_count(ds, &key).await?,
@@ -634,39 +814,10 @@ impl Indexer {
         } else {
             0
         };
-
-        // Best-effort sources retry a failed read next run (no state recorded); a fatal source
-        // aborts rather than silently dropping data.
-        let mut turns = {
-            let src = &self.sources[src_i];
-            match src.read(&self.units[i].1) {
-                Ok(t) => t,
-                Err(e) if !src.fatal_on_read_error() => {
-                    eprintln!("{progress} {key} — rejected: {e}");
-                    self.rejected.insert(i);
-                    return Ok(0);
-                }
-                Err(e) => return Err(e),
-            }
-        };
-
-        let (sessions, label) = unit_summary(&turns, &key);
-        elide_turns(&mut turns);
-        let scanner_state = match &self.scanner {
-            Some(scanner) => match redact_turns(&mut turns, scanner, tiers, self.include_thinking) {
-                Ok(()) => ScannerState::Scanned,
-                Err(_) => {
-                    eprintln!("note: local secret scan failed; indexing continues unscanned");
-                    ScannerState::Failed
-                }
-            },
-            None => ScannerState::Unavailable,
-        };
-        let mut coverage = self.sources[src_i].omp_coverage(&self.units[i].1);
-        anyhow::ensure!(!is_omp || coverage.is_some(), "OMP source returned no coverage");
-        let mut chunks = chunk::chunks_from_turns(&turns, tiers, self.include_thinking);
+        let (sessions, label) = unit_summary(turns, &key);
+        let mut chunks = chunk::chunks_from_turns(turns, &Tier::ALL, self.include_thinking);
         let mut repo_by_turn: HashMap<(&str, &str), String> = HashMap::new();
-        for t in &turns {
+        for t in turns {
             if let Some(cwd) = &t.cwd {
                 repo_by_turn
                     .entry((t.session_id.as_str(), t.turn_uuid.as_str()))
@@ -710,14 +861,16 @@ impl Indexer {
                 0
             } else {
                 eprintln!("{progress} {label} — {} new of {total_chunks} chunks", new_chunks.len());
-                let n = self.embed_and_write(&new_chunks).await?;
-                self.existing.extend(new_chunks.into_iter().map(|c| c.id));
-                n
+                if is_omp {
+                    self.embed_and_write(&new_chunks).await?
+                } else {
+                    self.write_rows(&new_chunks).await?
+                }
             }
         };
 
         if let Some(coverage) = coverage {
-            let scanner = retained_scanner(previous.as_ref(), prior_chunks, scanner_state, added);
+            let scanner = retained_scanner(previous.as_ref(), prior_chunks, self.batch_scanner, added);
             self.omp_pending.insert(
                 key.clone(),
                 OmpReceipt {
@@ -729,23 +882,51 @@ impl Indexer {
                 },
             );
         } else if let Some(sig) = &sig {
-            // Other harnesses retain per-unit resumability, now with an atomic checkpoint.
-            self.state.insert(
-                key.clone(),
+            self.record(
+                &key,
                 UnitState {
                     sig: sig.clone(),
-                    level: target,
+                    level: Some(Tier::ToolResult),
+                    refused: None,
                 },
-            );
-            atomic_json(&self.state_path, &self.state)?;
-            write_index_coverage(&self.coverage_path, &self.sources, &self.units, &self.state)?;
+            )?;
+            if drains(&key, Tier::ToolResult, self.include_thinking) {
+                if let Err(e) = drain(&key, sig) {
+                    eprintln!("{progress} {key} — indexed, but the spool copy stayed: {e:#}");
+                }
+            }
         }
-        // Count a unit's sessions once per run — later tier passes over it only add chunks.
-        if self.counted.insert(i) {
-            self.n_sessions += sessions;
-        }
+        self.n_sessions += sessions;
         self.n_chunks += added;
         Ok(added)
+    }
+
+    /// Write a capped batch of units, preserving a boundary even when every unit is skipped or
+    /// refused.
+    async fn write_units(&mut self, units: &[usize], done: usize, total: usize) -> Result<usize> {
+        // OMP's explicit chunk budget is checked between sources, before parsing or scanning
+        // another archive and invalidating its receipt.
+        let units = if self.sources[self.units[units[0]].0].is_omp() {
+            &units[..1]
+        } else {
+            units
+        };
+        let label = |pos: usize| format!("[{}/{total}]", done + pos + 1);
+        let batch = self.read_batch(units, label)?;
+        let consumed = batch.len();
+        for (n, turns) in batch.into_iter().enumerate() {
+            if self
+                .omp_max_chunks
+                .is_some_and(|budget| self.n_chunks as usize >= budget)
+            {
+                self.work_remaining = true;
+                break;
+            }
+            if let Some(turns) = turns {
+                self.write_unit(units[n], &turns, &label(n)).await?;
+            }
+        }
+        Ok(consumed)
     }
 
     /// [`repo::of_cwd`], cached so each distinct checkout runs `git` once across the run.
@@ -783,7 +964,24 @@ impl Indexer {
             t0.elapsed().as_secs_f64()
         );
 
-        let batch = build_batch(new_chunks, &vectors)?;
+        let batch = build_batch(new_chunks, Some(&vectors))?;
+        self.append(batch).await?;
+        self.existing.extend(new_chunks.iter().map(|c| c.id.clone()));
+        self.n_embedded += n as u64;
+        Ok(n as u64)
+    }
+
+    /// Append `chunks` unembedded, creating the dataset on the first write.
+    async fn write_rows(&mut self, chunks: &[chunk::Chunk]) -> Result<u64> {
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        self.append(build_batch(chunks, None)?).await?;
+        self.existing.extend(chunks.iter().map(|c| c.id.clone()));
+        Ok(chunks.len() as u64)
+    }
+
+    async fn append(&mut self, batch: arrow_array::RecordBatch) -> Result<()> {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
         let uri = self.uri.clone();
         match &mut self.ds {
@@ -794,19 +992,36 @@ impl Indexer {
                 self.ds = Some(Dataset::write(reader, &uri, Some(WriteParams::default())).await?);
             }
         }
-        Ok(n as u64)
+        Ok(())
     }
 
-    /// Build the FTS + IVF_PQ indexes (best-effort), reap superseded versions, and print the run
-    /// summary. Consumes the indexer, releasing the memory lock. The vector index bounds how much a
-    /// query reads — what makes recall over a remote (hf://) tier lazy rather than a full scan; lance
-    /// enforces its own training minimum (256 rows) and skips below it, falling back to brute force.
+    async fn pending_embeddings(&self) -> Result<PendingEmbeddings> {
+        match &self.ds {
+            Some(ds) => pending_embeddings(ds).await,
+            None => Ok(PendingEmbeddings::default()),
+        }
+    }
+
+    async fn embed_pending(
+        &mut self,
+        pending: &PendingEmbeddings,
+        keep_going: impl FnMut(usize) -> bool,
+    ) -> Result<usize> {
+        if pending.total == 0 {
+            return Ok(0);
+        }
+        let ds = self.ds.as_mut().context("embedding rows before any was written")?;
+        let embedded = embed_pending(ds, self.embedder.as_mut(), pending, keep_going).await?;
+        self.n_embedded += embedded as u64;
+        Ok(embedded)
+    }
+
+    /// Consumes the indexer, releasing the memory lock.
     async fn finalize(mut self) -> Result<()> {
-        // Nothing written → the memory is unchanged since it opened; skip the rebuild and its
-        // version churn.
-        if self.n_chunks > 0 {
-            if let Some(d) = &mut self.ds {
-                dataset::build_indexes(d, |phase| eprintln!("building {phase}…")).await;
+        if let Some(d) = &mut self.ds {
+            // Retry incomplete FTS coverage even when no rows or vectors were written.
+            if self.n_chunks > 0 || self.n_embedded > 0 || dataset::fts_needs_refresh(d).await? {
+                dataset::build_indexes(d, ui::index_progress).await?;
 
                 // Reap superseded versions — best-effort; on failure the reap waits for next run.
                 match d.cleanup_old_versions(chrono::Duration::minutes(10), None, None).await {
@@ -847,7 +1062,8 @@ impl Indexer {
                         key.clone(),
                         UnitState {
                             sig: receipt.coverage.signature.clone(),
-                            level: *Tier::ALL.iter().max().expect("tiers"),
+                            level: Some(Tier::ToolResult),
+                            refused: None,
                         },
                     );
                 } else {
@@ -867,6 +1083,7 @@ impl Indexer {
                 self.n_sessions,
                 self.n_skipped,
                 self.n_chunks,
+                self.n_embedded,
                 self.rejected.len() as u64,
                 self.units.len(),
             )
@@ -880,38 +1097,142 @@ impl Indexer {
 
 /// The run summary line. An interactive rerun that added nothing — and left nothing owed or
 /// rejected — gets a friendly "up to date" instead of a zero-count tally; an automated run (no
-/// reader) or any run that indexed, rejected or still owes something gets the tally.
-fn run_summary(done: bool, sessions: u64, skipped: u64, chunks: u64, rejected: u64, units: usize) -> String {
-    if done && chunks == 0 && rejected == 0 {
-        format!("up to date ({units} sessions, all tiers)")
+/// reader) or any run that wrote, embedded, rejected or still owes something gets the tally.
+fn run_summary(
+    done: bool,
+    sessions: u64,
+    skipped: u64,
+    chunks: u64,
+    embedded: u64,
+    rejected: u64,
+    units: usize,
+) -> String {
+    if done && chunks == 0 && embedded == 0 && rejected == 0 {
+        format!("up to date ({units} sessions, all embedded)")
     } else if rejected == 0 {
-        format!("indexed sessions={sessions} skipped={skipped} chunks={chunks}")
+        format!("indexed sessions={sessions} skipped={skipped} chunks={chunks} embedded={embedded}")
     } else {
-        format!("indexed sessions={sessions} skipped={skipped} chunks={chunks} rejected={rejected}")
+        format!("indexed sessions={sessions} skipped={skipped} chunks={chunks} embedded={embedded} rejected={rejected}")
     }
 }
 
-/// Build/update the local index from one or more source roots — each `(path, harness override)`
-/// where `None` auto-detects. All roots share one memory, embedder, and `state.json` (keyed by
-/// absolute file path, so cross-root incremental works). Writes only locally — publishing is the
-/// separate `push`. `max_sessions` caps sessions *per root* to the most recent N (`None` = all).
-/// `yes` skips the first-index confirmation (`--yes`).
+/// Rows still owing a vector: per tier, the sessions holding them in storage order, each with its
+/// row ids.
+#[derive(Default)]
+struct PendingEmbeddings {
+    by_tier: BTreeMap<Tier, Vec<(String, Vec<u64>)>>,
+    total: usize,
+}
+
+/// Embed pending rows in tier order, stopping between fills when `keep_going` declines.
+/// Progress is cumulative across tiers; a completed pass needs no continuation decision.
+async fn embed_pending(
+    ds: &mut Dataset,
+    embedder: &mut dyn Embedder,
+    pending: &PendingEmbeddings,
+    mut keep_going: impl FnMut(usize) -> bool,
+) -> Result<usize> {
+    let mut embedded = 0;
+    for (&tier, sessions) in &pending.by_tier {
+        let total: usize = sessions.iter().map(|(_, rows)| rows.len()).sum();
+        let before = embedded;
+        let mut rows_to_fill = Vec::new();
+        let t0 = Instant::now();
+        for (n, (_, rows)) in sessions.iter().enumerate() {
+            rows_to_fill.extend(rows);
+            if rows_to_fill.len() < EMBED_BATCH && n + 1 < sessions.len() {
+                continue;
+            }
+            fill(ds, embedder, &rows_to_fill).await?;
+            embedded += rows_to_fill.len();
+            rows_to_fill.clear();
+            let tier_done = embedded - before;
+            eprintln!(
+                "\r    {}: embedded {tier_done}/{total}  ({:.0}/s)        ",
+                tier.label(),
+                tier_done as f64 / t0.elapsed().as_secs_f64().max(0.001)
+            );
+            if embedded < pending.total && !keep_going(embedded) {
+                return Ok(embedded);
+            }
+        }
+    }
+    Ok(embedded)
+}
+
+/// Embed stored text and fill the vectors at `row_ids` in place.
+async fn fill(ds: &mut Dataset, embedder: &mut dyn Embedder, row_ids: &[u64]) -> Result<()> {
+    let rows = ds.take_rows(row_ids, ds.schema().project(&["id", "text"])?).await?;
+    let ids = str_column(&rows, "id")?;
+    let texts = str_column(&rows, "text")?;
+    let n = texts.len();
+    let vectors = embed_batched(embedder, &texts, |done| {
+        eprint!("\r    embedding {done}/{n}   ");
+        let _ = std::io::stderr().flush();
+    })?;
+    *ds = dataset::fill_vectors(ds, &ids, &vectors).await?;
+    Ok(())
+}
+
+async fn pending_embeddings(ds: &Dataset) -> Result<PendingEmbeddings> {
+    let mut scan = ds.scan();
+    scan.project(&["session_id", "block_type"])?;
+    scan.with_row_id();
+    scan.filter("vector IS NULL")?;
+    let mut stream = scan.try_into_stream().await?;
+    let mut pending = PendingEmbeddings::default();
+    while let Some(batch) = stream.try_next().await? {
+        let sessions = str_column(&batch, "session_id")?;
+        let block_types = str_column(&batch, "block_type")?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+            .context("pending rows: missing or non-u64 row ids")?;
+        for i in 0..batch.num_rows() {
+            let sessions_of_tier = pending.by_tier.entry(Tier::of_block(block_types[i])).or_default();
+            match sessions_of_tier.last_mut() {
+                Some((session, rows)) if session == sessions[i] => rows.push(row_ids.value(i)),
+                _ => sessions_of_tier.push((sessions[i].to_string(), vec![row_ids.value(i)])),
+            }
+            pending.total += 1;
+        }
+    }
+    Ok(pending)
+}
+
+/// Build/update the local index from one or more source roots. All roots share one memory,
+/// embedder, and `state.json` (keyed by absolute file path, so cross-root incremental works).
+/// Writes only locally — publishing is the separate `push`. `max_sessions` caps sessions *per
+/// root* to the most recent N (`None` = all). `yes` skips the first-index confirmation (`--yes`).
 pub async fn run_index_roots(
-    roots: &[(PathBuf, Option<Harness>)],
+    roots: &[PathBuf],
     no_thinking: bool,
     max_sessions: Option<usize>,
     yes: bool,
-    omp_max_chunks: Option<usize>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        omp_max_chunks.is_none() || (omp_max_chunks != Some(0) && roots.iter().all(|(_, h)| *h == Some(Harness::Omp))),
-        "OMP chunk budget requires positive --omp-max-chunks and explicit --harness omp"
-    );
     let sources = roots
         .iter()
-        .map(|(path, harness)| source::open_with_harness(path, max_sessions, *harness))
+        .map(|path| source::open(path, max_sessions))
         .collect::<Result<Vec<_>>>()?;
-    index_sources(sources, no_thinking, yes, omp_max_chunks).await
+    index_sources(sources, no_thinking, yes, None).await
+}
+
+/// Index explicitly selected native OMP transcripts with revision-bound coverage receipts.
+pub async fn run_index_omp(
+    path: &Path,
+    no_thinking: bool,
+    max_sessions: Option<usize>,
+    yes: bool,
+    max_chunks: Option<usize>,
+) -> Result<()> {
+    anyhow::ensure!(max_chunks != Some(0), "OMP chunk budget must be positive");
+    index_sources(
+        vec![source::open_omp(path, max_sessions)?],
+        no_thinking,
+        yes,
+        max_chunks,
+    )
+    .await
 }
 
 /// Index a Hub trace dataset (`funes index <org/repo>`): resolve its `refs/convert/parquet` shards,
@@ -924,14 +1245,18 @@ pub async fn run_index_remote(uri: &str, no_thinking: bool) -> Result<()> {
     index_sources(vec![src], no_thinking, true, None).await
 }
 
-/// The wall-clock budget a budgeted run gives itself: it stops at the first whole-session boundary
-/// past this. Deeper tiers and older sessions backfill on later runs.
+/// The wall-clock budget a budgeted run gives itself: it stops at the first unit-batch or
+/// embed-fill boundary past this. Deeper tiers and older sessions backfill on later runs.
 const INDEX_BUDGET_SECS: u64 = 60;
 
-/// What a budgeted run does when the budget expires with passes still owed.
+/// Rows embedded per fill. A fill rewrites the vector column of every fragment it touches, so fills
+/// span whole sessions and are not cut small.
+const EMBED_BATCH: usize = 512;
+
+/// What a budgeted run does when the budget expires with work still owed.
 #[derive(Clone, Copy)]
 enum Finish {
-    /// Stop at the session boundary — later runs catch up.
+    /// Stop at the boundary — later runs catch up.
     Stop,
     /// Offer to finish the rest now (interactive only; otherwise stop).
     Ask,
@@ -939,89 +1264,111 @@ enum Finish {
     All,
 }
 
-/// Build/update the local index from harness session roots, budgeted and tier-major: text across
-/// every session first, then tool_use, then tool_result, stopping at the first whole-session
-/// boundary past the budget. The no-path `funes index` — the per-turn hook advances the backfill
-/// one bounded step per run; an interactive run offers to finish the rest; `yes` finishes it
+/// Build/update the local index from spools, budgeted and rows first: every owed unit
+/// is written first, then the pending embeddings text → tool_use → tool_result, stopping at the
+/// first unit-batch or embed-fill boundary past the budget. The no-path `funes index` advances the
+/// backfill one bounded step per run; an interactive run offers to finish the rest; `yes` finishes it
 /// without asking.
 pub async fn run_index_budgeted(
-    roots: &[(PathBuf, Option<Harness>)],
+    roots: &[PathBuf],
     no_thinking: bool,
     max_sessions: Option<usize>,
     yes: bool,
 ) -> Result<()> {
     let sources = roots
         .iter()
-        .map(|(path, harness)| source::open_with_harness(path, max_sessions, *harness))
+        .map(|path| source::open(path, max_sessions))
         .collect::<Result<Vec<_>>>()?;
     let finish = if yes { Finish::All } else { Finish::Ask };
     run_budgeted(sources, no_thinking, finish).await
 }
 
-/// The `funes add` first index: the budgeted drain with no finish prompt — the add flow already
-/// asked, and the per-turn drip owns whatever the budget defers. Tier-major order spends the
-/// budget on text (decisions, rationale) first, so recall works in about a minute; a small history
-/// simply finishes whole.
-pub async fn run_index_seed(root: &Path, harness: Harness) -> Result<()> {
-    let sources = vec![source::open_with_harness(root, None, Some(harness))?];
+/// Index a spool for initial setup, stopping at the budget boundary without a finish prompt.
+/// Written rows stay searchable; later runs fill any embeddings left pending.
+pub async fn run_index_seed(spool: &Path) -> Result<()> {
+    let sources = vec![source::open(spool, None)?];
     run_budgeted(sources, false, Finish::Stop).await
 }
 
-/// Drive `sources` tier-major — every owed unit at text, then at tool_use, then at tool_result —
-/// checking the budget after each whole-session pass; `finish` says what to do when it expires
-/// with work left. The owed passes are computed upfront from state alone (no reading), so the plan
-/// and the ETA reflect what this run actually owes.
+/// Whether a run past its budget goes on: only if the caller said so, or a human agrees.
+fn go_on(finish: Finish, interactive: bool, remaining: Duration) -> bool {
+    match finish {
+        Finish::All => true,
+        Finish::Ask if interactive => confirm_continue(remaining),
+        _ => false,
+    }
+}
+
+/// Drive `sources` rows first — every owed unit's rows, then the pending embeddings tier by tier —
+/// checking the budget after each unit batch and each fill; `finish` says what to do when it
+/// expires with work left. The owed units come from state alone (no reading) and the pending rows
+/// from the memory, so the plan reflects what this run actually owes.
 async fn run_budgeted(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: bool, finish: Finish) -> Result<()> {
     anyhow::ensure!(
         !sources.iter().any(|src| src.is_omp()),
         "OMP indexing requires an explicit path, not a harness-root sweep"
     );
     let mut idx = Indexer::open(sources, no_thinking).await?;
-
-    let owed: Vec<(Tier, Vec<usize>)> = Tier::ALL
-        .iter()
-        .map(|&t| (t, idx.pending(t)))
-        .filter(|(_, units)| !units.is_empty())
-        .collect();
-    if owed.is_empty() {
+    let interactive = idx.interactive;
+    let owed = idx.pending();
+    let mut pending = idx.pending_embeddings().await?;
+    if owed.is_empty() && pending.total == 0 {
         return idx.finalize().await;
     }
-    let report = owed
-        .iter()
-        .map(|(t, u)| format!("{}: {}", t.label(), u.len()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!("to index — {report}");
+    let mut todo = Vec::new();
+    if !owed.is_empty() {
+        todo.push(format!("{} session(s) to write", owed.len()));
+    }
+    if pending.total > 0 {
+        todo.push(format!("{} chunk(s) awaiting embedding", pending.total));
+    }
+    eprintln!("to index — {}", todo.join(", "));
 
     let start = Instant::now();
     let budget = Duration::from_secs(INDEX_BUDGET_SECS);
-    let passes: usize = owed.iter().map(|(_, u)| u.len()).sum();
-    let mut done = 0usize;
     let mut capped = true;
-    'tiers: for (tier, units) in &owed {
-        for (j, &i) in units.iter().enumerate() {
-            let progress = format!("{} [{}/{}]", tier.label(), j + 1, units.len());
-            idx.index_unit(i, &[*tier], &progress).await?;
-            done += 1;
-            if capped && start.elapsed() >= budget {
-                let go_on = match finish {
-                    Finish::All => true,
-                    Finish::Ask if idx.interactive => {
-                        confirm_continue(estimate_remaining(start.elapsed(), done, passes))
-                    }
-                    _ => false,
-                };
-                if !go_on {
-                    eprintln!(
-                        "{} pass(es) left — per-turn indexing (or a `funes index` rerun) picks them up",
-                        passes - done
-                    );
-                    idx.work_remaining = true;
-                    break 'tiers;
-                }
-                capped = false; // finish the rest now
-            }
+    let mut done = 0usize;
+    while done < owed.len() {
+        done += idx.write_units(&owed[done..], done, owed.len()).await?;
+        if done == owed.len() {
+            pending = idx.pending_embeddings().await?;
         }
+        if capped && start.elapsed() >= budget && (done < owed.len() || pending.total > 0) {
+            if !go_on(
+                finish,
+                interactive,
+                estimate_remaining(start.elapsed(), done, owed.len()),
+            ) {
+                let (remaining, work) = if done < owed.len() {
+                    (owed.len() - done, "session(s) left to write")
+                } else {
+                    (pending.total, "chunk(s) left to embed")
+                };
+                eprintln!("{remaining} {work} — per-turn indexing (or a `funes index` rerun) picks them up");
+                idx.work_remaining = true;
+                return idx.finalize().await;
+            }
+            capped = false; // finish the rest now
+        }
+    }
+
+    let embed_start = Instant::now();
+    let embedded = idx
+        .embed_pending(&pending, |embedded| {
+            if !capped || start.elapsed() < budget {
+                return true;
+            }
+            let remaining = estimate_remaining(embed_start.elapsed(), embedded, pending.total);
+            capped = !go_on(finish, interactive, remaining);
+            !capped
+        })
+        .await?;
+    if embedded < pending.total {
+        eprintln!(
+            "{} chunk(s) left to embed — per-turn indexing (or a `funes index` rerun) picks them up",
+            pending.total - embedded
+        );
+        idx.work_remaining = true;
     }
     idx.finalize().await
 }
@@ -1041,51 +1388,57 @@ async fn index_sources(
     indexer.omp_max_chunks = omp_max_chunks;
     let total = indexer.unit_count();
 
-    // Per-source tally. This run indexes every tier, so a unit counts as cached only once it has
-    // reached the highest.
-    let target = *Tier::ALL.iter().max().expect("Tier::ALL is non-empty");
+    // Per-source tally of what this run owes.
     for (si, src) in indexer.sources.iter().enumerate() {
         let units = indexer.units.iter().filter(|(i, _)| *i == si);
         let (mut n, mut cached) = (0usize, 0usize);
         for (_, u) in units {
             n += 1;
-            if indexer.current(si, u, target) {
+            if indexer.current(si, u) {
                 cached += 1;
             }
         }
         eprintln!("{} — {} to index, {cached} cached", src.describe(), n - cached);
     }
 
-    // First interactive index: after the first session lands, estimate the whole run from its time
-    // and — if it looks long — ask whether to continue or bail and re-run with --limit.
-    let mut probe_pending = indexer.first_index && !yes && interactive;
-
-    for i in 0..total {
+    let all: Vec<usize> = (0..total).collect();
+    let mut done = 0;
+    while done < total {
+        done += indexer.write_units(&all[done..], done, total).await?;
         if indexer
             .omp_max_chunks
             .is_some_and(|budget| indexer.n_chunks as usize >= budget)
         {
-            indexer.work_remaining = true;
+            indexer.work_remaining |= done < total;
             break;
         }
-        // Time from before the read so a first-index estimate covers parse + I/O, not just embedding.
-        let t_unit = Instant::now();
-        let progress = format!("[{}/{}]", i + 1, total);
-        let added = indexer.index_unit(i, &Tier::ALL, &progress).await?;
+    }
 
-        // Estimate off the first session that actually embedded, and ask before a long haul.
-        if probe_pending && added > 0 {
-            probe_pending = false;
-            let est = t_unit.elapsed().mul_f64(total as f64);
-            if est >= Duration::from_secs(FIRST_INDEX_PROMPT_SECS) && !confirm_full_index(total, est) {
-                eprintln!(
-                    "stopped after 1 session (kept — the index is resumable). Re-run \
-                     `funes index --limit M` for the most recent M, or `funes index` to do all."
-                );
-                indexer.work_remaining = true;
-                break;
+    // Native OMP appends are fully embedded before receipt publication; do not spend its
+    // explicit chunk budget on unrelated rows left by a spool run.
+    if indexer.sources.iter().all(|src| src.is_omp()) {
+        return indexer.finalize().await;
+    }
+    let pending = indexer.pending_embeddings().await?;
+    let mut probe = indexer.first_index && !yes && interactive;
+    let t0 = Instant::now();
+    let embedded = indexer
+        .embed_pending(&pending, |embedded| {
+            if !probe {
+                return true;
             }
-        }
+            probe = false;
+            let est = t0.elapsed().mul_f64(pending.total as f64 / embedded as f64);
+            est < Duration::from_secs(FIRST_INDEX_PROMPT_SECS) || confirm_full_index(pending.total, est)
+        })
+        .await?;
+    if embedded < pending.total {
+        eprintln!(
+            "stopped with {} chunk(s) unembedded (kept — the index is searchable and resumable). \
+             Re-run `funes index` to embed the rest.",
+            pending.total - embedded
+        );
+        indexer.work_remaining = true;
     }
 
     indexer.finalize().await
@@ -1099,49 +1452,76 @@ pub struct CheckReport {
 }
 
 impl CheckReport {
-    pub fn is_clean(&self) -> bool {
-        self.rejected == 0 && self.duplicate_ids == 0
+    /// Whether every unit parsed. A duplicate id is reported, not a failure: an append keeps the
+    /// first occurrence and drops the rest, the rows two runs would have left.
+    pub fn all_accepted(&self) -> bool {
+        self.rejected == 0
     }
 }
 
 /// Dry-run `path`: read and chunk every unit exactly as an index would, count turns and chunks,
 /// find the ids a unit produces twice (a turn re-emitted under its `turn_uuid` would be deduped
 /// away, never indexed), and write nothing — no lock, no memory, no model.
-pub fn check(path: &Path, no_thinking: bool, limit: Option<usize>, harness: Option<Harness>) -> Result<CheckReport> {
+pub fn check(path: &Path, no_thinking: bool, limit: Option<usize>) -> Result<CheckReport> {
     if !path.exists() {
         anyhow::bail!("no such path: {}", path.display());
     }
-    let src = source::open_with_harness(path, limit, harness)?;
+    let src = source::open(path, limit)?;
+    check_source(src, path, no_thinking)
+}
+
+/// Validate native OMP transcripts without publishing graph or coverage metadata.
+pub fn check_omp(path: &Path, no_thinking: bool, limit: Option<usize>) -> Result<CheckReport> {
+    check_source(source::open_omp(path, limit)?, path, no_thinking)
+}
+
+fn check_source(src: Box<dyn source::TraceSource>, path: &Path, no_thinking: bool) -> Result<CheckReport> {
     let units = src.units()?;
     let scanner = find_scanner();
     let mut text = format!("checking {}\n", path.display());
     let (mut turns, mut chunks, mut rejected, mut duplicate_ids) = (0usize, 0usize, 0usize, 0usize);
-    for unit in &units {
-        let mut unit_turns = match src.read_for_check(unit) {
-            Ok(t) => t,
+    let mut from = 0;
+    while from < units.len() {
+        let mut rejections = Vec::new();
+        let mut read = take_batch(&units[from..], |_, unit| match src.read_for_check(unit) {
+            Ok(t) => Ok(Some(t)),
             Err(e) => {
-                rejected += 1;
-                text.push_str(&format!("  {} — rejected: {e}\n", unit.key));
-                continue;
+                rejections.push(format!("  {} — rejected: {e}\n", unit.key));
+                Ok(None)
             }
-        };
-        let unit_chunks = chunks_of(&mut unit_turns, &Tier::ALL, !no_thinking, scanner.as_ref())?;
-        text.push_str(&format!(
-            "  {} — {} turns, {} chunks\n",
-            unit.key,
-            unit_turns.len(),
-            unit_chunks.len()
-        ));
-        let mut seen = HashSet::new();
-        for c in unit_chunks.iter().filter(|c| !seen.insert(c.id.as_str())) {
-            duplicate_ids += 1;
+        })?;
+        let mut all: Vec<&mut [traces::Turn]> = read.iter_mut().flatten().map(Vec::as_mut_slice).collect();
+        sanitize_units(&mut all, &Tier::ALL, !no_thinking, scanner.as_ref())?;
+        let mut rejections = rejections.into_iter();
+        for (n, unit_turns) in read.iter().enumerate() {
+            let Some(unit_turns) = unit_turns else {
+                rejected += 1;
+                text.push_str(
+                    &rejections
+                        .next()
+                        .expect("a unit the check did not read is a rejected one"),
+                );
+                continue;
+            };
+            let unit_chunks = chunk::chunks_from_turns(unit_turns, &Tier::ALL, !no_thinking);
             text.push_str(&format!(
-                "    duplicate id {}: session {} turn {} block {} split {}\n",
-                c.id, c.session_id, c.turn_uuid, c.block_idx, c.split_idx
+                "  {} — {} turns, {} chunks\n",
+                units[from + n].key,
+                unit_turns.len(),
+                unit_chunks.len()
             ));
+            let mut seen = HashSet::new();
+            for c in unit_chunks.iter().filter(|c| !seen.insert(c.id.as_str())) {
+                duplicate_ids += 1;
+                text.push_str(&format!(
+                    "    duplicate id {}: session {} turn {} block {} split {}\n",
+                    c.id, c.session_id, c.turn_uuid, c.block_idx, c.split_idx
+                ));
+            }
+            turns += unit_turns.len();
+            chunks += unit_chunks.len();
         }
-        turns += unit_turns.len();
-        chunks += unit_chunks.len();
+        from += read.len();
     }
     text.push_str(&format!(
         "checked {} unit(s): {turns} turns, {chunks} chunks, {rejected} rejected, {duplicate_ids} duplicate id(s)\n",
@@ -1154,11 +1534,11 @@ pub fn check(path: &Path, no_thinking: bool, limit: Option<usize>, harness: Opti
     })
 }
 
-/// Build/update the local index from a single source root, auto-detecting its harness — a thin
-/// convenience over [`run_index_roots`] for a single path (tests, benchmarks, one explicit path).
-/// Passes `yes = true`: these callers are non-interactive and must not gate on the first-index prompt.
+/// Build/update the local index from a single source root — a thin convenience over
+/// [`run_index_roots`] for a single path (tests, benchmarks, one explicit path). Passes
+/// `yes = true`: these callers are non-interactive and must not gate on the first-index prompt.
 pub async fn run_index(path: &Path, no_thinking: bool, max_sessions: Option<usize>) -> Result<()> {
-    run_index_roots(&[(path.to_path_buf(), None)], no_thinking, max_sessions, true, None).await
+    run_index_roots(&[path.to_path_buf()], no_thinking, max_sessions, true).await
 }
 
 /// A first interactive index estimated at ≥ this many seconds prompts before continuing.
@@ -1180,13 +1560,13 @@ fn confirm(prompt: &str, default_yes: bool) -> bool {
     }
 }
 
-/// Prompt before a long first index (interactive only): continue all, or bail and re-run with a
-/// `--limit`. Returns whether to proceed.
-fn confirm_full_index(total: usize, est: Duration) -> bool {
+/// Prompt before a long first embedding pass (interactive only); rows already written stay
+/// available and a later run resumes any embeddings left pending.
+fn confirm_full_index(chunks: usize, est: Duration) -> bool {
     confirm(
         &format!(
-            "indexing all {total} sessions is estimated at ~{} (rough, from one session). Continue? [y/N]  \
-             (or re-run with `--limit M` for the most recent M)",
+            "embedding {chunks} chunks is estimated at ~{} (rough, from the first batch). Continue? [y/N]  \
+             (the rows are in and searchable; a later `funes index` embeds the rest)",
             fmt_eta(est)
         ),
         false,
@@ -1196,11 +1576,13 @@ fn confirm_full_index(total: usize, est: Duration) -> bool {
 /// After a budgeted pass leaves work unfinished, ask whether to finish the rest now; default yes.
 /// `remaining` is a rough estimate of the time left.
 fn confirm_continue(remaining: Duration) -> bool {
+    let estimate = if remaining.is_zero() {
+        String::new()
+    } else {
+        format!(" (~{} left, rough)", fmt_eta(remaining))
+    };
     confirm(
-        &format!(
-            "more to index (~{} left, rough). Finish it now? [Y/n]  (or let per-turn indexing catch up)",
-            fmt_eta(remaining)
-        ),
+        &format!("more to index{estimate}. Finish it now? [Y/n]  (or let per-turn indexing catch up)"),
         true,
     )
 }
@@ -1324,6 +1706,95 @@ mod tests {
         assert!(memory.state().await.is_err());
     }
 
+    #[derive(Default)]
+    struct TestEmbedder {
+        texts: Vec<String>,
+    }
+
+    impl Embedder for TestEmbedder {
+        fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.texts.extend(texts.iter().map(|text| text.to_string()));
+            Ok(vec![vec![1.0; dataset::DIM as usize]; texts.len()])
+        }
+    }
+
+    async fn unembedded_memory(path: &Path, tiers: &[(&str, usize)]) -> Dataset {
+        let chunks: Vec<chunk::Chunk> = tiers
+            .iter()
+            .flat_map(|&(kind, count)| {
+                (0..count).map(move |i| chunk::Chunk {
+                    id: format!("{kind}-{i}"),
+                    text: format!("narwhal {kind} passage {i}"),
+                    session_id: format!("session-{i}"),
+                    workdir: String::new(),
+                    turn_uuid: format!("{kind}-{i}"),
+                    parent_uuid: None,
+                    seq: i as i64,
+                    ts: "2026-01-01T00:00:00Z".into(),
+                    role: "assistant".into(),
+                    block_type: kind.into(),
+                    tool_name: None,
+                    source_path: String::new(),
+                    block_idx: 0,
+                    split_idx: 0,
+                    harness: "test".into(),
+                    repo: String::new(),
+                })
+            })
+            .collect();
+        let reader = RecordBatchIterator::new([Ok(build_batch(&chunks, None).unwrap())], schema());
+        Dataset::write(reader, path.to_str().unwrap(), None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn embedding_stops_between_fills_and_resumes_from_the_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let tiers = [("text", EMBED_BATCH + 1), ("tool_use", 1), ("tool_result", 1)];
+        let mut ds = unembedded_memory(dir.path(), &tiers).await;
+        let mut embedder = TestEmbedder::default();
+
+        // Declining after the first fill stops inside the text tier.
+        let pending = pending_embeddings(&ds).await.unwrap();
+        let embedded = embed_pending(&mut ds, &mut embedder, &pending, |_| false)
+            .await
+            .unwrap();
+        assert_eq!(embedded, EMBED_BATCH);
+
+        // The memory says what is left; progress counts across tiers, checked at each fill but
+        // the last. Declining at a tier boundary leaves the later tiers owed.
+        let pending = pending_embeddings(&ds).await.unwrap();
+        assert_eq!(pending.total, 3);
+        let mut checks = Vec::new();
+        let embedded = embed_pending(&mut ds, &mut embedder, &pending, |done| {
+            checks.push(done);
+            done < 2
+        })
+        .await
+        .unwrap();
+        assert_eq!((embedded, checks), (2, vec![1, 2]));
+        assert!(pending_embeddings(&ds)
+            .await
+            .unwrap()
+            .by_tier
+            .contains_key(&Tier::ToolResult));
+
+        let pending = pending_embeddings(&ds).await.unwrap();
+        let embedded = embed_pending(&mut ds, &mut embedder, &pending, |_| {
+            panic!("no check after the last fill")
+        })
+        .await
+        .unwrap();
+        assert_eq!(embedded, 1);
+        assert_eq!(pending_embeddings(&ds).await.unwrap().total, 0);
+        assert_eq!(ds.count_rows(None).await.unwrap(), EMBED_BATCH + 3, "fills add no rows");
+        let distinct: HashSet<_> = embedder.texts.iter().collect();
+        assert_eq!(
+            (embedder.texts.len(), distinct.len()),
+            (EMBED_BATCH + 3, EMBED_BATCH + 3),
+            "nothing embedded twice"
+        );
+    }
+
     /// A source whose enumeration yields fixed unit keys, or fails — for `collect_units` tests.
     struct MockSource {
         name: &'static str,
@@ -1345,7 +1816,6 @@ mod tests {
                 .map(|k| source::Unit {
                     key: k.to_string(),
                     signature: Some("sig".to_string()),
-                    is_subagent: false,
                 })
                 .collect())
         }
@@ -1355,6 +1825,38 @@ mod tests {
         fn read(&self, _: &source::Unit) -> Result<Vec<traces::Turn>> {
             Ok(vec![])
         }
+    }
+
+    /// A stamp from before the nanoseconds and the inode matches what it agrees with, and nothing
+    /// finer; a current stamp matches itself alone.
+    #[test]
+    fn an_older_stamp_still_matches_to_the_second() {
+        assert!(same_sig("5:1700", "5:1700.000000123:42"));
+        assert!(!same_sig("5:1700", "5:1701.000000000:42"));
+        assert!(!same_sig("5:1700", "6:1700.000000123:42"));
+        assert!(
+            !same_sig("5:17", "5:1700.000000123:42"),
+            "a prefix of the seconds is not them"
+        );
+        assert!(same_sig("5:1700.000000123:42", "5:1700.000000123:42"));
+        assert!(!same_sig("5:1700.000000123:42", "5:1700.000000123:43"));
+    }
+
+    /// A snapshot an older funes wrote names agents' own transcripts, which nothing indexes now.
+    #[test]
+    fn coverage_from_before_the_spool_forgets_the_transcripts_it_pended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index-coverage.json");
+        std::fs::write(
+            &path,
+            r#"{"pending":["/home/me/.claude/projects/-p/abc.jsonl","/home/me/.hermes/state.db#s1","/home/me/.funes/spool/codex/rollout-x.funes.jsonl"]}"#,
+        )
+        .unwrap();
+        let pending = read_index_coverage(&path).pending;
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec!["/home/me/.funes/spool/codex/rollout-x.funes.jsonl".to_string()]
+        );
     }
 
     #[test]
@@ -1428,28 +1930,46 @@ mod tests {
         assert!(collect_units(&srcs).unwrap().is_empty());
     }
 
+    /// A unit stamped `sig` and indexed to `level`, which nothing refused.
+    fn indexed(sig: &str, level: Tier) -> UnitState {
+        UnitState {
+            sig: sig.into(),
+            level: Some(level),
+            refused: None,
+        }
+    }
+
     #[test]
-    fn unit_current_needs_matching_sig_and_reached_target_tier() {
-        let l1 = UnitState {
-            sig: "10:20".into(),
-            level: Tier::Text,
+    fn unit_current_needs_matching_sig_and_every_row_written() {
+        let written = indexed("10:20", Tier::ToolResult);
+        assert!(unit_current(Some(&written), "10:20"));
+        // A changed stamp is never current.
+        assert!(!unit_current(Some(&written), "99:99"));
+        assert!(!unit_current(None, "10:20"));
+        // A lower tier, from a funes that wrote tier by tier, still owes its deeper rows.
+        assert!(!unit_current(Some(&indexed("10:20", Tier::Text)), "10:20"));
+        assert!(!unit_current(Some(&indexed("10:20", Tier::ToolUse)), "10:20"));
+    }
+
+    /// A refusal holds against the content that caused it and the build that made it, and lifts
+    /// when either changes. It is never "current": nothing of the unit was indexed.
+    #[test]
+    fn a_refusal_is_remembered_until_the_unit_or_funes_changes() {
+        let refused = |sig: &str, by: &str| UnitState {
+            sig: sig.into(),
+            level: None,
+            refused: Some(by.into()),
         };
-        // Signature mismatch is never current, whatever the tier.
-        assert!(!unit_current(Some(&l1), "99:99", Tier::Text));
-        // Sig matches and the recorded tier meets the target → current.
-        assert!(unit_current(Some(&l1), "10:20", Tier::Text));
-        // Sig matches but a higher tier is targeted → NOT current; L2/L3 still owe a pass.
-        assert!(!unit_current(Some(&l1), "10:20", Tier::ToolUse));
-        assert!(!unit_current(Some(&l1), "10:20", Tier::ToolResult));
-        // A fully-indexed unit satisfies every target.
-        let full = UnitState {
-            sig: "10:20".into(),
-            level: Tier::ToolResult,
-        };
-        assert!(unit_current(Some(&full), "10:20", Tier::Text));
-        assert!(unit_current(Some(&full), "10:20", Tier::ToolResult));
-        // No record → not current.
-        assert!(!unit_current(None, "10:20", Tier::Text));
+
+        let mine = refused("10:20", VERSION);
+        assert!(unit_refused(Some(&mine), "10:20"));
+        assert!(!unit_current(Some(&mine), "10:20"));
+        // Re-emitted content is read again, however it failed before.
+        assert!(!unit_refused(Some(&mine), "99:99"));
+        // So is content another build refused: validation is funes's, not the file's.
+        assert!(!unit_refused(Some(&refused("10:20", "0.0.1")), "10:20"));
+        assert!(!unit_refused(Some(&indexed("10:20", Tier::Text)), "10:20"));
+        assert!(!unit_refused(None, "10:20"));
     }
 
     #[test]
@@ -1457,7 +1977,6 @@ mod tests {
         let unit = |key: &str, sig: Option<&str>| source::Unit {
             key: key.to_string(),
             signature: sig.map(str::to_string),
-            is_subagent: false,
         };
         let first = vec![
             unit("current", Some("1")),
@@ -1467,27 +1986,9 @@ mod tests {
             unit("unsigned", None),
         ];
         let state = HashMap::from([
-            (
-                "current".to_string(),
-                UnitState {
-                    sig: "1".into(),
-                    level: Tier::ToolResult,
-                },
-            ),
-            (
-                "partial".to_string(),
-                UnitState {
-                    sig: "2".into(),
-                    level: Tier::Text,
-                },
-            ),
-            (
-                "stale".to_string(),
-                UnitState {
-                    sig: "old".into(),
-                    level: Tier::ToolResult,
-                },
-            ),
+            ("current".to_string(), indexed("1", Tier::ToolResult)),
+            ("partial".to_string(), indexed("2", Tier::Text)),
+            ("stale".to_string(), indexed("old", Tier::ToolResult)),
         ]);
         let snapshot = update_index_coverage(IndexCoverageSnapshot::default(), &first, &state);
         assert_eq!(
@@ -1511,18 +2012,18 @@ mod tests {
     }
 
     #[test]
-    fn index_coverage_retires_a_transcript_the_tree_no_longer_lists() {
+    fn index_coverage_retires_a_transcript_the_spool_no_longer_lists() {
         let dir = tempfile::tempdir().unwrap();
         let coverage = dir.path().join("index-coverage.json");
-        let root = dir.path().join("projects");
+        let root = dir.path().join("spool");
         std::fs::create_dir_all(&root).unwrap();
-        for f in ["a.jsonl", "b.jsonl"] {
-            std::fs::write(root.join(f), b"{}\n").unwrap();
+        for f in ["a.funes.jsonl", "b.funes.jsonl"] {
+            std::fs::write(root.join(f), b"").unwrap();
         }
         let key = |f: &str| root.join(f).to_string_lossy().into_owned();
         let sweep = || -> Vec<Box<dyn source::TraceSource>> {
             vec![
-                source::open_with_harness(&root, None, Some(Harness::Claude)).unwrap(),
+                source::open(&root, None).unwrap(),
                 // A store that claims no key contributes none, however its units are signed.
                 Box::new(MockSource {
                     name: "remote",
@@ -1533,68 +2034,41 @@ mod tests {
         };
         assert_eq!(
             pending_after_a_sweep(&coverage, &sweep()),
-            HashSet::from([key("a.jsonl"), key("b.jsonl")])
+            HashSet::from([key("a.funes.jsonl"), key("b.funes.jsonl")])
         );
 
-        std::fs::remove_file(root.join("b.jsonl")).unwrap();
+        std::fs::remove_file(root.join("b.funes.jsonl")).unwrap();
         assert_eq!(
             pending_after_a_sweep(&coverage, &sweep()),
-            HashSet::from([key("a.jsonl")])
+            HashSet::from([key("a.funes.jsonl")])
         );
-    }
-
-    #[test]
-    fn index_coverage_retires_a_session_the_hermes_db_no_longer_holds() {
-        let dir = tempfile::tempdir().unwrap();
-        let coverage = dir.path().join("index-coverage.json");
-        let db = dir.path().join("state.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, \
-                content TEXT, tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL, \
-                reasoning TEXT, reasoning_content TEXT);
-             INSERT INTO sessions (id, cwd) VALUES ('s1','/w'),('s2','/w');
-             INSERT INTO messages (session_id, role, content, timestamp) VALUES
-                ('s1','user','a',1.0),('s2','user','b',2.0);",
-        )
-        .unwrap();
-        let key = |sid: &str| format!("{}#{sid}", db.display());
-        let sweep = || -> Vec<Box<dyn source::TraceSource>> {
-            vec![source::open_with_harness(&db, None, Some(Harness::Hermes)).unwrap()]
-        };
-        assert_eq!(
-            pending_after_a_sweep(&coverage, &sweep()),
-            HashSet::from([key("s1"), key("s2")])
-        );
-
-        // The db outlives the session it dropped, and the key is no path to probe for.
-        conn.execute_batch("DELETE FROM messages WHERE session_id = 's2'")
-            .unwrap();
-        assert_eq!(pending_after_a_sweep(&coverage, &sweep()), HashSet::from([key("s1")]));
     }
 
     #[test]
     fn run_summary_says_up_to_date_only_on_a_done_no_op() {
         // Interactive rerun that added nothing and owes nothing → the friendly no-op.
         assert_eq!(
-            run_summary(true, 0, 30, 0, 0, 30),
-            "up to date (30 sessions, all tiers)"
+            run_summary(true, 0, 30, 0, 0, 0, 30),
+            "up to date (30 sessions, all embedded)"
         );
-        // A run that indexed something → the tally, not "up to date".
+        // A run that wrote or embedded something → the tally, not "up to date".
         assert_eq!(
-            run_summary(true, 2, 28, 57, 0, 30),
-            "indexed sessions=2 skipped=28 chunks=57"
+            run_summary(true, 2, 28, 57, 57, 0, 30),
+            "indexed sessions=2 skipped=28 chunks=57 embedded=57"
+        );
+        assert_eq!(
+            run_summary(true, 0, 30, 0, 120, 0, 30),
+            "indexed sessions=0 skipped=30 chunks=0 embedded=120"
         );
         // Stopped early (or no reader at all) → the tally, even with nothing added: work is owed.
         assert_eq!(
-            run_summary(false, 0, 30, 0, 0, 30),
-            "indexed sessions=0 skipped=30 chunks=0"
+            run_summary(false, 0, 30, 0, 0, 0, 30),
+            "indexed sessions=0 skipped=30 chunks=0 embedded=0"
         );
         // A rejected unit is never "up to date", and shows in the tally.
         assert_eq!(
-            run_summary(true, 0, 29, 0, 1, 30),
-            "indexed sessions=0 skipped=29 chunks=0 rejected=1"
+            run_summary(true, 0, 29, 0, 0, 1, 30),
+            "indexed sessions=0 skipped=29 chunks=0 embedded=0 rejected=1"
         );
     }
 
@@ -1625,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn redact_turns_replaces_secrets_in_block_text() {
+    fn redact_units_replaces_secrets_in_block_text() {
         struct Fake(Vec<scan::Finding>);
         impl scan::SecretScanner for Fake {
             fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<scan::Finding>>> {
@@ -1663,7 +2137,7 @@ mod tests {
             source_path: String::new(),
             harness: "claude_code".into(),
         }];
-        redact_turns(&mut turns, &scanner, &chunk::Tier::ALL, true).unwrap();
+        redact_units(&mut [&mut turns], &scanner, &chunk::Tier::ALL, true).unwrap();
         assert_eq!(
             turns[0].blocks[0].text,
             "key=[REDACTED:PrivateKey] hash=[REDACTED:VirusTotal]"
@@ -1707,7 +2181,7 @@ mod tests {
             harness: "claude_code".into(),
         }];
         // A text-only pass redacts the text block but leaves the tool_result it won't store untouched.
-        redact_turns(&mut turns, &Fake, &[chunk::Tier::Text], true).unwrap();
+        redact_units(&mut [&mut turns], &Fake, &[chunk::Tier::Text], true).unwrap();
         assert!(
             turns[0].blocks[0].text.contains("[REDACTED:PrivateKey]"),
             "text block redacted"
@@ -1748,7 +2222,7 @@ mod tests {
         }];
         let scanner = Recorder(std::cell::RefCell::new(String::new()));
         elide_turns(&mut turns);
-        redact_turns(&mut turns, &scanner, &chunk::Tier::ALL, true).unwrap();
+        redact_units(&mut [&mut turns], &scanner, &chunk::Tier::ALL, true).unwrap();
         assert_eq!(
             turns[0].blocks[0].text,
             r#"{"image_url":"data:image/png;base64,[elided]"}"#
@@ -1757,5 +2231,173 @@ mod tests {
             !scanner.0.borrow().contains("iVBORw0KGgo"),
             "the scanner must never see the payload: excising a match inside it would strand the rest"
         );
+    }
+
+    #[test]
+    fn redact_scans_every_unit_in_one_pass_and_only_the_blocks_stored() {
+        // Finds the secret a text carries, so a finding must land on the unit it came from.
+        struct Counting(std::cell::Cell<usize>);
+        impl scan::SecretScanner for Counting {
+            fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<scan::Finding>>> {
+                self.0.set(self.0.get() + 1);
+                let finding = |detector: &str, raw: &str| scan::Finding {
+                    detector: detector.into(),
+                    raw: raw.into(),
+                    decoder: "PLAIN".into(),
+                };
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        let mut found = Vec::new();
+                        if t.contains("SECRET") {
+                            found.push(finding("PrivateKey", "SECRET"));
+                        }
+                        if t.contains("TOKEN") {
+                            found.push(finding("Slack", "TOKEN"));
+                        }
+                        found
+                    })
+                    .collect())
+            }
+        }
+        let block = |bt: &str, text: &str| traces::Block {
+            block_type: bt.into(),
+            text: text.into(),
+            tool_name: None,
+            tool_use_id: None,
+        };
+        let turn = |blocks: Vec<traces::Block>| traces::Turn {
+            format: traces::FORMAT_VERSION,
+            session_id: "sess".into(),
+            cwd: None,
+            workdir: "proj".into(),
+            turn_uuid: "turn".into(),
+            parent_uuid: None,
+            seq: 0,
+            ts: String::new(),
+            role: "user".into(),
+            blocks,
+            source_path: String::new(),
+            harness: "claude_code".into(),
+        };
+        let mut a = vec![turn(vec![
+            block("text", "note SECRET here"),
+            block("thinking", "SECRET thought"),
+        ])];
+        let mut b = vec![turn(vec![block("tool_result", "output TOKEN dump")])];
+        let scanner = Counting(std::cell::Cell::new(0));
+        redact_units(&mut [&mut a, &mut b], &scanner, &chunk::Tier::ALL, false).unwrap();
+        assert_eq!(scanner.0.get(), 1, "one scanner run for both units");
+        assert_eq!(a[0].blocks[0].text, "note [REDACTED:PrivateKey] here");
+        assert_eq!(
+            a[0].blocks[1].text, "SECRET thought",
+            "a thinking block --no-thinking won't store is not scanned"
+        );
+        assert_eq!(
+            b[0].blocks[0].text, "output [REDACTED:Slack] dump",
+            "each unit of the batch gets its own secrets, and only those"
+        );
+    }
+
+    #[test]
+    fn take_batch_fills_at_the_unit_cap_or_the_text_cap() {
+        let turns_of = |bytes: usize| {
+            vec![traces::Turn {
+                format: traces::FORMAT_VERSION,
+                session_id: "sess".into(),
+                cwd: None,
+                workdir: "proj".into(),
+                turn_uuid: "turn".into(),
+                parent_uuid: None,
+                seq: 0,
+                ts: String::new(),
+                role: "user".into(),
+                blocks: vec![traces::Block {
+                    block_type: "text".into(),
+                    text: "x".repeat(bytes),
+                    tool_name: None,
+                    tool_use_id: None,
+                }],
+                source_path: String::new(),
+                harness: "claude_code".into(),
+            }]
+        };
+        let units: Vec<usize> = (0..40).collect();
+
+        // Tiny units fill a batch by count; the rest go in the next.
+        let batch = take_batch(&units, |_, _| Ok(Some(turns_of(1)))).unwrap();
+        assert_eq!(batch.len(), SCAN_BATCH);
+        let rest = take_batch(&units[batch.len()..], |_, _| Ok(Some(turns_of(1)))).unwrap();
+        assert_eq!(rest.len(), 40 - SCAN_BATCH);
+
+        // A unit the pass has no use for is consumed and counts: a backlog of them still ends a
+        // batch, so a budget check is never more than a batch away.
+        let batch = take_batch(&units, |n, _| Ok((n % 2 == 0).then(|| turns_of(1)))).unwrap();
+        assert_eq!(batch.len(), SCAN_BATCH);
+        assert_eq!(batch.iter().flatten().count(), SCAN_BATCH / 2);
+        let batch = take_batch(&units, |_, _| Ok(None)).unwrap();
+        assert_eq!(batch.len(), SCAN_BATCH);
+
+        // Text fills a batch before the count does.
+        let batch = take_batch(&units, |_, _| Ok(Some(turns_of(SCAN_BATCH_BYTES / 4)))).unwrap();
+        assert_eq!(batch.len(), 4);
+    }
+
+    /// The drain drops the bytes it indexed and only those: a file the bundle replaced under the
+    /// same name since is left for the next run, untouched.
+    #[test]
+    fn a_drain_drops_what_it_indexed_and_keeps_a_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.funes.jsonl");
+        std::fs::write(&path, "indexed\n").unwrap();
+        let key = path.to_str().unwrap().to_string();
+        let sig = source::file_sig(&path).unwrap();
+
+        // Replaced the way a converter lands it: written beside, renamed over.
+        let newer = tmp.path().join("s.tmp");
+        std::fs::write(&newer, "indexed, and one more turn\n").unwrap();
+        std::fs::rename(&newer, &path).unwrap();
+        drain(&key, &sig).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "indexed, and one more turn\n",
+            "kept for the next run"
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1, "nothing left aside");
+
+        let sig = source::file_sig(&path).unwrap();
+        drain(&key, &sig).unwrap();
+        assert!(!path.exists(), "the bytes indexed are dropped");
+        assert!(drain(&key, &sig).is_err(), "nothing left to claim");
+    }
+
+    /// A pending spool file that is gone — its integration removed — is owed no more; a file of
+    /// the user's own is not funes's to judge.
+    #[test]
+    fn a_vanished_spool_key_is_retired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot = tmp.path().join("index-coverage.json");
+        let gone = spool::spool_root().join("nobody/gone.funes.jsonl");
+        let kept = tmp.path().join("mine/kept.funes.jsonl");
+        let omp = tmp.path().join("omp/native.jsonl");
+        let retired = tmp.path().join("legacy/claude.jsonl");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "").unwrap();
+        let pending = [&gone, &kept, &omp, &retired].map(|p| p.to_str().unwrap().to_string());
+        write_snapshot(
+            &snapshot,
+            &IndexCoverageSnapshot {
+                pending: pending.into_iter().collect(),
+                native_omp: HashSet::from([omp.to_str().unwrap().to_string()]),
+            },
+        )
+        .unwrap();
+
+        retire_vanished_units(&snapshot, &[]).unwrap();
+        let after = read_index_coverage(&snapshot);
+        assert!(!after.pending.contains(gone.to_str().unwrap()));
+        assert!(after.pending.contains(kept.to_str().unwrap()));
+        assert!(after.pending.contains(omp.to_str().unwrap()));
+        assert!(!after.pending.contains(retired.to_str().unwrap()));
     }
 }

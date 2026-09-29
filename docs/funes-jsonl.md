@@ -1,10 +1,13 @@
 # The funes JSONL format
 
 `.funes.jsonl` is funes's own turn model, serialized: one JSON object per line, one turn per object,
-one or many turns per file, no header. It is how a conversation reaches funes when funes has no parser
-for its source — a coding agent funes does not read natively, an issue tracker, a chat export. A
-*producer* (a plugin, a script, a Space) writes the file; funes indexes it through the same pipeline
-as its native transcripts, so recall, `get`, `sessions` and `sketch` work on it unchanged.
+one or many turns per file, no header. Agent integrations convert their transcripts into this shared
+format. Other producers — a script, a plugin, a Space — can write it for conversations from an issue
+tracker or a chat export too. funes indexes these turns through one pipeline, so recall, `get`,
+`sessions` and `sketch` work on all of them. Writing the format needs no integration and no
+registration: a file or a directory of them indexes with nothing installed. An
+[integration](add.md#the-integration-contract) is the managed journey for one agent; its converter
+writes this same format into that agent's spool.
 
 ```bash
 funes index thread-2026-06.funes.jsonl   # one file
@@ -12,10 +15,21 @@ funes index ./exports/                    # a directory of them, recursively
 funes index --check ./exports/            # validate everything, write nothing
 ```
 
-A file is one unit: it is read whole and written in one append. A directory is one unit per file. A
-file is *signature-less* — it is re-read on every `funes index` that names it and never recorded in
-`state.json`; chunk-id dedup makes the re-read a no-op. Keep files bounded and ship updates as new
-files rather than regrowing one. `--harness` is refused on both shapes: the facet is in the data.
+A file is one unit: it is read whole and written in one append. A directory is one unit per file.
+
+A file you name is re-read on every `funes index` that names it; chunk-id dedup prevents duplicate
+rows. In a directory, unchanged files are skipped and changed files are read again. Keep files
+bounded, and ship an update either as a new file or by rewriting the one it belongs to; dedup drops
+what is already stored. `--harness` is refused on both shapes: the facet is in the data.
+
+**Write into a directory funes indexes by renaming into place**: write a temporary name in that same
+directory, then `mv` it over the final one. funes may index the directory while you are writing, and
+a half-written file is a rejected file. Keep the temporary name off the `.jsonl` extension: funes
+lists every `.jsonl` in the directory, and one that is not a turns file rejects the whole directory.
+
+A file funes refuses is remembered as refused, against both its content and the funes version that
+refused it, so a run that meets only files it has already refused reports nothing and exits zero.
+Re-emit the file, or upgrade funes, and it is read again.
 
 ## The turn
 
@@ -38,16 +52,15 @@ files rather than regrowing one. `--harness` is refused on both shapes: the face
 |---|---|---|---|
 | `block_type` | string | yes | `text` \| `thinking` \| `tool_use` \| `tool_result`. Anything else is rejected. |
 | `text` | string | yes | the content. For `tool_use`, the call — arguments as text; for `tool_result`, the output. Markdown is fine; it is indexed as written. |
-| `tool_name` | string | `tool_use`: yes; `tool_result`: no | the tool. funes never infers it: a result without a name renders without one. |
+| `tool_name` | string | no | the tool. funes never infers it: a block without a name renders without one. |
 | `tool_use_id` | string | no | pairs a `tool_result` with its `tool_use`. Stored as given; funes derives nothing from it. |
 
 Any field not listed above is rejected, on either object — funes expects its producers to be exactly
 aligned on this contract, and would rather refuse a file than silently drop what it does not
 understand. The funes-owned fields (`source_path`, `workdir`, `repo`, chunk ids) must not appear.
 
-**Tool output is a `tool_result` block, whatever the turn's role.** Tiers key on `block_type`, never
-on `role`: a `role: "tool"` turn whose output sits in a `text` block is indexed as text — first, not
-deferred.
+**Tool output is a `tool_result` block, whatever the turn's role.** funes keys on `block_type`,
+never on `role`: a `role: "tool"` turn whose output sits in a `text` block is indexed as text.
 
 **A turn's rows are a function of the turn alone.** funes renders and splits each block from that
 turn's own fields — never from another turn, another file, or an earlier run — so re-emitting an
@@ -93,16 +106,19 @@ follows from that.
 A file is accepted or rejected **whole**; nothing from a rejected file is written. Rejected: a line that
 is not a JSON object, an unknown field, a missing required field, a wrong type, an unknown
 `block_type`, a `ts` that is not RFC 3339 UTC (`Z`), a `format` funes does not know, a `:` in
-`session_id` or `turn_uuid`, a `harness` outside `[a-z0-9_-]`, a `tool_use` without a `tool_name`.
+`session_id` or `turn_uuid`, a `harness` outside `[a-z0-9_-]`.
 
 Indexing a single file, a rejection fails the run. Indexing a directory, each file stands alone: a
 rejected file is reported with its first bad line, the run continues, the summary counts it under
-`rejected`, and the exit status is non-zero. A directory holding any other `.jsonl` file is rejected —
-the source would be ambiguous; files that are not `.jsonl` are ignored.
+`rejected`, and the exit status is non-zero — the first time. It is then remembered as refused, and
+a later run over the same directory skips it rather than failing again. A directory holding any
+other `.jsonl` file is rejected — the source would be ambiguous; files that are not `.jsonl` are
+ignored.
 
 `funes index --check <file-or-dir>` runs the same validation and computes ids without writing:
-turns, chunks, duplicate ids, and the first bad line of every rejected file. Run it before you
-publish a producer.
+turns, chunks, duplicate ids, and the first bad line of every rejected file. Only a rejected file
+fails it — a duplicate id is reported, since indexing keeps the first occurrence and drops the rest.
+Run it before you publish a producer.
 
 ## What funes does with your turns
 
@@ -112,12 +128,10 @@ Behaviour, not contract — it may evolve; the identity rule above will not.
 - **Redacts** secrets before chunking, best-effort; whatever slips through is caught by the fail-closed
   gate on `push`, so a leaked token never reaches a published memory.
 - **Renders** each block to the text that is embedded and full-text indexed: `text` and `thinking`
-  as-is; `tool_use` as `[tool_use <tool_name>] <text>`; `tool_result` as `[tool_result <tool_name>]
-  <text>` (`[tool_result] <text>` without a name).
+  as-is; `tool_use` as `[tool_use <tool_name>] <text>` (`[tool_use None] <text>` without a name);
+  `tool_result` as `[tool_result <tool_name>] <text>` (`[tool_result] <text>` without a name).
 - **Splits** long rendered text into overlapping pieces; `split_idx` numbers them and `get` stitches
   them back.
-- **Indexes by tier**: `text` and `thinking` first, then `tool_use`, then `tool_result`. A budgeted run
-  may leave later tiers pending; `funes status` says so.
 - **Stamps** `source_path` with the file's path and derives `workdir` and `repo` from `cwd`.
 - **Lists** a session in `sessions` by its opening text — the first `user` text block, else the first
   text block; `sketch` uses `user` / `assistant` turns where they exist.
@@ -132,7 +146,7 @@ unknown field is rejected rather than dropped — so a file is either understood
 ## Examples
 
 An agent conversation, OpenAI-style, with the tool result in its own turn (a producer may just as well
-place it inside the assistant's turn — tiers follow `block_type`):
+place it inside the assistant's turn):
 
 ```json
 {"format":1,"session_id":"b3f2e0c4","turn_uuid":"t-0001","seq":0,"ts":"2026-09-18T09:41:07Z","role":"user","harness":"opencode","cwd":"/home/me/dev/x","blocks":[{"block_type":"text","text":"why does the build fail on arm64?"}]}
@@ -151,4 +165,4 @@ local clone so the `repo` facet resolves.
 ```
 
 A PR's diff fits the tool vocabulary honestly — a `tool_use` block `gh pr diff 31234` followed by a
-`tool_result` holding it — and lands in the last tier, indexed after the discussion.
+`tool_result` holding it.

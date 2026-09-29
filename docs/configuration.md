@@ -36,13 +36,19 @@ registration and funes-owned files/entries:
 
 | Agent | Files or configuration |
 | --- | --- |
-| Claude Code | Hooks-only plugin under `~/.funes/integrations/claude-plugin`; registered through Claude's plugin commands. |
-| Codex | `~/.codex/hooks.json` and scripts under `~/.codex/hooks/`. |
-| Hermes | `~/.hermes/config.yaml`, `~/.hermes/shell-hooks-allowlist.json`, and scripts under `~/.hermes/hooks/`. |
-| pi | Extension and optional memory binding under `~/.funes/integrations/pi/`. |
+| Claude Code | Hooks-only plugin under `~/.funes/agents/claude/`; registered through Claude's plugin commands. |
+| Codex | Plugin carrying the skill and the hooks under `~/.funes/agents/codex/`; registered through Codex's plugin commands. |
+| Hermes | Plugin carrying the automation hooks at `~/.hermes/plugins/funes/`; enabled through hermes' plugin commands. |
+| pi | Extension and optional memory binding under `~/.funes/agents/pi/`. |
 
-See [automation.md](automation.md) for how these files are merged and which events they handle.
-Hook logs sit beside the installed scripts as `funes-sync.log`.
+Beside each integration's directory, `~/.funes/agents/<id>.json` records what `funes add`
+installed there and where the files came from; `<id>.memory` beside it notes the memory its
+setup last ran with, when one was.
+
+What each integration puts there, and which of its agent's events it hooks, is in the
+integration's README — the maintained ones are in
+[funes-integrations](https://github.com/huggingface/funes-integrations#readme). Hook logs sit
+beside the installed scripts as `funes-sync.log`.
 
 ## Authentication
 
@@ -75,6 +81,7 @@ file-grained cache design and cold-versus-warm behavior.
 | `FUNES_HOME` | Local memory and funes state directory; default `~/.funes`. |
 | `FUNES_BIN` | Binary path recorded in supported MCP registrations and used by the pi bridge. Hook workers instead find `funes` on `PATH` or in common install directories. |
 | `FUNES_MEMORY` | Per-run memory override understood by the pi extension; otherwise its binding from `funes add pi [memory]` is used. |
+| `FUNES_INTEGRATIONS` | Directory `funes add` installs an agent integration from, instead of the published one. funes can't vouch for those files, so it asks you to confirm before running them — once, until they change. |
 | `FUNES_TRUFFLEHOG` | Explicit TruffleHog binary for secret scanning. Index-time redaction is best-effort; push and scrub scanning fail closed. |
 | `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, `HUGGINGFACE_TOKEN` | Hugging Face authentication, in the precedence shown above. |
 | `HF_HOME` | Hugging Face home, including the default backend's model cache. |
@@ -82,6 +89,8 @@ file-grained cache design and cold-versus-warm behavior.
 | `NO_COLOR` | Disable ANSI color in human-facing terminal output. |
 | `COLUMNS` | Human-rendering width, clamped to 40–120 columns. |
 
-Bindings passed to `funes add` live in the agent's own registration or integration files; there is
-no hidden “active remote” in `$FUNES_HOME`. Re-run `funes add <agent> [memory]` to change one, or
+Bindings passed to `funes add` live in the agent's own registration or integration files, noted
+beside the install in `~/.funes/agents/<agent>.memory` so a bare re-run keeps them; there is no
+hidden “active remote” in `$FUNES_HOME`. Re-run `funes add <agent> <memory>` to change one (`local`
+unbinds), or
 `funes remove <agent>` to remove that agent integration without deleting the memory.

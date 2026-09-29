@@ -2,12 +2,13 @@
 //! so any MCP client (Claude Code, Cursor, …) can call funes as a first-class tool.
 //! stdout is the JSON-RPC channel — logs must go to stderr.
 
-use super::recall;
+use super::{push, recall};
+use crate::agents;
 use crate::memory::Memory;
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
@@ -30,11 +31,11 @@ pub struct RecallRequest {
     #[schemars(description = "Restrict to a block type: text | thinking | tool_use | tool_result")]
     pub block_type: Option<String>,
     #[schemars(
-        description = "Restrict to a harness facet: an agent's name (claude | codex | pi | hermes) or any harness a turns file carries"
+        description = "Restrict to a harness facet, as the turns carry it (`claude` also matches the older `claude_code`)"
     )]
     pub harness: Option<String>,
     #[schemars(
-        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory, with this host's turns not yet pushed to it."
     )]
     pub memory: Option<String>,
 }
@@ -52,7 +53,7 @@ pub struct GetRequest {
     )]
     pub to: Option<i64>,
     #[schemars(
-        description = "Memory to read for this call — the one the recall hit's `→ get` line names. Defaults to the server's memory."
+        description = "Memory to read for this call — the one the recall hit's `→ get` line names. Defaults to the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -74,7 +75,7 @@ pub struct SessionsRequest {
     )]
     pub offset: Option<usize>,
     #[schemars(
-        description = "Memory to list — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to list — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory, with the sessions this host has not finished pushing listed from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -98,7 +99,7 @@ pub struct ScanRequest {
     #[schemars(description = "Characters of surrounding text shown on each side of a match")]
     pub context: Option<usize>,
     #[schemars(
-        description = "Memory to scan — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to scan — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -122,7 +123,7 @@ pub struct SketchRequest {
     #[schemars(description = "Last turn to digest, as the session's own seq.")]
     pub to: Option<i64>,
     #[schemars(
-        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
@@ -133,6 +134,17 @@ pub struct StatusRequest {
         description = "Memory to inspect — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
     )]
     pub memory: Option<String>,
+}
+
+/// A tool's text, led by the stale-install note when there is one. A tool result is the one channel
+/// every client hands to the model, so this is where an install that stopped capturing gets said;
+/// the CLI prints the same line on stderr and keeps stdout byte-identical to this text. `memory`
+/// is the server's own, which the note's cure names.
+fn noted(memory: Option<&str>, text: String) -> String {
+    match agents::stale_install_notice(memory) {
+        Some(note) => format!("{note}\n{text}"),
+        None => text,
+    }
 }
 
 #[derive(Clone)]
@@ -159,6 +171,17 @@ impl Funes {
         Memory::resolve(spec.filter(|s| !s.trim().is_empty()).or_else(|| self.memory.clone()))
     }
 
+    /// The memory a session verb reads: a call on the server's own memory reads a session this
+    /// host still owes it from the local memory, which holds all of it.
+    async fn memory_for_session(&self, spec: Option<String>, session_id: &str) -> Result<Memory> {
+        let own = own(&spec);
+        let memory = self.memory(spec);
+        if own {
+            return session_memory(memory, session_id).await;
+        }
+        Ok(memory)
+    }
+
     #[tool(
         description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it."
     )]
@@ -175,22 +198,42 @@ impl Funes {
             memory,
         }): Parameters<RecallRequest>,
     ) -> String {
-        match recall::recall(
-            self.memory(memory),
-            query,
-            k.unwrap_or(recall::DEFAULT_K),
-            candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
-            half_life.unwrap_or(recall::DEFAULT_HALF_LIFE),
-            neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
-            block_type,
-            harness,
+        let own = own(&memory);
+        let memory = self.memory(memory);
+        let quiet = |_: &str| ();
+        let recalled = async {
+            let candidates = candidates.unwrap_or(recall::DEFAULT_CANDIDATES);
+            let search = recall::Search::new(query, candidates, block_type, harness, &quiet).await?;
+            // The server's own memory, as it will be after this host's next push. The local search
+            // runs while the remote one waits on the network.
+            let (read, owed) = tokio::join!(search.candidates(&memory, &quiet), async {
+                if own {
+                    unpushed(&search, &memory).await
+                } else {
+                    Ok(None)
+                }
+            });
+            let mut pools = vec![read?];
+            pools.extend(owed?);
+            let (note, hits) = search
+                .rank(
+                    pools,
+                    k.unwrap_or(recall::DEFAULT_K),
+                    half_life.unwrap_or(recall::DEFAULT_HALF_LIFE),
+                    neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
+                    &quiet,
+                )
+                .await?;
+            anyhow::Ok(recall::rendered(&note, &hits))
+        };
+        noted(
+            self.memory.as_deref(),
+            match recalled.await {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("recall error: {e}"),
+            },
         )
-        .await
-        {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("recall error: {e}"),
-        }
     }
 
     #[tool(
@@ -206,11 +249,19 @@ impl Funes {
         }): Parameters<GetRequest>,
     ) -> String {
         let range = recall::TurnRange { from, to };
-        match recall::get(self.memory(memory), session_id, range).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("get error: {e}"),
-        }
+        noted(
+            self.memory.as_deref(),
+            match async {
+                let memory = self.memory_for_session(memory, &session_id).await?;
+                recall::get(memory, session_id, range).await
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("get error: {e}"),
+            },
+        )
     }
 
     #[tool(
@@ -234,11 +285,22 @@ impl Funes {
             limit,
             offset: offset.unwrap_or(0),
         };
-        match recall::sessions(self.memory(memory), filter).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("sessions error: {e}"),
-        }
+        noted(
+            self.memory.as_deref(),
+            match async {
+                if own(&memory) {
+                    recall::list_sessions(session_pools(&self.memory(memory)).await?, filter).await
+                } else {
+                    recall::sessions(self.memory(memory), filter).await
+                }
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("sessions error: {e}"),
+            },
+        )
     }
 
     #[tool(
@@ -256,21 +318,27 @@ impl Funes {
             memory,
         }): Parameters<ScanRequest>,
     ) -> String {
-        match recall::scan(
-            self.memory(memory),
-            needle,
-            session_id,
-            from,
-            to,
-            ignore_case.unwrap_or(false),
-            context.unwrap_or(recall::DEFAULT_CONTEXT),
+        noted(
+            self.memory.as_deref(),
+            match async {
+                recall::scan(
+                    self.memory_for_session(memory, &session_id).await?,
+                    needle,
+                    session_id,
+                    from,
+                    to,
+                    ignore_case.unwrap_or(false),
+                    context.unwrap_or(recall::DEFAULT_CONTEXT),
+                )
+                .await
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("scan error: {e}"),
+            },
         )
-        .await
-        {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("scan error: {e}"),
-        }
     }
 
     #[tool(
@@ -287,40 +355,108 @@ impl Funes {
             memory,
         }): Parameters<SketchRequest>,
     ) -> String {
-        match super::sketch::run(self.memory(memory), session_id, from, to, units, max_chars).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("sketch error: {e}"),
-        }
+        noted(
+            self.memory.as_deref(),
+            match async {
+                let memory = self.memory_for_session(memory, &session_id).await?;
+                super::sketch::run(memory, session_id, from, to, units, max_chars).await
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("sketch error: {e}"),
+            },
+        )
     }
 
     #[tool(
-        description = "Health and size of a memory: how much is indexed, what is still pending, and for a remote what this host has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
+        description = "Health and size of a memory: indexed chunks, local chunks awaiting embedding, source sessions awaiting indexing, and for a remote what this host has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
     )]
     async fn status(&self, Parameters(StatusRequest { memory }): Parameters<StatusRequest>) -> String {
         // No update check here: it needs the network, and the "update available" notice belongs
         // on the human-facing CLI `funes status`, not on this hot, otherwise-local tool path.
-        recall::status(self.memory(memory))
-            .await
-            .unwrap_or_else(|e| format!("status error: {e}"))
+        noted(
+            self.memory.as_deref(),
+            recall::status(self.memory(memory))
+                .await
+                .unwrap_or_else(|e| format!("status error: {e}")),
+        )
     }
+}
+
+/// Whether a call reads the server's own memory — it names none of its own.
+fn own(spec: &Option<String>) -> bool {
+    spec.as_deref().is_none_or(|s| s.trim().is_empty())
+}
+
+/// This host's turns not yet pushed to `memory`: the local memory's candidates for `search`, kept
+/// to the rows missing from this host's receipt for it. `None` unless this host has pushed to
+/// `memory`, a remote.
+pub async fn unpushed(search: &recall::Search, memory: &Memory) -> Result<Option<recall::Candidates>> {
+    let Memory::Remote { uri } = memory else {
+        return Ok(None);
+    };
+    let Some(pushed) = push::load_pushed(uri) else {
+        return Ok(None);
+    };
+    let mut pool = search.candidates(&Memory::local(), &|_| ()).await?;
+    pool.retain(|h| !pushed.contains(&h.id));
+    Ok(Some(pool))
+}
+
+/// The sessions of `memory` as it will be after this host's next push: its own, except those this
+/// host still owes rows, which come from the local memory whole. The local side is read while the
+/// remote one waits on the network.
+pub async fn session_pools(memory: &Memory) -> Result<Vec<recall::SessionPool>> {
+    let Memory::Remote { uri } = memory else {
+        return Ok(vec![recall::SessionPool::open(memory).await?]);
+    };
+    let (pool, owed) = tokio::join!(recall::SessionPool::open(memory), async {
+        let owed = push::owed_sessions(uri).await?;
+        if owed.is_empty() {
+            return Ok(None);
+        }
+        let mut local = recall::SessionPool::open(&Memory::local()).await?;
+        local.retain(|s| owed.contains(&s.session_id));
+        anyhow::Ok(Some((local, owed)))
+    });
+    let mut pool = pool?;
+    let Some((local, owed)) = owed? else {
+        return Ok(vec![pool]);
+    };
+    pool.retain(|s| !owed.contains(&s.session_id));
+    Ok(vec![pool, local])
+}
+
+/// Where `memory`, as it will be after this host's next push, holds `session_id`: the local memory
+/// when this host still owes the session rows, else `memory` itself.
+pub async fn session_memory(memory: Memory, session_id: &str) -> Result<Memory> {
+    if let Memory::Remote { uri } = &memory {
+        if push::owes_session(uri, session_id).await? {
+            return Ok(Memory::local());
+        }
+    }
+    Ok(memory)
 }
 
 #[tool_handler]
 impl ServerHandler for Funes {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut server_info = Implementation::default();
         server_info.name = "funes".to_string();
         server_info.version = env!("CARGO_PKG_VERSION").to_string();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let mut instructions = "Persistent memory over the user's past AI coding sessions: their transcripts, \
+                                indexed automatically as they work and read-only here — nothing has to be saved. \
+                                When earlier work matters, this is the memory to consult."
+            .to_string();
+        if let Some(note) = agents::stale_install_notice(self.memory.as_deref()) {
+            instructions.push_str("\n\n");
+            instructions.push_str(&note);
+        }
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_info)
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "Persistent memory over the user's past AI coding sessions: their transcripts, \
-                 indexed automatically as they work and read-only here — nothing has to be saved. \
-                 When earlier work matters, this is the memory to consult."
-                    .to_string(),
-            )
+            .with_instructions(instructions)
     }
 }
 

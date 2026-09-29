@@ -192,3 +192,46 @@ refresh/enumerate/turns/read round trip before consumer activation. Earlier
 verification above does not cover this lockfile. This source refresh does not
 switch installations or services, publish a release or Hugging Face artifact,
 or upload memory.
+
+### September 29, 2026 upstream integration
+
+The `update-all-20260929` branch starts from the deployed custom revision
+`c27917ac833c34b9f5b7f39e397efc56f6d59899`; maintained-fork `main` was clean
+and already current. Upstream `huggingface/funes` main through `9712c6f` adds
+external integration spools, rows-first indexing, refreshed search indexes,
+streamed inference-weight loading, and pooled MCP reads.
+
+The fork retains native OMP indexing behind an explicit local path and
+`--harness omp`, including bounded embedding, committed coverage receipts,
+scanner history, graph dependencies, full citations, and dry-run isolation.
+Native OMP obligations survive the upstream retirement of other native indexing
+sources. Claude, Codex, and OMP normalization through `funes source` remains
+independent of integration spools; protocol 1, parser capability labels,
+`actomasto-v1`, identity derivation, and fail-closed evidence gates are unchanged.
+
+The regenerated compatible lockfile uses RMCP 3.5.0 (following upstream's
+RMCP 3 migration), `serde_with` 3.24.0, `cc` 1.5.1, `zerocopy` 0.8.59, and
+`tokio-rustls` 0.26.6. Lance remains pinned to 11.0.0, Arrow to the 58 series,
+and `hf-hub` to 1.0.0. The obsolete YAML dependency and unused release-bucket
+helper are removed; software updates still use the fork's GitHub Releases,
+not a Hugging Face deployment.
+
+Builds use the default BLAS backend and the existing optimized dev-profile
+convention (opt-level 1, debug information and incremental compilation disabled,
+lld). Consumers must check `source` capabilities against the exact committed
+build revision before switching their pinned executable. No live Hugging Face
+tests, uploads, or deployments are authorized by this refresh.
+
+Verification of the integrated source passed formatting, warning-free Clippy for
+both the default and ONNX backends, the offline installer regression, and
+`cargo test --locked --all-targets -- --test-threads=1`: 347 reported passes,
+including five live-Hub tests that returned early because `HF_FUNES_TEST_TOKEN`
+was empty. No remote-memory or publication coverage is claimed.
+
+Runtime probes exercised source capabilities and a synthetic
+refresh/enumerate/turns/read round trip, bounded native indexing and resumed
+coverage, semantic recall, and a real MCP initialize/tools-list/get exchange.
+Native OMP 18.4.3 fixtures retained three parent/child/advisor sessions and nine
+chunks while excluding reasoning, tool results, and control text. Its completed
+lifecycle emitted one valid source turn; its aborted lifecycle stayed pending.
+Live services are switched separately by the integrating operator.

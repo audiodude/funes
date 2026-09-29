@@ -133,7 +133,7 @@ fn iso_clock(text: &str) -> Option<(u32, u32, u32, u32)> {
         if !matches!(whole.len(), 2 | 4 | 6) || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
-        for (index, part) in whole.as_bytes().chunks_exact(2).enumerate() {
+        for (index, part) in whole.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             components[index] = u32::from(part[0] - b'0') * 10 + u32::from(part[1] - b'0');
         }
     }
@@ -786,7 +786,9 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         if let Some(tools) = controls.get("tools") {
             if !allowed_keys(tools, "declared deferred active")
                 || ["declared", "deferred", "active"].iter().any(|key| {
-                    !tools[key].as_array().is_some_and(|names| names.iter().all(Value::is_string))
+                    !tools[key]
+                        .as_array()
+                        .is_some_and(|names| names.iter().all(Value::is_string))
                 })
             {
                 return Err(SCHEMA);
@@ -795,9 +797,9 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         if let Some(effort) = controls.get("effort") {
             if !allowed_keys(effort, "topLevel tail")
                 || ["topLevel", "tail"].iter().any(|key| {
-                    !effort.get(key).is_some_and(|value| {
-                        value.is_null() || one_of(value, "low medium high xhigh max")
-                    })
+                    !effort
+                        .get(key)
+                        .is_some_and(|value| value.is_null() || one_of(value, "low medium high xhigh max"))
                 })
             {
                 return Err(SCHEMA);

@@ -42,6 +42,11 @@ Then add it to your agent:
 funes add claude    # or codex, pi, hermes
 ```
 
+Another agent? Integrations their authors maintain are listed in
+[funes-integrations/COMMUNITY.md](https://github.com/huggingface/funes-integrations/blob/main/COMMUNITY.md),
+and `funes add <id> --from …` installs one from wherever it is published.
+To build and share your own, start with [Writing an integration](CONTRIBUTING.md#writing-an-integration).
+
 One command onboards you: your agent gets `recall` and `get` as tools, and — for Claude, Codex, and
 Hermes — funes builds your first index, installs a hook that keeps it current every turn, and (with a
 memory bound) publishes at each session boundary. From here you just work. See
@@ -138,17 +143,18 @@ The per-turn indexing and session-boundary publishing the hooks run are detailed
 
 `funes add` runs one loop: **index** what you've done, **recall** it when it matters — and index what
 you just did, so it's recallable next time. Both halves are one deterministic pipeline: each source
-is parsed into a generic turn/block shape, chunked, embedded with a pinned local model, and written to
-a local Lance dataset; recall fuses vector + BM25 search, reranks, and reweights by recency. Because
-everything downstream of parsing is source-agnostic, adding an agent means implementing one
-[`TraceSource`](src/source.rs) trait — not touching the indexing or query path.
+is parsed into a generic turn/block shape, chunked, written to a local Lance dataset, and embedded
+with a pinned local model; recall fuses vector + BM25 search, reranks, and reweights by recency.
+Integrations convert each agent's transcripts into the shared [turns format](docs/funes-jsonl.md).
+Adding an agent means publishing an [integration](CONTRIBUTING.md#writing-an-integration) of your
+own; the indexing and query pipeline already reads that format.
 
 `funes` shapes its output for agents, not people — so to put a question to a memory yourself, borrow
 an agent: `funes ask` recalls from the memory and answers grounded in what it finds, installing
 nothing. `funes recall` prints the raw ranked passages behind an answer, and `funes get` reassembles
 any cited turn in full.
 
-- [docs/index.md](docs/index.md) — the indexing pipeline, tiers, and incremental behavior.
+- [docs/index.md](docs/index.md) — sources, progress, and incremental indexing.
 - [docs/recall.md](docs/recall.md) — retrieval, drill-down with `get`, and reading a shared memory.
 - [docs/sessions.md](docs/sessions.md) — browsing a memory by session: `sessions`, `sketch`, `scan`.
 - [docs/ask.md](docs/ask.md) — borrow an agent for a grounded answer, nothing installed.

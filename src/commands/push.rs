@@ -1,7 +1,7 @@
 //! `push`: publish the local memory's not-yet-remote chunks into a remote memory on the HF Hub.
 //!
 //! Streamed, never a full mirror. "What's already there" is the memory's own chunk ids, so the
-//! delta is `local_ids − remote_ids` — the same primitive `index` uses. `push` is orchestration:
+//! delta is `embedded_local_ids − remote_ids`. `push` is orchestration:
 //! it computes the delta, holds back any row that still contains a secret (redaction happens at
 //! index time; this is the egress backstop — the rows wait for `funes scrub`), and drives the HF
 //! write operations in [`crate::memory::remote`], which own the atomic, parent-commit-guarded commits.
@@ -16,8 +16,8 @@
 //!   crosses [`REINDEX_THRESHOLD`] (best-effort: a head-moved conflict is a warning, the next push
 //!   retries), or eagerly with `--force-reindex` (retried until it lands).
 //!
-//! What a push ships is either everything the local memory holds that the remote doesn't, or —
-//! with `--sessions` — exactly the sessions named. The list is the decision; nothing else gates it.
+//! What a push ships is the embedded chunks the remote doesn't hold, optionally restricted to the
+//! sessions named with `--sessions`. Rows awaiting embedding stay local until a later push.
 
 use crate::hub;
 use crate::memory::card::{self, CardAction, CardCtx};
@@ -25,7 +25,7 @@ use crate::memory::dataset;
 use crate::memory::lock;
 use crate::memory::remote::{self, Appended, Reindexed};
 use crate::memory::{Memory, MemoryState};
-use crate::{chunk, scan};
+use crate::{chunk, scan, ui};
 use anyhow::{bail, Context, Result};
 use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array};
 use arrow_select::filter::filter_record_batch;
@@ -112,7 +112,7 @@ fn load_pushed_from(path: &Path) -> Option<HashSet<String>> {
     )
 }
 
-fn load_pushed(memory_uri: &str) -> Option<HashSet<String>> {
+pub(crate) fn load_pushed(memory_uri: &str) -> Option<HashSet<String>> {
     load_pushed_from(&pushed_path(memory_uri))
 }
 
@@ -202,6 +202,44 @@ pub(crate) async fn local_push_coverage(local: &Dataset, memory_uri: &str) -> Op
     Some(coverage)
 }
 
+/// The local sessions holding rows `memory_uri` lacks, by this host's receipt.
+/// Empty when nothing is owed, including when this host never pushed there or has nothing indexed.
+pub(crate) async fn owed_sessions(memory_uri: &str) -> Result<HashSet<String>> {
+    let Some(pushed_ids) = load_pushed(memory_uri) else {
+        return Ok(HashSet::new());
+    };
+    let MemoryState::Ready(local) = Memory::local().state().await? else {
+        return Ok(HashSet::new());
+    };
+    let mut owed = HashSet::new();
+    for batch in dataset::scan_rows(&local, &["id", "session_id"], None, None).await? {
+        let column = |name| batch.column_by_name(name)?.as_any().downcast_ref::<StringArray>();
+        let (Some(ids), Some(sessions)) = (column("id"), column("session_id")) else {
+            continue;
+        };
+        for i in 0..batch.num_rows() {
+            if !pushed_ids.contains(ids.value(i)) {
+                owed.insert(sessions.value(i).to_string());
+            }
+        }
+    }
+    Ok(owed)
+}
+
+/// Whether this host still owes `memory_uri` rows of `session_id` — reads that one session's ids,
+/// not the whole local memory.
+pub(crate) async fn owes_session(memory_uri: &str, session_id: &str) -> Result<bool> {
+    let Some(pushed_ids) = load_pushed(memory_uri) else {
+        return Ok(false);
+    };
+    let MemoryState::Ready(local) = Memory::local().state().await? else {
+        return Ok(false);
+    };
+    let filter = format!("session_id = '{}'", crate::commands::recall::esc(session_id));
+    let batches = dataset::scan_rows(&local, &["id"], Some(&filter), None).await?;
+    Ok(!ids_in_batches(&batches).is_subset(&pushed_ids))
+}
+
 /// What the secret gate would hold back of the `pending` rows, scanned exactly as a push would.
 async fn held_among(local: &Dataset, pending: &HashSet<String>) -> Option<Skipped> {
     if pending.is_empty() {
@@ -227,9 +265,16 @@ fn ids_in_batches(batches: &[RecordBatch]) -> HashSet<String> {
     ids
 }
 
-/// Every row of the local memory, whole — a publish ships each row as it stands.
+/// Every embedded row of the local memory, whole — a publish ships each row as it stands.
 async fn all_rows(local: &Dataset) -> Result<Vec<RecordBatch>> {
-    dataset::scan_rows(local, &[], None, None).await
+    dataset::scan_rows(local, &[], Some("vector IS NOT NULL"), None).await
+}
+
+/// The ids of the local chunks that carry a vector — the only ones a push may publish.
+async fn embedded_ids(local: &Dataset) -> Result<HashSet<String>> {
+    Ok(ids_in_batches(
+        &dataset::scan_rows(local, &["id"], Some("vector IS NOT NULL"), None).await?,
+    ))
 }
 
 /// Don't make this a scan filter. On a memory that hasn't been pushed in a while, that filter lists
@@ -360,13 +405,13 @@ fn named_ids(by_session: &HashMap<String, Vec<String>>, sessions: &[String]) -> 
     Ok(sessions.iter().flat_map(|s| by_session[s].iter().cloned()).collect())
 }
 
-/// Publish the local memory's new chunks to `target` (a remote memory on the HF Hub). With
+/// Publish the local memory's new embedded chunks to `target` (a remote memory on the HF Hub). With
 /// `force_reindex`, refresh the remote index after the data commit (retrying until it lands) even
 /// if the unindexed backlog is below [`REINDEX_THRESHOLD`]; with no new chunks pending it's a pure
 /// index refresh. `confirm` gates a publish to a memory the local index shares no chunks with.
 ///
-/// `sessions`, when non-empty, is the publication itself: exactly those sessions' chunks are
-/// candidates. Empty publishes everything the local memory holds that the remote does not.
+/// `sessions`, when non-empty, restricts candidates to those sessions' embedded chunks.
+/// Empty publishes all embedded chunks the local memory holds that the remote does not.
 pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, sessions: &[String]) -> Result<Pushed> {
     let uri = match &target {
         Memory::Remote { uri } => uri.clone(),
@@ -430,7 +475,8 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
         eprintln!("publishing {} named session(s)", sessions.len());
         named_ids(&ids_by_session(&local).await?, sessions)?
     };
-    let to_push: HashSet<String> = candidates.difference(&remote_ids).cloned().collect();
+    let publishable: HashSet<String> = candidates.intersection(&embedded_ids(&local).await?).cloned().collect();
+    let to_push: HashSet<String> = publishable.difference(&remote_ids).cloned().collect();
 
     // Bootstrap/refresh the local receipt from facts the push comparison has already established.
     // This makes a no-op push enough to initialize status for a legacy remote, with no extra scan.
@@ -451,7 +497,7 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
     let token = hub::hf_token().context("no HF token (set HF_TOKEN) — required to push")?;
 
     // When required, ask for confirmation before publishing.
-    if must_confirm(candidates.len(), to_push.len()) && !confirm.proceed(&target.label(), to_push.len()) {
+    if must_confirm(publishable.len(), to_push.len()) && !confirm.proceed(&target.label(), to_push.len()) {
         bail!("push aborted");
     }
 
@@ -542,7 +588,7 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
             &rev,
             message,
             &extra,
-            |phase| eprintln!("building {phase}…"),
+            ui::index_progress,
         )
         .await?;
         let Some(oid) = oid else {
@@ -857,7 +903,7 @@ mod tests {
     fn batch(turns: &[Turn]) -> (RecordBatch, Vec<chunk::Chunk>) {
         let chunks = chunk::chunks_from_turns(turns, &chunk::Tier::ALL, true);
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
-        (dataset::build_batch(&chunks, &vectors).unwrap(), chunks)
+        (dataset::build_batch(&chunks, Some(&vectors)).unwrap(), chunks)
     }
 
     #[test]
@@ -967,6 +1013,36 @@ mod tests {
         assert_eq!(by_session.len(), 2, "one entry per session");
         assert!(by_session.contains_key("reviewed") && by_session.contains_key("private"));
         assert!(by_session.values().all(|ids| !ids.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn only_embedded_rows_can_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks = chunk::chunks_from_turns(
+            &[
+                turn_sess("s", 0, "embedded"),
+                turn_sess("s", 1, "still awaiting embedding"),
+            ],
+            &chunk::Tier::ALL,
+            true,
+        );
+        let reader = RecordBatchIterator::new(
+            vec![Ok(dataset::build_batch(&chunks, None).unwrap())],
+            dataset::schema(),
+        );
+        let uri = dataset::table_uri(&dir.path().to_string_lossy());
+        let ds = Dataset::write(reader, &uri, None).await.unwrap();
+        let ds = dataset::fill_vectors(&ds, &[&chunks[0].id], &[vec![1.0; dataset::DIM as usize]])
+            .await
+            .unwrap();
+
+        let embedded = HashSet::from([chunks[0].id.clone()]);
+        assert_eq!(embedded_ids(&ds).await.unwrap(), embedded);
+        assert_eq!(
+            ids_in_batches(&all_rows(&ds).await.unwrap()),
+            embedded,
+            "a first publish ships no nulls"
+        );
     }
 
     #[tokio::test]

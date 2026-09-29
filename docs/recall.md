@@ -13,6 +13,9 @@ Retrieval is one pipeline: hybrid search (vector + BM25, fused by reciprocal ran
 rerank → recency reweight → neighbor expansion. What comes back is the **actual passage from the
 actual turn**, not a summary written about it.
 
+Passages are searchable by their words as soon as their text is indexed, even while embeddings
+are pending. If text search fails, recall reports an error.
+
 `funes recall` prints one stable, parseable layout — the **agent format** — everywhere, terminal or
 pipe. It's shaped for an agent to read, but it's the raw evidence for you too. If you want an
 *answer* rather than ranked passages, [`funes ask`](ask.md) borrows an agent to read the memory and
@@ -32,9 +35,10 @@ Each hit carries its provenance and a ready-to-run drill-down line:
 ---
 ```
 
-The `→ get` line carries exactly the arguments `get` wants, including the memory the hits were read
-from. `no results` prints when nothing matched. The exact shape is stable — a contract, not a
-presentation; don't parse it loosely.
+The `→ get` line carries exactly the arguments `get` wants, including the memory the hit was read
+from — the local one for a turn an agent's bound memory is still owed (see
+[add.md](add.md#other-mcp-clients)). `no results` prints when nothing matched. The exact shape is
+stable — a contract, not a presentation; don't parse it loosely.
 
 ## `recall` flags
 
@@ -45,7 +49,7 @@ presentation; don't parse it loosely.
 | `--half-life` | 30 | recency decay in days (a hit this old keeps half its weight); 0 disables |
 | `--neighbors` | 1 | adjacent chunks (by seq) attached per hit; 0 disables |
 | `--type` | — | restrict to `text \| thinking \| tool_use \| tool_result` |
-| `--harness` | — | restrict to `claude \| codex \| pi \| hermes` |
+| `--harness` | — | restrict to one harness facet, as the turns carry it (`claude` also matches the older `claude_code`) |
 | `--memory` | local | the memory to read (see below) |
 
 The MCP `recall` tool takes the same parameters and defaults, so an agent can widen a search —

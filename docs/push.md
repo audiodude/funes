@@ -12,8 +12,9 @@ funes recall "..." --memory <user|org>/funes-memory   # read it back from anywhe
 
 ## `funes push`
 
-`funes push <memory>` uploads the chunks your local memory has that the remote doesn't. The memory is an
-`<org>/<repo>` shorthand or a full `hf://…` URI.
+`funes push <memory>` uploads the embedded chunks your local memory has that the remote doesn't.
+Chunks awaiting embedding stay local; after indexing fills their vectors, the next push includes
+them. The memory is an `<org>/<repo>` shorthand or a full `hf://…` URI.
 
 On its **first publish**, push also writes the repo's dataset card — what a funes memory is, how to
 recall from it, live stats — tagged [`funes`](https://huggingface.co/datasets?other=funes) so every
@@ -93,17 +94,17 @@ automate remote deletion.
 
 ## Publishing a selection: `--sessions`
 
-A push ships every local chunk the remote doesn't have. To publish a *selection* instead, name the
-sessions:
+A push ships every embedded local chunk the remote doesn't have. To publish a *selection* instead,
+name the sessions:
 
 ```bash
 funes push <memory> --sessions <session> --sessions <session>
 ```
 
-Those sessions' chunks are exactly what ships. The list **is** the decision — funes keeps no record
-of what you meant to publish, so a selection is made where it takes effect, and an unrecognized
-session id fails the push rather than quietly publishing the rest. `funes sessions` lists the ids,
-and a session is published whole: naming it publishes every chunk it holds.
+Those sessions' embedded chunks are exactly what ships. The list **is** the decision — funes keeps
+no record of what you meant to publish, so a selection is made where it takes effect, and an
+unrecognized session id fails the push rather than quietly publishing the rest. `funes sessions`
+lists the ids, and naming a session publishes every embedded chunk it holds.
 
 The remote is append-only, so a selection is a pre-publication gate and not a remote undo. Nothing
 retracts a session once it is up.
@@ -122,10 +123,10 @@ funes status <org>/<repo>    # …and what this host has or has not pushed there
 ```
 
 `funes status` tells you whether recall is reading your own memory yet, and whether a newer funes
-release is out. When work exists, local-index sections report how many source sessions the latest
-indexing sweep left pending and the command to run; a completed sweep stays quiet. The status read
-uses the sweep's small coverage snapshot rather than recursively scanning transcript trees. For a
-personal remote memory, one `local push` line says either that this host is up to date or how many
+release is out. Its local-index sections distinguish chunks awaiting embedding from source
+sessions not yet indexed. Run `funes index` to continue either.
+
+For a personal remote memory, one `local push` line says either that this host is up to date or how many
 local sessions are pending. This comes from a per-remote receipt kept on this host, so sessions
 contributed by other hosts do not distort the result and status never scans the remote to compute
 it. Run `funes push <memory>` once to initialize the receipt for an existing memory.

@@ -4,7 +4,7 @@
 //! byte-stable, its layout is a published contract (the `→ get` lines are parsed) and must not
 //! change. Every read verb answers an agent, so that is the only format here.
 
-use crate::commands::recall::{Hit, ScanCut, ScanResult, Session, Turn};
+use crate::commands::recall::{memory_hint, Hit, ScanCut, ScanResult, Session, Turn};
 use crate::session_sketch::{Clamped, SessionSketch};
 use std::fmt::Write as _;
 
@@ -16,12 +16,11 @@ fn hint_range(seq: i64) -> String {
     format!(" --from {} --to {}", (seq - HINT_WINDOW).max(0), seq + HINT_WINDOW)
 }
 
-/// The agent `recall` format: provenance header with score, a `→ get` line carrying `memory_arg`
-/// (the pre-rendered ` --memory <label>` suffix, empty for the built-in guide), the full chunk
-/// text, and neighbor lines per hit (unclipped for OMP). The chunk is never clipped — the ranking scored
+/// The agent `recall` format: provenance header with score, a `→ get` line naming the memory the
+/// hit was read from, the full chunk text, and neighbor lines (unclipped for OMP). The ranking scored
 /// all of it, so a preview could hide exactly the span that made it a hit; the chunker's size
 /// cap bounds the payload instead. Byte-stable — the layout is a published contract.
-pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String {
+pub fn recall_agent(note: &str, hits: &[(Hit, f64)]) -> String {
     let mut out = note.to_string();
     for (h, score) in hits {
         let is_omp = h.harness == "omp";
@@ -36,7 +35,13 @@ pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String
             "[{}] {} {}/{} {}  score={:.3}",
             h.ts, h.harness, h.workdir, display_id, h.block_type, score
         );
-        let _ = writeln!(out, "  → get {}{}{}", h.session_id, hint_range(h.seq), memory_arg);
+        let _ = writeln!(
+            out,
+            "  → get {}{}{}",
+            h.session_id,
+            hint_range(h.seq),
+            memory_hint(Some(&h.memory).filter(|m| !m.is_empty()).map(String::as_str))
+        );
         if is_omp {
             let _ = writeln!(out, "[Archived statement, NOT a verified outcome. Citation: [session {}, seq {}, turn {}]. Current applicability and supersession are unknown.]", h.session_id, h.seq, h.turn_uuid);
         }
@@ -293,6 +298,7 @@ mod tests {
 
     fn hit(ts: &str, block_type: &str, text: &str) -> Hit {
         Hit {
+            id: "c1".to_string(),
             text: text.to_string(),
             session_id: "0123456789abcdef".to_string(),
             workdir: "-home-u-funes".to_string(),
@@ -302,6 +308,8 @@ mod tests {
             block_type: block_type.to_string(),
             harness: "claude_code".to_string(),
             neighbors: vec![],
+            memory: "hf://datasets/acme/kb".to_string(),
+            fused: 0.0,
         }
     }
 
@@ -316,7 +324,7 @@ mod tests {
             block_type: "text".to_string(),
             text: "hello".to_string(),
         });
-        let out = recall_agent("", " --memory hf://datasets/acme/kb", &[(h, 0.5781)]);
+        let out = recall_agent("", &[(h, 0.5781)]);
         assert_eq!(
             out,
             "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578\n\
@@ -325,8 +333,10 @@ mod tests {
              \x20 ~ [assistant text seq5] hello\n\
              ---\n"
         );
-        // The built-in guide has no memory to name: an empty suffix keeps the hint bare.
-        let bare = recall_agent("", "", &[(hit("2026-06-19T01:29:59.000Z", "text", "x"), 0.5)]);
+        // A hit with no memory to name keeps the hint bare.
+        let mut unnamed = hit("2026-06-19T01:29:59.000Z", "text", "x");
+        unnamed.memory.clear();
+        let bare = recall_agent("", &[(unnamed, 0.5)]);
         assert!(
             bare.contains("  → get 0123456789abcdef --from 4 --to 10\n"),
             "got: {bare}"
@@ -344,7 +354,7 @@ mod tests {
     #[test]
     fn agent_prepends_note_and_keeps_full_chunk() {
         let long: String = "x".repeat(1200);
-        let out = recall_agent("remote down\n", "", &[(hit("bad-ts", "text", &long), 1.0)]);
+        let out = recall_agent("remote down\n", &[(hit("bad-ts", "text", &long), 1.0)]);
         assert!(out.starts_with("remote down\n[bad-ts]"));
         // The matched chunk is never clipped.
         assert!(out.contains(&long));
@@ -364,7 +374,7 @@ mod tests {
             block_type: "text".into(),
             text: text.clone(),
         });
-        let out = recall_agent("", "", &[(h, 1.0)]);
+        let out = recall_agent("", &[(h, 1.0)]);
         assert!(out.contains(&text), "OMP neighbor omitted the qualifier: {out}");
     }
 
@@ -374,7 +384,7 @@ mod tests {
             let mut h = hit("2026-09-06", "text", "A recorded decision.");
             h.harness = "omp".into();
             h.session_id = id.into();
-            let out = recall_agent("", "", &[(h, 1.0)]);
+            let out = recall_agent("", &[(h, 1.0)]);
             out.lines().next().unwrap().to_owned()
         };
         assert_ne!(

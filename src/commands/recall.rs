@@ -8,7 +8,6 @@ use crate::chunk;
 use crate::inference::{self, Embedder, Reranker};
 use crate::memory::dataset;
 use crate::memory::{Memory, MemoryState};
-use crate::traces::harness::Harness;
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_array::{Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use chrono::{DateTime, Utc};
@@ -21,6 +20,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 /// Columns a [`Hit`] needs from a search scan.
 const HIT_COLS: &[&str] = &[
+    "id",
     "text",
     "session_id",
     "workdir",
@@ -47,6 +47,7 @@ pub struct Neighbor {
 
 /// One candidate row carried from retrieval through rerank to display.
 pub struct Hit {
+    pub id: String,
     pub text: String,
     pub session_id: String,
     pub workdir: String,
@@ -56,6 +57,8 @@ pub struct Hit {
     pub block_type: String,
     pub harness: String,
     pub neighbors: Vec<Neighbor>,
+    pub memory: String,
+    pub fused: f32,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -166,7 +169,7 @@ fn ival(a: Option<&Int64Array>, i: usize) -> i64 {
 }
 
 /// Escape a value for inlining into a Lance SQL filter string.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -191,16 +194,13 @@ fn build_where(block_type: Option<&str>, harness: &[String]) -> Option<String> {
     }
 }
 
-/// The stored `harness` facets a `--harness` value names. A known agent's name matches both its
-/// stored facet and its CLI spelling where they differ (`claude_code` and `claude`), since a turns
-/// file may store either; any other value matches as given.
+/// The stored `harness` facets a `--harness` value names. `claude` and `claude_code` name each
+/// other: Claude's turns were stored under the second before its integration wrote the first, and
+/// a memory may hold both. Any other value matches as given.
 fn harness_spellings(h: String) -> Vec<String> {
-    match Harness::parse(&h) {
-        Ok(known) if known.as_str() != known.cli_name() => {
-            vec![known.as_str().to_string(), known.cli_name().to_string()]
-        }
-        Ok(known) => vec![known.as_str().to_string()],
-        Err(_) => vec![h],
+    match h.as_str() {
+        "claude" | "claude_code" => vec!["claude_code".to_string(), "claude".to_string()],
+        _ => vec![h],
     }
 }
 
@@ -360,7 +360,7 @@ pub async fn recall(
     block_type: Option<String>,
     harness: Option<String>,
 ) -> Result<String> {
-    let (note, memory_label, hits) = recall_hits(
+    let (note, hits) = recall_hits(
         memory,
         query,
         k,
@@ -372,21 +372,21 @@ pub async fn recall(
         &|_| (),
     )
     .await?;
+    Ok(rendered(&note, &hits))
+}
+
+/// Recall results in the agent format, or the note and `no results` when nothing matched.
+pub fn rendered(note: &str, hits: &[(Hit, f64)]) -> String {
     if hits.is_empty() {
-        return Ok(format!("{note}no results"));
+        return format!("{note}no results");
     }
-    Ok(crate::ui::render::recall_agent(
-        &note,
-        &memory_hint(memory_label.as_deref()),
-        &hits,
-    ))
+    crate::ui::render::recall_agent(note, hits)
 }
 
 /// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →
-/// neighbor expansion. Returns the degradation note (empty when the memory opened normally), the
-/// label of the memory actually read, and the scored hits, best
-/// first — rendering is the caller's choice. `progress` hears a short label as each slow phase
-/// starts (model load, search, rerank); pass a no-op to run silently.
+/// neighbor expansion. Returns the degradation note (empty when the memory opened normally) and
+/// the scored hits, best first — rendering is the caller's choice. `progress` hears a short label
+/// as each slow phase starts (model load, search, rerank); pass a no-op to run silently.
 #[allow(clippy::too_many_arguments)]
 pub async fn recall_hits(
     memory: Memory,
@@ -398,87 +398,182 @@ pub async fn recall_hits(
     block_type: Option<String>,
     harness: Option<String>,
     progress: &(dyn Fn(&str) + Sync),
-) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
-    let harness = harness.map(harness_spellings).unwrap_or_default();
-
-    progress("loading model…");
-    let mut guard = models().await?.lock().await;
-    let Models { embedder, reranker } = &mut *guard;
-
-    let qv: Vec<f32> = embedder
-        .embed(&[query.as_str()])?
-        .into_iter()
-        .next()
-        .context("empty embedding")?;
-
-    progress(&format!("searching {}…", memory.label()));
-    let read = open_read(&memory).await?;
-    let note = read.note.clone().unwrap_or_default();
-    let ds = &read.ds;
-    // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside Lance
-    // with an opaque schema error, so refuse with a clear message instead.
-    if !harness.is_empty() && !has_harness_col(ds) {
-        return Err(anyhow!(
-            "this memory predates the harness facet — reindex it, or drop --harness"
-        ));
-    }
-    let where_clause = build_where(block_type.as_deref(), &harness);
-
-    // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
-    // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
-    // recall then falls back to vector-only.
-    let hits = hybrid_candidates(ds, &qv, &query, candidates, where_clause.as_deref()).await?;
-    if hits.is_empty() {
-        return Ok((note, read.memory_label.clone(), Vec::new()));
-    }
-
-    let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
-    progress(&format!("reranking {} candidates…", docs.len()));
-    let scores = reranker.rerank(query.as_str(), &docs)?;
-
-    let now = Utc::now();
-    let mut scored: Vec<(usize, f64)> = scores
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            let relevance = 1.0 / (1.0 + (-(s as f64)).exp());
-            (i, relevance * recency_weight(&hits[i].ts, now, half_life))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(k);
-
-    // Keep only the top-k hits, in scored order, carrying their score along.
-    let mut top: Vec<(Hit, f64)> = Vec::with_capacity(scored.len());
-    let mut taken: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
-    for (idx, score) in &scored {
-        if let Some(h) = taken[*idx].take() {
-            top.push((h, *score));
-        }
-    }
-
-    if neighbors > 0 {
-        progress("expanding neighbors…");
-        let mut refs: Vec<&mut Hit> = top.iter_mut().map(|(h, _)| h).collect();
-        attach_neighbors(ds, &mut refs, neighbors).await?;
-    }
-
-    let mut note = note;
-    let mut omp_sessions: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (hit, _) in &top {
-        if hit.harness == "omp" {
-            omp_sessions.entry(&hit.session_id).or_default().push(&hit.turn_uuid);
-        }
-    }
-    for (session_id, turn_ids) in omp_sessions {
-        note.push_str(&crate::traces::omp::provenance_note(session_id, &turn_ids));
-    }
-
-    Ok((note, read.memory_label.clone(), top))
+) -> Result<(String, Vec<(Hit, f64)>)> {
+    let search = Search::new(query, candidates, block_type, harness, progress).await?;
+    let pool = search.candidates(&memory, progress).await?;
+    search.rank(vec![pool], k, half_life, neighbors, progress).await
 }
 
-/// Vector ANN + BM25 candidates fused by reciprocal rank, top `candidates`. The FTS leg is
-/// best-effort: a memory with no FTS index makes that scan error, and we fall back to vector-only.
+/// One query, embedded once, and the filters every memory's search applies. A recall is
+/// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
+pub struct Search {
+    query: String,
+    qv: Vec<f32>,
+    candidates: usize,
+    harness_filtered: bool,
+    where_clause: Option<String>,
+}
+
+/// One memory's candidates for a [`Search`], before the rerank.
+pub struct Candidates {
+    ds: Dataset,
+    note: String,
+    hits: Vec<Hit>,
+}
+
+impl Candidates {
+    /// Keep only the candidates `keep` accepts.
+    pub fn retain(&mut self, keep: impl Fn(&Hit) -> bool) {
+        self.hits.retain(keep);
+    }
+}
+
+impl Search {
+    /// Embed `query` for searching up to `candidates` rows per memory, filtered by block type and
+    /// harness.
+    pub async fn new(
+        query: String,
+        candidates: usize,
+        block_type: Option<String>,
+        harness: Option<String>,
+        progress: &(dyn Fn(&str) + Sync),
+    ) -> Result<Self> {
+        let harness = harness.map(harness_spellings).unwrap_or_default();
+        progress("loading model…");
+        let qv: Vec<f32> = models()
+            .await?
+            .lock()
+            .await
+            .embedder
+            .embed(&[query.as_str()])?
+            .into_iter()
+            .next()
+            .context("empty embedding")?;
+        Ok(Self {
+            where_clause: build_where(block_type.as_deref(), &harness),
+            harness_filtered: !harness.is_empty(),
+            query,
+            qv,
+            candidates,
+        })
+    }
+
+    /// Hybrid retrieval over one memory: a vector ANN scan and a BM25 scan, fused by reciprocal
+    /// rank.
+    pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
+        progress(&format!("searching {}…", memory.label()));
+        let read = open_read(memory).await?;
+        // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside
+        // Lance with an opaque schema error, so refuse with a clear message instead.
+        if self.harness_filtered && !has_harness_col(&read.ds) {
+            return Err(anyhow!(
+                "this memory predates the harness facet — reindex it, or drop --harness"
+            ));
+        }
+        let mut hits = hybrid_candidates(
+            &read.ds,
+            &self.qv,
+            &self.query,
+            self.candidates,
+            self.where_clause.as_deref(),
+        )
+        .await?;
+        let label = read.memory_label.unwrap_or_default();
+        for h in &mut hits {
+            h.memory = label.clone();
+        }
+        Ok(Candidates {
+            ds: read.ds,
+            note: read.note.unwrap_or_default(),
+            hits,
+        })
+    }
+
+    /// Rerank the pooled candidates, a row several memories hold counted once, reweight by
+    /// recency, keep the top `k` and attach `neighbors` from the memory each hit came from.
+    /// However many pools there are, the rerank scores at most `candidates` of them, the best by
+    /// fused score: it costs per candidate, and dominates a recall. Returns the pools'
+    /// degradation notes and the scored hits, best first.
+    pub async fn rank(
+        &self,
+        pools: Vec<Candidates>,
+        k: usize,
+        half_life: f64,
+        neighbors: i64,
+        progress: &(dyn Fn(&str) + Sync),
+    ) -> Result<(String, Vec<(Hit, f64)>)> {
+        let mut note: String = pools.iter().map(|p| p.note.as_str()).collect();
+        let mut seen = HashSet::new();
+        let mut hits: Vec<(usize, Hit)> = Vec::new();
+        let mut sources = Vec::with_capacity(pools.len());
+        for (i, pool) in pools.into_iter().enumerate() {
+            hits.extend(
+                pool.hits
+                    .into_iter()
+                    .filter(|h| seen.insert(h.id.clone()))
+                    .map(|h| (i, h)),
+            );
+            sources.push(pool.ds);
+        }
+        // Stable, so equal scores keep their memory's order and the earlier pool's rows.
+        hits.sort_by(|(_, a), (_, b)| b.fused.partial_cmp(&a.fused).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(self.candidates);
+        if hits.is_empty() {
+            return Ok((note, Vec::new()));
+        }
+
+        let docs: Vec<&str> = hits.iter().map(|(_, h)| h.text.as_str()).collect();
+        progress(&format!("reranking {} candidates…", docs.len()));
+        let scores = models()
+            .await?
+            .lock()
+            .await
+            .reranker
+            .rerank(self.query.as_str(), &docs)?;
+
+        let now = Utc::now();
+        let mut scored: Vec<(usize, f64)> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let relevance = 1.0 / (1.0 + (-(s as f64)).exp());
+                (i, relevance * recency_weight(&hits[i].1.ts, now, half_life))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+
+        // Keep only the top-k hits, in scored order, carrying their score and source along.
+        let mut top: Vec<(usize, Hit, f64)> = Vec::with_capacity(scored.len());
+        let mut taken: Vec<Option<(usize, Hit)>> = hits.into_iter().map(Some).collect();
+        for (idx, score) in &scored {
+            if let Some((source, h)) = taken[*idx].take() {
+                top.push((source, h, *score));
+            }
+        }
+
+        if neighbors > 0 {
+            progress("expanding neighbors…");
+            for (i, ds) in sources.iter().enumerate() {
+                let mut refs: Vec<&mut Hit> = top.iter_mut().filter(|t| t.0 == i).map(|t| &mut t.1).collect();
+                attach_neighbors(ds, &mut refs, neighbors).await?;
+            }
+        }
+        let mut omp_sessions: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (_, hit, _) in &top {
+            if hit.harness == "omp" {
+                omp_sessions.entry(&hit.session_id).or_default().push(&hit.turn_uuid);
+            }
+        }
+        for (session_id, turn_ids) in omp_sessions {
+            note.push_str(&crate::traces::omp::provenance_note(session_id, &turn_ids));
+        }
+
+        Ok((note, top.into_iter().map(|(_, h, score)| (h, score)).collect()))
+    }
+}
+
+/// Vector ANN + BM25 candidates fused by reciprocal rank, top `candidates`.
 async fn hybrid_candidates(
     ds: &Dataset,
     qv: &[f32],
@@ -487,7 +582,7 @@ async fn hybrid_candidates(
     filter: Option<&str>,
 ) -> Result<Vec<Hit>> {
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
-    let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
+    let fts = fts_candidates(ds, query, candidates, filter).await?;
     Ok(rrf_fuse(vector, fts, candidates))
 }
 
@@ -553,7 +648,8 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
         let rowid = batch
             .column_by_name(ROW_ID)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-        let (text, sess, proj, turn, ts, bt) = (
+        let (chunk_id, text, sess, proj, turn, ts, bt) = (
+            scol(&batch, "id"),
             scol(&batch, "text"),
             scol(&batch, "session_id"),
             scol(&batch, "workdir"),
@@ -568,6 +664,7 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
             out.push((
                 id,
                 Hit {
+                    id: sval(chunk_id, i),
                     text: sval(text, i),
                     session_id: sval(sess, i),
                     workdir: sval(proj, i),
@@ -577,6 +674,8 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
                     block_type: sval(bt, i),
                     harness: sval(harness, i),
                     neighbors: Vec::new(),
+                    memory: String::new(),
+                    fused: 0.0,
                 },
             ));
         }
@@ -585,7 +684,7 @@ async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64
 }
 
 /// Reciprocal-rank fusion (k=60): each list contributes `1/(rank + 60)` to a row's score; return
-/// the top `limit` rows by fused score, deduped by `_rowid`.
+/// the top `limit` rows by fused score, deduped by `_rowid`, each carrying its score.
 fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<Hit> {
     const K: f32 = 60.0;
     let mut scores: HashMap<u64, f32> = HashMap::new();
@@ -604,7 +703,10 @@ fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<
             .then(a.0.cmp(&b.0))
     });
     ranked.truncate(limit);
-    ranked.into_iter().filter_map(|(id, _)| rows.remove(&id)).collect()
+    ranked
+        .into_iter()
+        .filter_map(|(id, fused)| rows.remove(&id).map(|h| Hit { fused, ..h }))
+        .collect()
 }
 
 /// For each hit, pull chunks in the same session within `window` of its seq (excluding the
@@ -842,22 +944,69 @@ impl SessionFilter {
     }
 }
 
-/// The sessions of a memory that `filter` keeps, oldest first, rendered in the agent format. The
-/// prompts are read after the filter and the bound, so their cost follows the rows rendered rather
-/// than the size of the memory.
+/// The sessions of a memory that `filter` keeps, oldest first, rendered in the agent format.
 pub async fn sessions(memory: Memory, filter: SessionFilter) -> Result<String> {
-    // Zero would render nothing, which is never what a caller wants.
+    refuse_zero_limit(&filter)?;
+    list_sessions(vec![SessionPool::open(&memory).await?], filter).await
+}
+
+/// One memory's sessions, before a listing pools, filters and pages them.
+pub struct SessionPool {
+    ds: Dataset,
+    note: String,
+    label: String,
+    sessions: Vec<Session>,
+}
+
+impl SessionPool {
+    /// Keep only the sessions `keep` accepts.
+    pub fn retain(&mut self, keep: impl Fn(&Session) -> bool) {
+        self.sessions.retain(keep);
+    }
+
+    /// Open `memory` and fold its rows into sessions.
+    pub async fn open(memory: &Memory) -> Result<Self> {
+        let read = open_read(memory).await?;
+        Ok(Self {
+            sessions: scan_sessions(&read.ds).await?,
+            note: read.note.unwrap_or_default(),
+            label: read.memory_label.unwrap_or_else(|| memory.label()),
+            ds: read.ds,
+        })
+    }
+}
+
+/// Zero would render nothing, which is never what a caller wants.
+fn refuse_zero_limit(filter: &SessionFilter) -> Result<()> {
     if filter.limit == Some(0) {
         bail!("a limit of 0 would list nothing — omit it for {SESSIONS_LIMIT} rows, raise it to at most {SESSIONS_LIMIT_MAX}, and walk the rest with --offset");
     }
-    let read = open_read(&memory).await?;
-    let note = read.note.clone().unwrap_or_default();
-    let label = read.memory_label.clone().unwrap_or_else(|| memory.label());
-    let all = scan_sessions(&read.ds).await?;
+    Ok(())
+}
+
+/// The sessions of the pooled memories that `filter` keeps, oldest first, rendered in the agent
+/// format; a session several pools hold is listed from the first. The prompts are read after the
+/// filter and the bound, so their cost follows the rows rendered rather than the size of the memory.
+pub async fn list_sessions(mut pools: Vec<SessionPool>, filter: SessionFilter) -> Result<String> {
+    refuse_zero_limit(&filter)?;
+    let note: String = pools.iter().map(|p| p.note.as_str()).collect();
+    let label = pools.first().map(|p| p.label.clone()).unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut all: Vec<(usize, Session)> = Vec::new();
+    for (i, pool) in pools.iter_mut().enumerate() {
+        let sessions = std::mem::take(&mut pool.sessions);
+        all.extend(
+            sessions
+                .into_iter()
+                .filter(|s| seen.insert(s.session_id.clone()))
+                .map(|s| (i, s)),
+        );
+    }
     if all.is_empty() {
         return Ok(format!("{note}no sessions in {label}\n"));
     }
-    let matched: Vec<Session> = all.into_iter().filter(|s| filter.keeps(s)).collect();
+    all.sort_by(|(_, a), (_, b)| (&a.ts, &a.session_id).cmp(&(&b.ts, &b.session_id)));
+    let matched: Vec<(usize, Session)> = all.into_iter().filter(|(_, s)| filter.keeps(s)).collect();
     if matched.is_empty() {
         return Ok(format!("{note}no session in {label} matches\n"));
     }
@@ -867,18 +1016,29 @@ pub async fn sessions(memory: Memory, filter: SessionFilter) -> Result<String> {
     let total = matched.len();
     let limit = filter.limit.unwrap_or(SESSIONS_LIMIT).min(SESSIONS_LIMIT_MAX);
     let end = total.saturating_sub(filter.offset);
-    let mut shown: Vec<Session> = matched.into_iter().take(end).skip(end.saturating_sub(limit)).collect();
+    let shown: Vec<(usize, Session)> = matched.into_iter().take(end).skip(end.saturating_sub(limit)).collect();
     if shown.is_empty() {
         return Ok(format!(
             "{note}offset {} is past the {total} session(s) in {label}\n",
             filter.offset
         ));
     }
-    let ids: Vec<String> = shown.iter().map(|s| s.session_id.clone()).collect();
-    let mut prompts = first_prompts(&read.ds, &ids).await?;
-    for s in shown.iter_mut() {
-        s.first_prompt = prompts.remove(&s.session_id).unwrap_or_default();
+    let mut prompts = HashMap::new();
+    for (i, pool) in pools.iter().enumerate() {
+        let ids: Vec<String> = shown
+            .iter()
+            .filter(|(from, _)| *from == i)
+            .map(|(_, s)| s.session_id.clone())
+            .collect();
+        prompts.extend(first_prompts(&pool.ds, &ids).await?);
     }
+    let shown: Vec<Session> = shown
+        .into_iter()
+        .map(|(_, s)| Session {
+            first_prompt: prompts.remove(&s.session_id).unwrap_or_default(),
+            ..s
+        })
+        .collect();
     Ok(crate::ui::render::sessions_agent(&note, &shown, total, filter.offset))
 }
 
@@ -1293,6 +1453,18 @@ async fn session_count(ds: &Dataset) -> Option<usize> {
     Some(sessions.len())
 }
 
+async fn pending_embeddings_line(ds: &Dataset) -> Result<String> {
+    let n = ds
+        .count_rows(Some("vector IS NULL".into()))
+        .await
+        .context("counting chunks awaiting embedding")?;
+    Ok(if n == 0 {
+        String::new()
+    } else {
+        format!("{n} chunk{} awaiting embedding\n", if n == 1 { "" } else { "s" })
+    })
+}
+
 fn index_coverage_line() -> Option<String> {
     let coverage = super::index::local_index_coverage()?;
     (coverage.pending > 0).then(|| {
@@ -1304,13 +1476,13 @@ fn index_coverage_line() -> Option<String> {
     })
 }
 
-/// The indexation lines of a local memory: how many sessions it holds and when it was last
-/// written to (an `index` or `scrub` run). A version with no recorded timestamp is omitted.
-async fn index_lines(ds: &Dataset, now: DateTime<Utc>) -> String {
+/// Local index progress and its last write time. A version with no recorded timestamp is omitted.
+async fn index_lines(ds: &Dataset, now: DateTime<Utc>) -> Result<String> {
     let mut out = String::new();
     if let Some(n) = session_count(ds).await {
         let _ = writeln!(out, "sessions: {n}");
     }
+    out.push_str(&pending_embeddings_line(ds).await?);
     if let Some(line) = index_coverage_line() {
         out.push_str(&line);
     }
@@ -1318,7 +1490,7 @@ async fn index_lines(ds: &Dataset, now: DateTime<Utc>) -> String {
     if t.timestamp() > 0 {
         let _ = writeln!(out, "last indexed: {}", stamp(t, now));
     }
-    out
+    Ok(out)
 }
 
 pub async fn status(memory: Memory) -> Result<String> {
@@ -1328,7 +1500,7 @@ pub async fn status(memory: Memory) -> Result<String> {
             let rows = ds.count_rows(None).await?;
             let mut out = format!("memory: {}\nchunks: {rows}\n", memory.label());
             match &memory {
-                Memory::Local { .. } => out.push_str(&index_lines(&ds, now).await),
+                Memory::Local { .. } => out.push_str(&index_lines(&ds, now).await?),
                 Memory::Remote { uri } => {
                     // Every write to a remote memory is a `funes push` (data or reindex commit),
                     // so the head version's timestamp is when it was last pushed to.
@@ -1356,6 +1528,7 @@ pub async fn status(memory: Memory) -> Result<String> {
                         if let Some(n) = local_sessions {
                             let _ = writeln!(out, "sessions: {n}");
                         }
+                        out.push_str(&pending_embeddings_line(&local).await?);
                         if let Some(line) = index_coverage_line() {
                             out.push_str(&line);
                         }
@@ -1472,9 +1645,56 @@ mod tests {
     async fn memory_of(turns: &[Turn], dir: &Path) -> Dataset {
         let chunks = chunk::chunks_from_turns(turns, &chunk::Tier::ALL, true);
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
-        let batch = dataset::build_batch(&chunks, &vectors).unwrap();
+        let batch = dataset::build_batch(&chunks, Some(&vectors)).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema());
         Dataset::write(reader, dir.to_str().unwrap(), None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn recall_requires_fts_even_when_vector_candidates_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = memory_of(
+            &[text_turn("session", 0, "user", "A narwhal parses transcripts.")],
+            dir.path(),
+        )
+        .await;
+        let qv = vec![1.0; dataset::DIM as usize];
+        assert_eq!(vector_candidates(&ds, &qv, 5, None).await.unwrap().len(), 1);
+        assert!(
+            hybrid_candidates(&ds, &qv, "narwhal", 5, None).await.is_err(),
+            "a missing FTS index must fail recall even when vector search finds a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_counts_pending_embeddings_until_they_are_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let turns = [
+            text_turn("session", 0, "user", "A narwhal parses transcripts."),
+            text_turn("session", 1, "assistant", "Each line becomes a typed turn."),
+        ];
+        let chunks = chunk::chunks_from_turns(&turns, &chunk::Tier::ALL, true);
+        let batch = dataset::build_batch(&chunks, None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema());
+        let mut ds = Dataset::write(reader, &dataset::table_uri(&memory.label()), None)
+            .await
+            .unwrap();
+        let prefix = format!("memory: {}\nchunks: 2\nsessions: 1\n", memory.label());
+
+        for (chunk, line) in chunks
+            .iter()
+            .zip(["2 chunks awaiting embedding\n", "1 chunk awaiting embedding\n"])
+        {
+            let out = status(memory.clone()).await.unwrap();
+            assert!(out.starts_with(&format!("{prefix}{line}")), "{out}");
+            ds = dataset::fill_vectors(&ds, &[chunk.id.as_str()], &[vec![0.0; dataset::DIM as usize]])
+                .await
+                .unwrap();
+        }
+        let out = status(memory).await.unwrap();
+        assert!(out.starts_with(&prefix), "{out}");
+        assert!(!out.contains("awaiting embedding"), "{out}");
     }
 
     fn text_turn(session: &str, seq: i64, role: &str, text: &str) -> Turn {
@@ -1528,6 +1748,7 @@ mod tests {
     #[test]
     fn rrf_fuse_settles_ties_by_row_id() {
         let hit = |id: u64| Hit {
+            id: id.to_string(),
             text: id.to_string(),
             session_id: String::new(),
             workdir: String::new(),
@@ -1537,6 +1758,8 @@ mod tests {
             block_type: String::new(),
             harness: String::new(),
             neighbors: Vec::new(),
+            memory: String::new(),
+            fused: 0.0,
         };
         // Disjoint lists: vector row 2i and FTS row 2i+1 both sit at rank i, so every rank ties.
         let lists = || {
