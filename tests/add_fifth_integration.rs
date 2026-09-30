@@ -105,8 +105,8 @@ fn release(dir: &Path, version: &str) {
     fs::write(manifest, text).unwrap();
 }
 
-/// `funes update` against `home` with the Hub out of reach, so the binary step fails before it
-/// could replace the binary under test; at a terminal answering yes when `terminal`.
+/// `funes update` against `home` with GitHub and the Hub out of reach, so the binary step fails
+/// before it could replace the binary under test; at a terminal answering yes when `terminal`.
 fn update(home: &Path, funes_home: &Path, log: &Path, integrations: Option<&Path>, terminal: bool) -> Output {
     let script = home.join("answers.exp");
     let script_arg = script.to_str().unwrap().to_string();
@@ -118,6 +118,10 @@ fn update(home: &Path, funes_home: &Path, log: &Path, integrations: Option<&Path
     argv.extend([
         "env",
         "HF_ENDPOINT=http://127.0.0.1:9",
+        "HTTPS_PROXY=http://127.0.0.1:9",
+        "https_proxy=http://127.0.0.1:9",
+        "NO_PROXY=",
+        "no_proxy=",
         env!("CARGO_BIN_EXE_funes"),
         "update",
     ]);
