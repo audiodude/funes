@@ -235,3 +235,19 @@ Native OMP 18.4.3 fixtures retained three parent/child/advisor sessions and nine
 chunks while excluding reasoning, tool results, and control text. Its completed
 lifecycle emitted one valid source turn; its aborted lifecycle stayed pending.
 Live services are switched separately by the integrating operator.
+
+### September 30, 2026 upstream and dependency refresh
+
+The `update-all-20260930` branch preserves custom revision `eb7babe` and merges
+upstream main through `86fb8e1`. Upstream now refreshes installed integrations
+after a software update while retaining explicit-source installs and their
+bindings. The fork still fetches software binaries only from GitHub Releases.
+This maintenance operation does not run `funes update`, change installed
+integrations, upload memory, or publish release artifacts.
+
+The compatible Cargo refresh advances `async-compression` to 0.4.49 and
+`compression-codecs` to 0.4.44. Lance, Arrow, and the source protocol retain their
+existing constraints. Native OMP parsing, lineage/provenance, bounded indexing,
+and source protocol 1 are preserved without parser changes. Build the committed
+revision before consumer verification; activation remains a separate operator
+step using the unchanged enrollment and corpus.

@@ -10,7 +10,7 @@ use crate::hub::verify_checksum;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -38,8 +38,9 @@ const ASSET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_
 };
 
 /// `funes update`: fetch the latest release binary for this platform and replace the running
-/// executable in place. Idempotent — with `force`, reinstalls even when already up to date.
-pub async fn run(force: bool) -> Result<()> {
+/// executable in place. Idempotent — with `force`, reinstalls even when already up to date. The
+/// executable it replaced, or `None` when it was up to date.
+pub async fn run(force: bool) -> Result<Option<PathBuf>> {
     let asset = ASSET.ok_or_else(|| {
         anyhow!(
             "no prebuilt funes binary for this platform ({}/{}) — build from source: {REPO}#building-from-source",
@@ -58,8 +59,8 @@ pub async fn run(force: bool) -> Result<()> {
         (Some(l), Some(c)) if l <= c
     );
     if up_to_date && !force {
-        println!("funes {current} is already up to date (latest release: {latest}). Re-run with --force to reinstall.");
-        return Ok(());
+        println!("funes {current} is up to date (latest release: {latest}).");
+        return Ok(None);
     }
 
     // Replacing the live binary means renaming over its path, so the download must land on the
@@ -95,7 +96,7 @@ pub async fn run(force: bool) -> Result<()> {
     let installed = install_verified(&staged, &exe, &manifest, asset, &latest)?;
     println!("Updated {} ({current} → {installed}).", exe.display());
     println!("Running agents keep using the old funes until you restart them or start a new session.");
-    Ok(())
+    Ok(Some(exe))
 }
 
 /// Verify the staged binary, confirm its reported version, and atomically rename it over `exe`.
