@@ -1,9 +1,8 @@
 # Benchmarks
 
-Three runnable examples, each `cargo run --release --example <name>`:
+Two runnable examples, each `cargo run --release --example <name>`:
 
-- **`bench_recall`** — `recall()` latency, local vs remote, cold vs warm (below).
-- **`bench_index`** — `index` build time, throughput, and memory compactness (at the end).
+- **`bench_recall`** — `recall()` latency, local vs remote, cold vs warm.
 - **`bench_backends`** — latency and output agreement between the BLAS and ONNX inference backends.
 
 ## `bench_recall` — recall latency
@@ -41,7 +40,7 @@ For each memory the harness reports a single **cold** call followed by the min /
 Build in release (a debug build is far slower and not representative):
 
 ```sh
-cargo run --release --example bench_recall -- "<query>" --remote dacorvo/funes-Glint-Research-Fable-5 --iters 5 --cold
+cargo run --release --example bench_recall -- "<query>" --remote huggingface/funes-memory --iters 5 --cold
 ```
 
 The bench downloads `--remote` (through the hf-hub crate, using the token from your environment for a
@@ -53,7 +52,7 @@ both legs run identical data, so the gap is the I/O path, not the corpus.
 | flag | default | meaning |
 |------|---------|---------|
 | `<query>` (positional) | `"how does recall rerank candidates"` | the text to recall |
-| `--remote <spec>` | `dacorvo/funes-Glint-Research-Fable-5` | dataset to benchmark (`org/repo` or `hf://…`), used for both legs |
+| `--remote <spec>` | `huggingface/funes-memory` | dataset to benchmark (`org/repo` or `hf://…`), used for both legs |
 | `--iters <N>` | `5` | warm iterations timed per memory (after the one cold call) |
 | `--cold` | off | give the remote leg a throwaway `HF_HUB_CACHE` temp dir so its cold call is a true download (your real cache is left untouched) |
 | `--k <N>` | `8` | results returned |
@@ -67,29 +66,16 @@ both legs run identical data, so the gap is the I/O path, not the corpus.
 
 ## Reading the output
 
-```
-dataset: dacorvo/funes-Glint-Research-Fable-5   query: "how does recall rerank candidates"   k=8 candidates=30 neighbors=1   warm iters=5
+A header repeats the dataset, the query and the knobs. Then one row per memory: `cold(ms)` is the
+single cold call, `warm_lo` / `warm_med` / `warm_hi` the min / median / max over the `--iters` warm
+calls, and `hits` the results returned, equal on both rows when both legs did the same work. A last
+line gives the remote-to-local ratios: cold, warm median and warm best-case. `warm_lo` is the most
+stable of the three, and `warm_hi` spikes are page-cache noise at low `--iters`.
 
-memory    cold(ms)   warm_lo  warm_med   warm_hi  hits
-local       5455.9    5682.6    5956.0    6093.4     8
-remote     10663.1    6504.0    6589.1    6668.6     8
-
-remote vs local:  2.0× slower cold,  1.1× slower warm (median),  1.1× warm best-case
-```
-
-_Captured on a Mac M2 (24 GB), release build._
-
-Both legs run the same ≈21.6k-chunk dataset (`hits` matches, confirming equal work). Remote **cold**
-pays a one-time download of the index + touched Lance fragments into the hf-hub file cache (the
-premium over warm). Every **warm** call is then served from that local cache, so warm remote lands at
-**≈ local** (1.1×) — the per-call `hf://` I/O is gone. `warm best-case` (`warm_lo`) is the most stable
-factor; `warm_hi` spikes are page-cache/GC noise at low `--iters`.
-
-**Absolute numbers are host-dependent — read the ratio, not the floor.** Recall is dominated by the
-cross-encoder rerank (`--candidates` query/passage pairs), identical work on both legs: the Mac M2
-above reranks ~5–6 s for 30 candidates on CPU, whereas a Linux box with a GPU does it in well under a
-second (local ≈ remote-warm ≈ ~1.9 s). The floor moves with the hardware; the remote-vs-local
-**ratio** — warm ≈ local, cold a one-time download — is what the benchmark measures.
+**Absolute numbers are host-dependent, so read the ratio, not the floor.** Recall is dominated by the
+cross-encoder rerank (`--candidates` query/passage pairs), identical work on both legs, and that floor
+moves with the CPU and the inference backend. What the benchmark measures is the remote-vs-local
+**ratio**: warm close to local, cold a one-time download.
 
 ## Caveats
 
@@ -98,63 +84,6 @@ second (local ≈ remote-warm ≈ ~1.9 s). The floor moves with the hardware; th
   terms) for a sturdier picture.
 - For a private dataset, a token must be available (`HF_TOKEN` or the cached login) — the same one
   recall uses.
-
-## Building a benchmark memory
-
-The remote target above was built from a public agent-trace dataset with funes' parquet indexer:
-
-```sh
-# 1. fetch the auto-converted parquet (one row per session)
-hf download Glint-Research/Fable-5-traces --repo-type dataset \
-  --revision refs/convert/parquet --include "pi_agent/train/0000.parquet" --local-dir ./traces
-
-# 2. (optional) slice to ~N sessions to hit a target chunk count, then index into an isolated home
-FUNES_HOME=./bench-home funes index ./traces/pi_agent/train/0000.parquet
-
-# 3. publish to a Hub dataset repo you own (create it first; funes won't), which re-materializes a
-#    clean, compact dataset on the remote (--yes accepts the first push to an empty repo)
-hf repo create <org>/<repo> --repo-type dataset
-FUNES_HOME=./bench-home funes push <org>/<repo> --yes
-```
-
-`funes index <file>.parquet` indexes the whole file as a bulk import (one append, so the memory stays
-compact); see `src/traces/parquet.rs`. The push gate redacts/holds back any rows containing secrets before
-upload.
-
-## `bench_index` — index build
-
-`bench_index.rs` times an `index` build into a throwaway `$FUNES_HOME` (your real memory and config
-are untouched; no remote is attached there, so nothing is pushed) and reports build time, embedding
-throughput, and how compact the resulting memory is.
-
-`--sessions <N>` caps how many sessions are indexed (default **500**) so the build doesn't run long
-over a big tree or the full parquet — raise it for a longer, steadier measurement.
-
-```sh
-cargo run --release --example bench_index -- path/to/traces.parquet                 # first 500 sessions
-cargo run --release --example bench_index -- ~/.claude/projects --sessions 100       # a JSONL tree, capped
-cargo run --release --example bench_index -- path/to/traces.parquet --sessions 5000  # longer run
-```
-
-Example output:
-
-```
-=== index benchmark ===
-source:           Fable-5-traces.parquet
-elapsed:          385.0s  (incl. model load)
-sessions:         4665
-chunks:           21767
-throughput:       57 chunks/s
-memory size:      53 MB
-lance fragments:  1
-```
-
-The three counts are deliberately distinct granularities: **4665 sessions** chunk into **21767
-chunks**, all written into **1 Lance fragment** (a physical data file). `lance fragments: 1` confirms
-the bulk-import path stayed compact — a regression to per-session appends would show one fragment per
-session and a much larger memory. (That run indexed the whole file; pass a large `--sessions` to do
-likewise — the default 500 builds far faster.) Elapsed includes the one-time embedding-model load,
-so throughput is a slight under-estimate on small inputs.
 
 ## `bench_backends` — inference backend comparison
 

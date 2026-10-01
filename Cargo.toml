@@ -1,6 +1,6 @@
 [package]
 name = "funes"
-version = "1.4.0+dev"
+version = "1.5.0+dev"
 edition = "2021"
 description = "Recall over your past AI agent sessions — the man who forgets nothing, with discrimination."
 license = "Apache-2.0"
@@ -70,10 +70,6 @@ onnx = ["dep:fastembed"]
 name = "bench_recall"
 path = "benchmark/bench_recall.rs"
 
-[[example]]
-name = "bench_index"
-path = "benchmark/bench_index.rs"
-
 # A/B the inference backends (BLAS vs ONNX as reference). Needs both compiled in:
 #   cargo run --release --features onnx --example bench_backends
 [[example]]
@@ -89,6 +85,13 @@ path = "scripts/backfill_repo.rs"
 [[example]]
 name = "backfill_remote_repo"
 path = "scripts/backfill_remote_repo.rs"
+
+# One-off migration of a memory from before the workdir rename to today's schema (local and
+# remote, dry-run by default). Delete it, and `memory::remote::rename_column`, once every memory
+# is migrated.
+[[example]]
+name = "migrate_schema"
+path = "scripts/migrate_schema.rs"
 
 [profile.release]
 opt-level = 3
