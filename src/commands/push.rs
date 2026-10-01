@@ -13,8 +13,9 @@
 //!   rows are left unindexed (a query still finds them by brute force).
 //! - **Reindex:** a *separate* guarded commit ([`remote::reindex`]), kept off the data commit so
 //!   the data commit stays small. `push` runs it after the data commit when the unindexed backlog
-//!   crosses [`REINDEX_THRESHOLD`] (best-effort: a head-moved conflict is a warning, the next push
-//!   retries), or eagerly with `--force-reindex` (retried until it lands).
+//!   crosses [`REINDEX_THRESHOLD`] or the remote has no text index (best-effort: a head-moved
+//!   conflict is a warning, the next push retries), or eagerly with `--force-reindex` (retried until
+//!   it lands).
 //!
 //! What a push ships is the embedded chunks the remote doesn't hold, optionally restricted to the
 //! sessions named with `--sessions`. Rows awaiting embedding stay local until a later push.
@@ -326,7 +327,7 @@ impl From<String> for Pushed {
     }
 }
 
-/// How a push handles a target the local index shares no chunks with.
+/// How a push handles a target that holds none of the chunks it would publish.
 pub enum Confirm {
     /// Proceed without asking (`--yes`, or a caller that has already established intent, e.g. tests).
     Yes,
@@ -344,10 +345,10 @@ impl Confirm {
     }
 }
 
-/// Whether a push must be confirmed first: there are rows to publish and the local index shares
-/// no chunk with the remote — a first publish, a new host of yours, or the wrong memory.
-fn must_confirm(local: usize, to_push: usize) -> bool {
-    to_push > 0 && to_push == local
+/// Whether a push must be confirmed first: there are rows to publish and the remote holds none of
+/// them — a first publish, a new host of yours, sessions it lacks, or the wrong memory.
+fn must_confirm(publishable: usize, to_push: usize) -> bool {
+    to_push > 0 && to_push == publishable
 }
 
 /// A memory URI as one path-safe filename — the push receipt's key.
@@ -408,7 +409,7 @@ fn named_ids(by_session: &HashMap<String, Vec<String>>, sessions: &[String]) -> 
 /// Publish the local memory's new embedded chunks to `target` (a remote memory on the HF Hub). With
 /// `force_reindex`, refresh the remote index after the data commit (retrying until it lands) even
 /// if the unindexed backlog is below [`REINDEX_THRESHOLD`]; with no new chunks pending it's a pure
-/// index refresh. `confirm` gates a publish to a memory the local index shares no chunks with.
+/// index refresh. `confirm` gates a publish to a memory holding none of the chunks to publish.
 ///
 /// `sessions`, when non-empty, restricts candidates to those sessions' embedded chunks.
 /// Empty publishes all embedded chunks the local memory holds that the remote does not.
@@ -607,7 +608,7 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
     // (each attempt re-appends onto the new manifest — the data commit is small, so this is cheap).
     eprintln!("uploading {n_chunks} chunk(s) to {}…", target.label());
     let mut attempts = 0u32;
-    let (oid, unindexed) = loop {
+    let (oid, unindexed, text_indexed) = loop {
         let attempt = remote::append(
             &repo,
             &dataset_uri,
@@ -620,7 +621,11 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
         )
         .await?;
         match attempt {
-            Appended::Committed { oid, unindexed } => break (oid, unindexed),
+            Appended::Committed {
+                oid,
+                unindexed,
+                text_indexed,
+            } => break (oid, unindexed, text_indexed),
             Appended::Conflict => {
                 attempts += 1;
                 if attempts > MAX_COMMIT_RETRIES {
@@ -633,12 +638,13 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
     let mut out = format!("{}: pushed {n_chunks} chunks (commit {oid})\n", target.label());
     out.push_str(&card_note);
 
-    // 7. Reindex as a separate commit: forced (retried until it lands) or, past the threshold,
-    // best-effort (one shot, warn on a conflict — the next push retries).
+    // 7. Reindex as a separate commit: forced (retried until it lands), or best-effort (one shot,
+    // warn on a conflict — the next push retries) past the threshold or when the remote has no text
+    // index, which recall cannot do without.
     if force_reindex {
         eprintln!("refreshing the remote index…");
         out.push_str(&reindex_forced(&repo, &dataset_uri, &opts, &rev).await?);
-    } else if unindexed > REINDEX_THRESHOLD {
+    } else if unindexed > REINDEX_THRESHOLD || !text_indexed {
         eprintln!("refreshing the remote index…");
         out.push_str(&reindex_auto(&repo, &dataset_uri, &opts, &rev).await);
     }
@@ -756,7 +762,16 @@ async fn reindex_forced(
     rev: &str,
 ) -> Result<String> {
     for _ in 0..=MAX_COMMIT_RETRIES {
-        match remote::reindex(repo, dataset_uri, opts.clone(), rev, "funes push: reindex".to_string()).await? {
+        match remote::reindex(
+            repo,
+            dataset_uri,
+            opts.clone(),
+            rev,
+            "funes push: reindex".to_string(),
+            ui::index_progress,
+        )
+        .await?
+        {
             Reindexed::Committed(oid) => return Ok(format!("  reindexed (commit {oid})\n")),
             Reindexed::AlreadyCurrent => return Ok("  index already current\n".to_string()),
             Reindexed::Conflict => continue,
@@ -773,7 +788,16 @@ async fn reindex_auto(
     opts: &HashMap<String, String>,
     rev: &str,
 ) -> String {
-    match remote::reindex(repo, dataset_uri, opts.clone(), rev, "funes push: reindex".to_string()).await {
+    match remote::reindex(
+        repo,
+        dataset_uri,
+        opts.clone(),
+        rev,
+        "funes push: reindex".to_string(),
+        ui::index_progress,
+    )
+    .await
+    {
         Ok(Reindexed::Committed(oid)) => format!("  reindexed (commit {oid})\n"),
         Ok(Reindexed::AlreadyCurrent) => String::new(),
         Ok(Reindexed::Conflict) => {
@@ -791,10 +815,10 @@ mod tests {
 
     #[test]
     fn must_confirm_only_when_overlap_is_empty_and_there_is_work() {
-        // First publish / fully disjoint (every local chunk is new to the remote) → confirm.
+        // First publish / fully disjoint (every chunk to publish is new to the remote) → confirm.
         assert!(must_confirm(5, 5));
         assert!(must_confirm(1, 1));
-        // Some overlap (fewer to push than the local total) → no prompt, it's a memory you add to.
+        // Some overlap (fewer to push than there are to publish) → no prompt, it's a memory you add to.
         assert!(!must_confirm(5, 3));
         // Nothing to push (up to date, or a reindex-only run) → never prompt, even with 0 overlap.
         assert!(!must_confirm(5, 0));

@@ -251,3 +251,31 @@ existing constraints. Native OMP parsing, lineage/provenance, bounded indexing,
 and source protocol 1 are preserved without parser changes. Build the committed
 revision before consumer verification; activation remains a separate operator
 step using the unchanged enrollment and corpus.
+
+### October 1, 2026 upstream and dependency refresh
+
+The `update-all-20261001` branch preserves custom revision
+`116500583749fc70c31084d514f8007c61d88d6d` and incorporates upstream main through
+`4d3b5413230139aa1791bdb707b50ac4225d80d1`. Upstream fixes release of copied
+memory locks, missing remote indexes on push, host binding status, and removal
+of old secret-bearing Lance versions during scrub. Native OMP normalization,
+lineage/provenance, source protocol 1, and `actomasto-v1` remain unchanged.
+The imported remote-cache regression borrows its repository identifier to
+match the stable `hf-hub` 1.0.0 builder API used by this fork.
+
+The compatible lockfile refresh advances `async-compression` to 0.4.50,
+`compression-codecs` to 0.4.45, `quinn-proto` to 0.11.19, `quinn-udp` to 0.5.16,
+and `yoke-derive` to 0.8.4 without changing manifest constraints. Lance remains
+pinned to 11.0.0 and Arrow to the 58 series.
+
+Standalone verification uses `cargo fmt --check`,
+`cargo clippy --locked --all-targets -- -D warnings`,
+`cargo clippy --locked --all-targets --no-default-features --features onnx -- -D warnings`,
+and `cargo test --locked --all-targets -- --test-threads=1`. Keep
+`HF_FUNES_TEST_TOKEN` empty: live-Hub tests publish scratch datasets and are
+not authorized by this refresh. The final executable is rebuilt after commit
+and its source capabilities must report that exact committed revision before
+consumer activation. A synthetic source refresh/enumerate/turns/read round trip
+checks strict normalization and provenance without using or changing live
+memory. Activation and service restarts belong to the integrating operator;
+this source update does not run `funes update` or publish Hugging Face artifacts.
