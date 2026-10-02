@@ -350,3 +350,34 @@ configuration, service, enrollment, memory, hosted generation, release tag,
 software release artifact, or Hugging Face upload was changed or published.
 Only the dated origin source branch is pushed. Verification assisted by
 OpenAI Codex.
+
+### October 2, 2026 OMP 18.4.12 consumer refresh
+
+The `update-20261002-stable18412` branch starts from
+`e5783df5eaa5cde5c38e2f0d8c808f0448ff48d9`, not the older root `main` or
+the previous `d03a2fc` upgrade. The active Actomasto source exporter reports
+that exact steering/mode parser revision; the installed OMP bridge still pins
+`d03a2fc`. The new branch preserves both histories and merges upstream through
+`33c3c58`. Recall now skips cross-encoder reranking when its candidate pool is
+less than four times the requested hits; larger pools retain reranking.
+The CLI, MCP descriptions, and recall documentation retain upstream's matching
+contract. The merge preserves the fork's `source` subcommand and all native OMP
+ingestion, attribution, completion, revision, lineage, and identity gates.
+
+`cargo update` refreshes only `bon`/`bon-macros` 3.10.2 and `libc` 0.2.190
+within existing manifest constraints. Lance remains 11.0.0, Arrow remains in
+the 58 series, and local source protocol 1 and `actomasto-v1` are unchanged.
+
+Focused verification uses `cargo nextest run --locked` with the local-source
+normalizer, OMP parser, index/coverage, and recall unit tests plus
+`local_source_normalize`, `omp_index`, `index_check`, `reindex_incremental`,
+`recall_without_rerank`, `recall_rerank_line`, and `recall_since_until`.
+The runnable default-BLAS executable is built after the final source commit
+with the existing optimized dev/lld convention. Consumer probes must require
+that executable's capabilities to report the exact final committed revision.
+An isolated synthetic CLI smoke covers steering/mode parsing, source metadata
+and full-text reads, bounded native indexing and resumed coverage, full
+citations, and both fused and reranked recall. These are local checks, not
+authorization to publish or upload Hugging Face artifacts or memory.
+Installation/configuration cutover and service restarts remain separate
+operator-owned steps. AI-assisted integration by OpenAI Codex.
