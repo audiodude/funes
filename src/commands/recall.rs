@@ -1,8 +1,7 @@
 //! The read surface: `recall`, `get`, `status` over the existing index.
 //! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → cross-encoder rerank →
-//! recency reweight → neighbor expansion. `recall`/`get` return results rendered in the agent
-//! format; `recall_hits`/`get_turns` return the structured results for other renderings
-//! (see `render`).
+//! neighbor expansion. `recall`/`get` return results rendered in the agent format;
+//! `recall_hits`/`get_turns` return the structured results for other renderings (see `render`).
 
 use crate::chunk;
 use crate::inference::{self, Embedder, Reranker};
@@ -10,7 +9,7 @@ use crate::memory::dataset;
 use crate::memory::{Memory, MemoryState};
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_array::{Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, ROW_ID};
 use lance_index::scalar::FullTextSearchQuery;
@@ -127,7 +126,7 @@ pub struct Session {
 impl Session {
     /// The `YYYY-MM-DD` the session started.
     pub fn date(&self) -> &str {
-        self.ts.get(..10).unwrap_or(&self.ts)
+        day(&self.ts)
     }
 
     /// Best available provenance: the repo when the checkout resolved, else the working directory.
@@ -173,8 +172,60 @@ pub(crate) fn esc(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// `block_type = '…' AND harness IN ('…')` over whichever filters are set, else None.
-fn build_where(block_type: Option<&str>, harness: &[String]) -> Option<String> {
+/// The day `ts` falls on: a `ts` is RFC 3339 in UTC, so its first ten characters.
+fn day(ts: &str) -> &str {
+    ts.get(..10).unwrap_or(ts)
+}
+
+/// A bound as the `YYYY-MM-DD` it names, in that exact spelling: a bound is also compared as
+/// text, which `2026-9-18` would not survive.
+fn parse_day(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .filter(|d| d.to_string() == s)
+        .ok_or_else(|| anyhow!("{s:?} is not a date: expected YYYY-MM-DD"))
+}
+
+/// The days from `since` through `until`, each an optional `YYYY-MM-DD`, both inclusive.
+#[derive(Default)]
+struct DayRange<'a> {
+    since: Option<&'a str>,
+    until: Option<&'a str>,
+}
+
+impl DayRange<'_> {
+    /// Whether the day `ts` falls on is in the range.
+    fn holds(&self, ts: &str) -> bool {
+        let d = day(ts);
+        self.since.is_none_or(|s| d >= s) && self.until.is_none_or(|u| d <= u)
+    }
+
+    /// The error a bound that is not a date deserves, else nothing.
+    fn check(&self) -> Result<()> {
+        for bound in [self.since, self.until].into_iter().flatten() {
+            parse_day(bound)?;
+        }
+        Ok(())
+    }
+
+    /// The same test as Lance filter clauses on `ts`: `ts >= since` and `ts < the day after until`.
+    /// A filter cannot take a substring of `ts`, so here the bounds must parse.
+    fn clauses(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Some(since) = self.since {
+            out.push(format!("ts >= '{}'", parse_day(since)?));
+        }
+        if let Some(until) = self.until {
+            let next = parse_day(until)?.succ_opt().context("the day after is out of range")?;
+            out.push(format!("ts < '{next}'"));
+        }
+        Ok(out)
+    }
+}
+
+/// `block_type = '…' AND harness IN ('…') AND ts >= '…'` over whichever filters are set, else
+/// None.
+fn build_where(block_type: Option<&str>, harness: &[String], days: &DayRange) -> Result<Option<String>> {
     let mut clauses = Vec::new();
     if let Some(bt) = block_type {
         clauses.push(format!("block_type = '{}'", esc(bt)));
@@ -187,11 +238,12 @@ fn build_where(block_type: Option<&str>, harness: &[String]) -> Option<String> {
             clauses.push(format!("harness IN ({})", list.join(", ")));
         }
     }
-    if clauses.is_empty() {
+    clauses.extend(days.clauses()?);
+    Ok(if clauses.is_empty() {
         None
     } else {
         Some(clauses.join(" AND "))
-    }
+    })
 }
 
 /// The stored `harness` facets a `--harness` value names. `claude` and `claude_code` name each
@@ -201,20 +253,6 @@ fn harness_spellings(h: String) -> Vec<String> {
     match h.as_str() {
         "claude" | "claude_code" => vec!["claude_code".to_string(), "claude".to_string()],
         _ => vec![h],
-    }
-}
-
-/// 0.5^(age/half_life): 1.0 for fresh, decaying with age. half_life <= 0 disables.
-fn recency_weight(ts: &str, now: DateTime<Utc>, half_life: f64) -> f64 {
-    if half_life <= 0.0 {
-        return 1.0;
-    }
-    match DateTime::parse_from_rfc3339(ts) {
-        Ok(t) => {
-            let age_days = (now - t.with_timezone(&Utc)).num_seconds() as f64 / 86_400.0;
-            0.5f64.powf(age_days.max(0.0) / half_life)
-        }
-        Err(_) => 1.0,
     }
 }
 
@@ -345,33 +383,18 @@ async fn models() -> Result<&'static Mutex<Models>> {
 /// A recall's defaults, owned here so the CLI and the MCP server search the same way.
 pub const DEFAULT_K: usize = 8;
 pub const DEFAULT_CANDIDATES: usize = 30;
-pub const DEFAULT_HALF_LIFE: f64 = 30.0;
 pub const DEFAULT_NEIGHBORS: i64 = 1;
 
 /// Run the recall pipeline over one memory and return the results rendered in the agent format.
-#[allow(clippy::too_many_arguments)]
 pub async fn recall(
     memory: Memory,
     query: String,
     k: usize,
     candidates: usize,
-    half_life: f64,
     neighbors: i64,
-    block_type: Option<String>,
-    harness: Option<String>,
+    filter: RecallFilter,
 ) -> Result<String> {
-    let (note, hits) = recall_hits(
-        memory,
-        query,
-        k,
-        candidates,
-        half_life,
-        neighbors,
-        block_type,
-        harness,
-        &|_| (),
-    )
-    .await?;
+    let (note, hits) = recall_hits(memory, query, k, candidates, neighbors, filter, &|_| ()).await?;
     Ok(rendered(&note, &hits))
 }
 
@@ -383,25 +406,44 @@ pub fn rendered(note: &str, hits: &[(Hit, f64)]) -> String {
     crate::ui::render::recall_agent(note, hits)
 }
 
-/// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →
-/// neighbor expansion. Returns the degradation note (empty when the memory opened normally) and
-/// the scored hits, best first — rendering is the caller's choice. `progress` hears a short label
-/// as each slow phase starts (model load, search, rerank); pass a no-op to run silently.
-#[allow(clippy::too_many_arguments)]
+/// Run the recall pipeline over one memory: hybrid retrieval → rerank → neighbor expansion.
+/// Returns the degradation note (empty when the memory opened normally) and the scored hits, best
+/// first — rendering is the caller's choice. `progress` hears a short label as each slow phase
+/// starts (model load, search, rerank); pass a no-op to run silently.
 pub async fn recall_hits(
     memory: Memory,
     query: String,
     k: usize,
     candidates: usize,
-    half_life: f64,
     neighbors: i64,
-    block_type: Option<String>,
-    harness: Option<String>,
+    filter: RecallFilter,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Vec<(Hit, f64)>)> {
-    let search = Search::new(query, candidates, block_type, harness, progress).await?;
+    let search = Search::new(query, candidates, filter, progress).await?;
     let pool = search.candidates(&memory, progress).await?;
-    search.rank(vec![pool], k, half_life, neighbors, progress).await
+    search.rank(vec![pool], k, neighbors, progress).await
+}
+
+/// What narrows a search.
+#[derive(Default)]
+pub struct RecallFilter {
+    /// Keep chunks of this block type: `text`, `thinking`, `tool_use` or `tool_result`.
+    pub block_type: Option<String>,
+    /// Keep turns of this harness, as the turns carry it (`claude` also names `claude_code`).
+    pub harness: Option<String>,
+    /// Keep turns on or after this `YYYY-MM-DD`.
+    pub since: Option<String>,
+    /// Keep turns on or before this `YYYY-MM-DD`.
+    pub until: Option<String>,
+}
+
+impl RecallFilter {
+    fn days(&self) -> DayRange<'_> {
+        DayRange {
+            since: self.since.as_deref(),
+            until: self.until.as_deref(),
+        }
+    }
 }
 
 /// One query, embedded once, and the filters every memory's search applies. A recall is
@@ -429,16 +471,14 @@ impl Candidates {
 }
 
 impl Search {
-    /// Embed `query` for searching up to `candidates` rows per memory, filtered by block type and
-    /// harness.
+    /// Embed `query` for searching up to `candidates` rows per memory that `filter` keeps.
     pub async fn new(
         query: String,
         candidates: usize,
-        block_type: Option<String>,
-        harness: Option<String>,
+        filter: RecallFilter,
         progress: &(dyn Fn(&str) + Sync),
     ) -> Result<Self> {
-        let harness = harness.map(harness_spellings).unwrap_or_default();
+        let harness = filter.harness.clone().map(harness_spellings).unwrap_or_default();
         progress("loading model…");
         let qv: Vec<f32> = models()
             .await?
@@ -450,7 +490,7 @@ impl Search {
             .next()
             .context("empty embedding")?;
         Ok(Self {
-            where_clause: build_where(block_type.as_deref(), &harness),
+            where_clause: build_where(filter.block_type.as_deref(), &harness, &filter.days())?,
             harness_filtered: !harness.is_empty(),
             query,
             qv,
@@ -489,16 +529,15 @@ impl Search {
         })
     }
 
-    /// Rerank the pooled candidates, a row several memories hold counted once, reweight by
-    /// recency, keep the top `k` and attach `neighbors` from the memory each hit came from.
-    /// However many pools there are, the rerank scores at most `candidates` of them, the best by
-    /// fused score: it costs per candidate, and dominates a recall. Returns the pools'
-    /// degradation notes and the scored hits, best first.
+    /// Rerank the pooled candidates, a row several memories hold counted once, keep the top `k`
+    /// and attach `neighbors` from the memory each hit came from. However many pools there are,
+    /// the rerank scores at most `candidates` of them, the best by fused score: it costs per
+    /// candidate, and dominates a recall. Returns the pools' degradation notes and the scored
+    /// hits, best first.
     pub async fn rank(
         &self,
         pools: Vec<Candidates>,
         k: usize,
-        half_life: f64,
         neighbors: i64,
         progress: &(dyn Fn(&str) + Sync),
     ) -> Result<(String, Vec<(Hit, f64)>)> {
@@ -531,14 +570,10 @@ impl Search {
             .reranker
             .rerank(self.query.as_str(), &docs)?;
 
-        let now = Utc::now();
         let mut scored: Vec<(usize, f64)> = scores
             .iter()
             .enumerate()
-            .map(|(i, &s)| {
-                let relevance = 1.0 / (1.0 + (-(s as f64)).exp());
-                (i, relevance * recency_weight(&hits[i].1.ts, now, half_life))
-            })
+            .map(|(i, &s)| (i, 1.0 / (1.0 + (-(s as f64)).exp())))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
@@ -930,23 +965,20 @@ impl SessionFilter {
                 return false;
             }
         }
-        if let Some(since) = &self.since {
-            if s.date() < since.as_str() {
-                return false;
-            }
+        self.days().holds(&s.ts)
+    }
+
+    fn days(&self) -> DayRange<'_> {
+        DayRange {
+            since: self.since.as_deref(),
+            until: self.until.as_deref(),
         }
-        if let Some(until) = &self.until {
-            if s.date() > until.as_str() {
-                return false;
-            }
-        }
-        true
     }
 }
 
 /// The sessions of a memory that `filter` keeps, oldest first, rendered in the agent format.
 pub async fn sessions(memory: Memory, filter: SessionFilter) -> Result<String> {
-    refuse_zero_limit(&filter)?;
+    check_filter(&filter)?;
     list_sessions(vec![SessionPool::open(&memory).await?], filter).await
 }
 
@@ -976,19 +1008,20 @@ impl SessionPool {
     }
 }
 
-/// Zero would render nothing, which is never what a caller wants.
-fn refuse_zero_limit(filter: &SessionFilter) -> Result<()> {
+/// Zero would render nothing, which is never what a caller wants, and a bound that is not a date
+/// would match nothing or everything without a word.
+fn check_filter(filter: &SessionFilter) -> Result<()> {
     if filter.limit == Some(0) {
         bail!("a limit of 0 would list nothing — omit it for {SESSIONS_LIMIT} rows, raise it to at most {SESSIONS_LIMIT_MAX}, and walk the rest with --offset");
     }
-    Ok(())
+    filter.days().check()
 }
 
 /// The sessions of the pooled memories that `filter` keeps, oldest first, rendered in the agent
 /// format; a session several pools hold is listed from the first. The prompts are read after the
 /// filter and the bound, so their cost follows the rows rendered rather than the size of the memory.
 pub async fn list_sessions(mut pools: Vec<SessionPool>, filter: SessionFilter) -> Result<String> {
-    refuse_zero_limit(&filter)?;
+    check_filter(&filter)?;
     let note: String = pools.iter().map(|p| p.note.as_str()).collect();
     let label = pools.first().map(|p| p.label.clone()).unwrap_or_default();
     let mut seen = HashSet::new();
@@ -1845,33 +1878,78 @@ mod tests {
     #[test]
     fn build_where_combines_set_filters() {
         let one = |h: &str| vec![h.to_string()];
-        assert_eq!(build_where(None, &[]), None);
-        assert_eq!(build_where(Some("text"), &[]).as_deref(), Some("block_type = 'text'"));
-        assert_eq!(build_where(None, &one("codex")).as_deref(), Some("harness = 'codex'"));
+        let any = DayRange::default();
+        let w = |bt: Option<&str>, h: &[String], d: &DayRange| build_where(bt, h, d).unwrap();
+        assert_eq!(w(None, &[], &any), None);
+        assert_eq!(w(Some("text"), &[], &any).as_deref(), Some("block_type = 'text'"));
+        assert_eq!(w(None, &one("codex"), &any).as_deref(), Some("harness = 'codex'"));
         assert_eq!(
-            build_where(Some("tool_use"), &one("pi")).as_deref(),
+            w(Some("tool_use"), &one("pi"), &any).as_deref(),
             Some("block_type = 'tool_use' AND harness = 'pi'")
         );
         assert_eq!(
-            build_where(None, &harness_spellings("claude".into())).as_deref(),
+            w(None, &harness_spellings("claude".into()), &any).as_deref(),
             Some("harness IN ('claude_code', 'claude')")
         );
-        // values are escaped against filter-string injection.
-        assert_eq!(build_where(None, &one("a'b")).as_deref(), Some("harness = 'a''b'"));
+        // A day range is inclusive: the upper clause is the day after `until`, exclusive.
+        let week = DayRange {
+            since: Some("2026-09-14"),
+            until: Some("2026-09-20"),
+        };
+        assert_eq!(
+            w(Some("text"), &[], &week).as_deref(),
+            Some("block_type = 'text' AND ts >= '2026-09-14' AND ts < '2026-09-21'")
+        );
+        let year_end = DayRange {
+            since: None,
+            until: Some("2026-12-31"),
+        };
+        assert_eq!(w(None, &[], &year_end).as_deref(), Some("ts < '2027-01-01'"));
+        // values are escaped against filter-string injection; a bound that is not a date is refused.
+        assert_eq!(w(None, &one("a'b"), &any).as_deref(), Some("harness = 'a''b'"));
+        let err = build_where(
+            None,
+            &[],
+            &DayRange {
+                since: Some("x'y"),
+                until: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expected YYYY-MM-DD"), "{err}");
+        // So is a date in another spelling: the text compare on `ts` needs the zero padding.
+        let unpadded = DayRange {
+            since: Some("2026-9-14"),
+            until: None,
+        };
+        assert!(build_where(None, &[], &unpadded).is_err());
+        assert!(unpadded.check().is_err());
     }
 
     #[test]
-    fn recency_weight_halves_each_half_life() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 31, 0, 0, 0).unwrap();
-        // disabled
-        assert_eq!(recency_weight("2026-01-01T00:00:00Z", now, 0.0), 1.0);
-        // fresh
-        assert!((recency_weight("2026-01-31T00:00:00Z", now, 30.0) - 1.0).abs() < 1e-9);
-        // exactly one half-life (30 days) old -> 0.5
-        assert!((recency_weight("2026-01-01T00:00:00Z", now, 30.0) - 0.5).abs() < 1e-9);
-        // future timestamps clamp to fresh, not >1.
-        assert!((recency_weight("2026-02-10T00:00:00Z", now, 30.0) - 1.0).abs() < 1e-9);
-        // unparseable -> neutral 1.0
-        assert_eq!(recency_weight("not-a-date", now, 30.0), 1.0);
+    fn day_range_is_inclusive_at_both_ends_and_open_without_a_bound() {
+        let week = DayRange {
+            since: Some("2026-09-14"),
+            until: Some("2026-09-20"),
+        };
+        assert!(week.holds("2026-09-14T00:00:00Z"));
+        assert!(week.holds("2026-09-20T23:59:59Z"));
+        assert!(!week.holds("2026-09-13T23:59:59Z"));
+        assert!(!week.holds("2026-09-21T00:00:00Z"));
+        assert!(DayRange::default().holds("1999-01-01T00:00:00Z"));
+        assert!(DayRange {
+            since: Some("2026-09-14"),
+            until: None
+        }
+        .holds("2030-01-01T00:00:00Z"));
+        // The filter clauses draw the same line: `ts >= since` and `ts < the day after until`.
+        for ts in [
+            "2026-09-13T23:59:59Z",
+            "2026-09-14T00:00:00Z",
+            "2026-09-20T23:59:59.999Z",
+            "2026-09-21T00:00:00Z",
+        ] {
+            assert_eq!(week.holds(ts), ("2026-09-14".."2026-09-21").contains(&ts), "{ts}");
+        }
     }
 }

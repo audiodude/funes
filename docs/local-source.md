@@ -279,3 +279,21 @@ consumer activation. A synthetic source refresh/enumerate/turns/read round trip
 checks strict normalization and provenance without using or changing live
 memory. Activation and service restarts belong to the integrating operator;
 this source update does not run `funes update` or publish Hugging Face artifacts.
+
+### October 2, 2026 upstream and compatible dependency refresh
+
+The `update-20261002-stable18410` branch starts from custom revision
+`eee23d57b6a5895b23898792728c880b3fdd25f8` and merges upstream main through
+`767122709efffb98931801f8d664e318abe8d443`. Recall now ranks by relevance
+without a recency half-life and accepts exact `YYYY-MM-DD` `--since` / `--until`
+bounds through the CLI and MCP. The merge retains native OMP ingestion,
+graph provenance, revision-bound source protocol 1, `actomasto-v1`, and the
+GitHub-only software release workflow. It keeps the local-source inventory
+dependency and subcommand while adopting upstream's updated recall description.
+
+`cargo update` resolved zero package changes: the existing lockfile already
+contains the latest versions compatible with its manifest constraints. Lance
+remains pinned to 11.0.0 and `object_store` to 0.13.2, with Arrow in the 58 series.
+No dependency bounds were widened. Verification below covers only local builds
+and synthetic fixtures; `HF_FUNES_TEST_TOKEN` remains empty so credential-gated
+Hub tests cannot publish scratch datasets.

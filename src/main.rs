@@ -1,6 +1,6 @@
 //! funes — recall over your past AI Agent sessions.
 //!
-//! `recall` reads the index (hybrid → rerank → recency); `index` builds/updates it from the local
+//! `recall` reads the index (hybrid → rerank); `index` builds/updates it from the local
 //! harness session dirs (Claude Code, Codex, pi) or an explicit path/parquet/repo. funes's home is
 //! `$FUNES_HOME` or `~/.funes`.
 
@@ -30,7 +30,7 @@ struct Cli {
 enum Cmd {
     /// Read the local-only, revision-bound source protocol from stdin.
     Source,
-    /// Recall passages from past sessions (hybrid → rerank → recency → neighbors).
+    /// Recall passages from past sessions (hybrid → rerank → neighbors).
     Recall {
         /// What to recall (free text).
         #[arg(required = true, num_args = 1..)]
@@ -41,9 +41,6 @@ enum Cmd {
         /// How many fused candidates to rerank.
         #[arg(long, default_value_t = recall::DEFAULT_CANDIDATES)]
         candidates: usize,
-        /// Recency half-life in days (a hit this old keeps half its weight). 0 disables.
-        #[arg(long, default_value_t = recall::DEFAULT_HALF_LIFE)]
-        half_life: f64,
         /// Adjacent chunks (within this seq window) to attach to each hit. 0 disables.
         #[arg(long, default_value_t = recall::DEFAULT_NEIGHBORS)]
         neighbors: i64,
@@ -54,6 +51,12 @@ enum Cmd {
         /// `claude_code`).
         #[arg(long)]
         harness: Option<String>,
+        /// Restrict to turns on or after this date (`YYYY-MM-DD`).
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
+        /// Restrict to turns on or before this date (`YYYY-MM-DD`).
+        #[arg(long, value_name = "DATE")]
+        until: Option<String>,
         #[command(flatten)]
         memory: MemoryOpts,
     },
@@ -348,10 +351,11 @@ async fn run(cli: Cli) -> Result<()> {
             query,
             k,
             candidates,
-            half_life,
             neighbors,
             block_type,
             harness,
+            since,
+            until,
             memory,
         } => {
             let memory = memory.resolve();
@@ -363,7 +367,18 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             let (note, hits) = recall::recall_hits(
-                memory, query, k, candidates, half_life, neighbors, block_type, harness, &progress,
+                memory,
+                query,
+                k,
+                candidates,
+                neighbors,
+                recall::RecallFilter {
+                    block_type,
+                    harness,
+                    since,
+                    until,
+                },
+                &progress,
             )
             .await?;
             drop(spinner);

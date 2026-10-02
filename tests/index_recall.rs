@@ -47,10 +47,8 @@ async fn index_then_read_surface() {
         "parse transcripts into turns".into(),
         5,
         30,
-        30.0,
         1,
-        None,
-        None,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -70,10 +68,11 @@ async fn index_then_read_surface() {
         "cargo test".into(),
         5,
         30,
-        0.0,
         0,
-        Some("tool_use".into()),
-        None,
+        funes::commands::recall::RecallFilter {
+            block_type: Some("tool_use".into()),
+            ..Default::default()
+        },
     )
     .await
     .unwrap();
@@ -173,6 +172,20 @@ async fn index_then_read_surface() {
     assert!(
         zero.is_err_and(|e| e.to_string().contains("would list nothing")),
         "a limit of 0 should error"
+    );
+
+    // A bound that is not a date is refused, as on recall.
+    let bad = funes::commands::recall::sessions(
+        funes::memory::Memory::local(),
+        funes::commands::recall::SessionFilter {
+            since: Some("2026-9".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        bad.is_err_and(|e| e.to_string().contains("expected YYYY-MM-DD")),
+        "a bound that is not a date should error"
     );
 
     // A date filter narrows the population; one that excludes everything says so.
@@ -279,10 +292,8 @@ async fn index_then_read_surface() {
         "parse transcripts into turns".into(),
         5,
         30,
-        30.0,
         1,
-        None,
-        None,
+        Default::default(),
     )
     .await
     .unwrap();

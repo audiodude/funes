@@ -18,10 +18,6 @@ pub struct RecallRequest {
     pub query: String,
     #[schemars(description = "Number of results to return")]
     pub k: Option<usize>,
-    #[schemars(
-        description = "Recency half-life in days: a hit that old keeps half its score. Pass 0 to weigh every age alike, for a memory spanning months or an answer that may be old."
-    )]
-    pub half_life: Option<f64>,
     #[schemars(description = "Adjacent chunks attached to each hit for context; 0 returns the hits alone.")]
     pub neighbors: Option<i64>,
     #[schemars(
@@ -34,6 +30,10 @@ pub struct RecallRequest {
         description = "Restrict to a harness facet, as the turns carry it (`claude` also matches the older `claude_code`)"
     )]
     pub harness: Option<String>,
+    #[schemars(description = "Restrict to turns on or after this date, `YYYY-MM-DD`")]
+    pub since: Option<String>,
+    #[schemars(description = "Restrict to turns on or before this date, `YYYY-MM-DD`")]
+    pub until: Option<String>,
     #[schemars(
         description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory, with this host's turns not yet pushed to it."
     )]
@@ -183,18 +183,19 @@ impl Funes {
     }
 
     #[tool(
-        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it."
+        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it. Ranking weighs relevance, not age: for the latest word on a topic, or one stretch of time, bound it with `since`/`until`."
     )]
     async fn recall(
         &self,
         Parameters(RecallRequest {
             query,
             k,
-            half_life,
             neighbors,
             candidates,
             block_type,
             harness,
+            since,
+            until,
             memory,
         }): Parameters<RecallRequest>,
     ) -> String {
@@ -203,7 +204,18 @@ impl Funes {
         let quiet = |_: &str| ();
         let recalled = async {
             let candidates = candidates.unwrap_or(recall::DEFAULT_CANDIDATES);
-            let search = recall::Search::new(query, candidates, block_type, harness, &quiet).await?;
+            let search = recall::Search::new(
+                query,
+                candidates,
+                recall::RecallFilter {
+                    block_type,
+                    harness,
+                    since,
+                    until,
+                },
+                &quiet,
+            )
+            .await?;
             // The server's own memory, as it will be after this host's next push. The local search
             // runs while the remote one waits on the network.
             let (read, owed) = tokio::join!(search.candidates(&memory, &quiet), async {
@@ -219,7 +231,6 @@ impl Funes {
                 .rank(
                     pools,
                     k.unwrap_or(recall::DEFAULT_K),
-                    half_life.unwrap_or(recall::DEFAULT_HALF_LIFE),
                     neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
                     &quiet,
                 )
