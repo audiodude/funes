@@ -1,6 +1,6 @@
 //! funes — recall over your past AI Agent sessions.
 //!
-//! `recall` reads the index (hybrid → rerank); `index` builds/updates it from the local
+//! `recall` reads the index (hybrid search, reranked for a deep pool); `index` builds/updates it from the local
 //! harness session dirs (Claude Code, Codex, pi) or an explicit path/parquet/repo. funes's home is
 //! `$FUNES_HOME` or `~/.funes`.
 
@@ -30,15 +30,17 @@ struct Cli {
 enum Cmd {
     /// Read the local-only, revision-bound source protocol from stdin.
     Source,
-    /// Recall passages from past sessions (hybrid → rerank → neighbors).
+    /// Recall passages from past sessions (hybrid → neighbors, reranked when --candidates is several times -k).
     Recall {
         /// What to recall (free text).
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
-        /// How many results to show.
+        /// How many results to show. Each is a passage to read.
         #[arg(short, long, default_value_t = recall::DEFAULT_K)]
         k: usize,
-        /// How many fused candidates to rerank.
+        /// Size of the fused pool the hits are cut from. At four times -k or more, the pool is
+        /// reranked by the cross-encoder before the cut (seconds per call). Under that, the hits
+        /// are the first -k of the fused order.
         #[arg(long, default_value_t = recall::DEFAULT_CANDIDATES)]
         candidates: usize,
         /// Adjacent chunks (within this seq window) to attach to each hit. 0 disables.
