@@ -774,6 +774,101 @@ fn current_claude_and_omp_metadata_preserve_complete_turn_evidence() {
 }
 
 #[test]
+fn omp_mode_changes_preserve_lineage_and_time_without_exposing_settings() {
+    let mut rows = conversation("omp");
+    rows.insert(
+        2,
+        json!({"type":"mode_change","id":"mode","parentId":"u","timestamp":2,
+            "mode":"plan","data":{"planFilePath":"PRIVATE"}}),
+    );
+    rows[3]["parentId"] = json!("mode");
+    let result = parse(&rows, "omp", 10.0, true);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["turns"][0]["invalid"], false);
+    assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+    assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+    assert_eq!(result["turns"][0]["items"][1]["text"], "Answer");
+    assert_eq!(result["turns"][0]["boundaries"][1]["time"].as_f64(), Some(2.0));
+    assert!(!result.to_string().contains("PRIVATE"));
+
+    rows[2]["mode"] = json!("none");
+    rows[2].as_object_mut().unwrap().remove("data");
+    assert_eq!(
+        parse(&rows, "omp", 10.0, true)["turns"][0]["message_ids"],
+        json!(["u", "a"])
+    );
+    rows[2]["timestamp"] = json!(20);
+    assert_eq!(parse(&rows, "omp", 10.0, true)["status"], "deferred_future");
+}
+
+#[test]
+fn omp_mode_changes_reject_unknown_or_malformed_settings() {
+    for (field, value) in [
+        ("mode", Value::Null),
+        ("mode", json!(1)),
+        ("data", Value::Null),
+        ("data", json!("PRIVATE")),
+        ("data", json!([])),
+        ("parentId", json!(1)),
+        ("id", Value::Null),
+        ("cwd", json!("/different-project")),
+    ] {
+        let mut rows = conversation("omp");
+        let mut mode = json!({"type":"mode_change","id":"mode","parentId":"u","timestamp":2,"mode":"plan"});
+        mode[field] = value;
+        rows.insert(2, mode);
+        rows[3]["parentId"] = json!("mode");
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+}
+
+#[test]
+fn omp_live_steering_preserves_evidence_and_provenance_gates() {
+    for delivered in [false, true] {
+        let mut rows = conversation("omp");
+        rows[1]["message"]["liveSteered"] = json!(delivered);
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "complete");
+        assert_eq!(result["turns"][0]["invalid"], false);
+        assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+        assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+        assert_eq!(result["turns"][0]["items"][1]["text"], "Answer");
+        assert!(!result.to_string().contains("liveSteered"));
+
+        for attribution in [Value::Null, json!("agent")] {
+            let mut unattributed = rows.clone();
+            unattributed[1]["message"]["attribution"] = attribution;
+            assert_eq!(parse(&unattributed, "omp", 10.0, true)["turns"], json!([]));
+        }
+        rows[2]["message"]["stopReason"] = json!("aborted");
+        let aborted = parse(&rows, "omp", 10.0, true);
+        assert_eq!(aborted["status"], "incomplete_turn");
+        assert_eq!(aborted["turns"], json!([]));
+    }
+}
+
+#[test]
+fn omp_live_steering_rejects_malformed_values_and_non_user_carriers() {
+    for value in [Value::Null, json!("true"), json!(1), json!([]), json!({})] {
+        let mut rows = conversation("omp");
+        rows[1]["message"]["liveSteered"] = value;
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+    for role in ["assistant", "toolResult", "system", "developer"] {
+        let mut rows = conversation("omp");
+        rows[2]["message"]["role"] = json!(role);
+        rows[2]["message"]["liveSteered"] = json!(true);
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+}
+
+#[test]
 fn omp_request_controls_preserve_evidence_without_exposing_provider_bookkeeping() {
     for controls in [
         json!({"messageIndex": 1}),

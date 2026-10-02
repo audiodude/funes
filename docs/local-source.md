@@ -67,6 +67,21 @@ optional `effort` with `topLevel`/`tail` values of null or
 required nested fields, and non-assistant carriers remain rejected. Completion,
 human attribution, lineage, and project/time boundary gates are unchanged.
 
+OMP user messages also accept boolean `liveSteered` display metadata. It does
+not establish human attribution or complete an unfinished turn; malformed values
+and non-user carriers remain errors. `mode_change` settings records accept a
+string `mode` and optional object `data`, with native ID/parent lineage. They
+preserve time and lineage boundaries without resetting the conversation or
+exposing mode-specific data. Unknown top-level fields still fail closed.
+
+The October 2 steering/mode compatibility repair was exercised through the real
+`source` CLI with synthetic originals and read-only existing-session checks.
+Across one 657-source inventory, all 43 sources rejected by the deployed reader
+for `unknown_content_schema` became readable: 36 complete and seven with pending
+turns still excluded. Three concurrently changed originals remained rejected by
+the revision guard. No live enrollment, source inventory, or service configuration
+was changed by these checks. Implementation and verification assisted by OpenAI Codex.
+
 ## Consumer durability and permissions
 
 Actomasto checks gates before all requests and before durable updates. It maps every cwd boundary to the unique deepest discovered repository, including ineligible nested repositories; applies whole interval and per-message eligibility; checks existing source_markers and `adapter-unit:*` markers before read; applies whole-turn secret/blocklist filters before persistence or transmission. It records a terminal marker only after durable exclusion or enqueue. Enumeration cursor advances only after all source turns are durably handled; pending or unavailable activity is revisited on subsequent passes without changing collection/expiry times. Full metadata re-enumeration is safe with exact unit deduplication. No adapter stream offsets/inodes are converted into cursors. Configuration/database migration preserves old terminal markers and pending timestamps, initializes conversation health closed, and rejects old binaries via database/config versioning.

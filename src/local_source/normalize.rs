@@ -738,6 +738,19 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     if !truth(&context.session) {
         return Err("missing_session_header");
     }
+    if kind == "mode_change" {
+        if !allowed_keys(row, "type id parentId timestamp mode data")
+            || !row["id"].is_string()
+            || row.get("parentId").is_none()
+            || !(row["parentId"].is_null() || row["parentId"].is_string())
+            || !row["mode"].is_string()
+            || row.get("data").is_some_and(|value| !value.is_object())
+        {
+            return Err(SCHEMA);
+        }
+        // Settings metadata: retain lineage/time, never expose mode-specific data.
+        return Ok(event);
+    }
     if one_of(kind, "reset_boundary compaction branch_summary") {
         event.role = Role::Reset;
         return Ok(event);
@@ -765,13 +778,20 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let allowed = match message["role"].as_str() {
         Some("bashExecution") => "role command output exitCode cancelled truncated timestamp excludeFromContext",
         Some("fileMention") => "role files timestamp",
-        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError model provider providerPayload prunedAt requestControls responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
+        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError liveSteered model provider providerPayload prunedAt requestControls responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
     };
     if !allowed_keys(message, allowed) {
         return Err(SCHEMA);
     }
     if message.get("upstreamModel").is_some_and(|v| !v.is_string())
         || message.get("credentialId").is_some_and(|v| v.as_u64().is_none())
+    {
+        return Err(SCHEMA);
+    }
+    // Live delivery is user-only display metadata, not proof of human authorship.
+    if message
+        .get("liveSteered")
+        .is_some_and(|value| message["role"] != "user" || !value.is_boolean())
     {
         return Err(SCHEMA);
     }
