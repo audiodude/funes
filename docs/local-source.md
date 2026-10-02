@@ -297,3 +297,41 @@ remains pinned to 11.0.0 and `object_store` to 0.13.2, with Arrow in the 58 seri
 No dependency bounds were widened. Verification below covers only local builds
 and synthetic fixtures; `HF_FUNES_TEST_TOKEN` remains empty so credential-gated
 Hub tests cannot publish scratch datasets.
+
+Verification used Rust/Cargo 1.98.1, system `protoc`, the default BLAS backend,
+two build jobs, dev opt-level 1 with debug info and incremental compilation
+disabled, lld, and `RUST_MIN_STACK=16777216`. `cargo fmt --check` and both
+warning-free Clippy commands from the October 1 section passed. Library and
+binary tests passed 278 and 1 tests respectively. The first all-targets run then
+stopped at terminal integration tests because `expect` was absent. Extracting
+Arch's Expect 5.45.4 package into a disposable `/tmp` directory supplied that
+test prerequisite without a system installation. The resumed
+`cargo test --locked --test "*" --examples -- --test-threads=1` passed all 78
+reported integration tests and compiled the five example test targets. Total:
+357 reported passes, zero remaining failures; six token-gated early returns
+are included in that count and their live-Hub behavior remains unverified.
+The default executable built with `cargo build --locked --bin funes`.
+
+Actual CLI smoke checks passed capabilities/refresh/enumerate/turns/read with
+synthetic OMP originals, preserving full ordinary Unicode text, native
+session/message/unit identities, exact raw-record digests, timestamps, and
+completion provenance. Metadata responses exposed neither source text nor
+private paths; reasoning and provider bookkeeping stayed excluded. Aborted
+turns remained pending, repeated reads retained unit identities, unknown request
+fields failed closed, changed/missing originals were rejected, and missing
+sources remained inventory tombstones. Separate native OMP CLI checks wrote
+nothing under `index --check`, resumed bounded indexing from partial to complete
+coverage, retained graph parent citations through `get`, and exercised inclusive
+same-day recall bounds, exclusion by a future lower bound, and rejection of
+noncanonical date spelling. Runtime evidence is retained locally under
+`/tmp/funes-update-20261002-{source-smoke,native-smoke}.json`; integration output
+is `/tmp/funes-update-20261002-integration-tests.log`.
+
+These checks exercised implementation commit
+`ba44cd529d70149c262fbb3a2739361238fffdef`; this follow-on commit changes only this
+verification record. Rebuild it and require source capabilities to report the
+final full committed SHA before consumer activation. No live installation,
+configuration, service, enrollment, memory, hosted generation, release tag,
+software release artifact, or Hugging Face upload was changed or published.
+Only the dated origin source branch is pushed. Verification assisted by
+OpenAI Codex.
