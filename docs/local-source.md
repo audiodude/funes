@@ -381,3 +381,32 @@ citations, and both fused and reranked recall. These are local checks, not
 authorization to publish or upload Hugging Face artifacts or memory.
 Installation/configuration cutover and service restarts remain separate
 operator-owned steps. AI-assisted integration by OpenAI Codex.
+
+### October 2, 2026 OMP 18.5.0 stable consumer refresh
+
+The `update-stable1850` branch starts from the latest completed custom upgrade,
+`65611ba8f0fc486ce4bfd8ad92953b82b86b8037`, preserving the steering/mode parser
+revision `e5783df` and all previous maintained-fork upgrades. Fetching origin and
+pulling `origin/main` in the isolated worktree required no merge. Upstream main
+and its latest stable tag `v1.6.0` both resolve to
+`33c3c589ecda7b758e18d52d447f8b37212336c2`, already included in the custom base.
+Upstream's tagged manifest still identifies the package as `1.5.0+dev`; the fork
+retains that version rather than inventing a different package release.
+
+`cargo update` advances `uuid` from 1.26.1 to 1.27.0. A subsequent verbose
+resolution reports no additional compatible updates. The supported upstream
+dependency family remains Lance 11.0.0, Arrow/Parquet 58, and `object_store`
+0.13.2; separately upgrading those coupled storage APIs or the optional ONNX
+backend would require an upstream migration, not a compatible consumer refresh.
+The fork retains stable `hf-hub` 1.0.0 and its bundled SQLite local-source
+inventory. No source protocol, capabilities, normalization, enrollment, memory
+format, or installed integration changes are introduced.
+
+Build and verification use the documented Cargo commands with
+`HF_FUNES_TEST_TOKEN` empty, so token-gated live-Hub tests do not publish scratch
+datasets. Runtime smoke uses only disposable synthetic originals and an
+independently authored temporary enrollment. Consumer activation must pin the
+final committed build revision returned by source capabilities. Installation
+and user-service restarts remain the integration owner's responsibility. No
+`funes update`, release artifact, tag, Hugging Face upload, live enrollment
+change, or memory publication is authorized. AI-assisted by OpenAI Codex.
