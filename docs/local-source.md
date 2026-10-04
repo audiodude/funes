@@ -410,3 +410,27 @@ final committed build revision returned by source capabilities. Installation
 and user-service restarts remain the integration owner's responsibility. No
 `funes update`, release artifact, tag, Hugging Face upload, live enrollment
 change, or memory publication is authorized. AI-assisted by OpenAI Codex.
+
+### October 3, 2026 OMP 18.6.0 stable consumer refresh
+
+The isolated `update-stable1860` branch preserves custom revision
+`d88337d51a9c58ba8952eeeecce374dc7427b97a` from `update-stable1850`.
+Fetching origin and pulling `origin/main` required no merge; fetching upstream
+`huggingface/funes` main likewise required no merge. Upstream main and latest
+stable `v1.6.0` remain `33c3c589ecda7b758e18d52d447f8b37212336c2`.
+
+The compatible `cargo update` advances `async-recursion` 1.1.1 to 1.2.0,
+`cc` 1.5.1 to 1.6.0, `mio` 1.2.3 to 1.2.4, and `tokio` 1.53.1 to 1.53.2.
+No manifest bounds, source protocol, parser capabilities, or storage dependency
+family change. All custom OMP steering/mode normalization, native indexing,
+local-source inventory, and GitHub-only software-release changes are retained.
+
+Verification follows the Cargo commands above, using the existing target cache
+with one build job, lld, dev opt-level 1, no debug info or incremental compilation,
+and `RUST_MIN_STACK=16777216`. `HF_FUNES_TEST_TOKEN` stays empty: credential-gated
+Hub tests return early and do not verify remote-memory behavior. CLI smoke uses
+disposable synthetic originals and enrollment only. Local installation must use
+the final committed binary and its exact source capability revision; service
+definitions and restarts remain the integration owner's responsibility.
+No `funes update`, release tag/artifact, Hugging Face upload, or live memory
+publication is part of this refresh. AI-assisted by OpenAI Codex.
