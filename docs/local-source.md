@@ -434,3 +434,22 @@ the final committed binary and its exact source capability revision; service
 definitions and restarts remain the integration owner's responsibility.
 No `funes update`, release tag/artifact, Hugging Face upload, or live memory
 publication is part of this refresh. AI-assisted by OpenAI Codex.
+
+### October 6, 2026 OMP 18.7.0 stable consumer refresh
+
+The isolated `update-stable1870` branch starts from custom revision
+`3f4019407f76bea057910d2fd3651261c41e083a` (`update-stable1860`); origin had no
+newer commits. Upstream `huggingface/funes` main (`fe60450`, 25 commits past
+`v1.6.0`: recall `--role` filtering, index fragment compaction, and remote
+push/reindex fixes) merged without conflicts. The compatible `cargo update`
+refreshes 28 locked packages, including hf-xet/xet 1.7.0, hyper 1.12.0,
+rmcp 3.5.1 and (transitively) sysinfo 0.39. Custom OMP steering/mode
+normalization and the local source protocol are unchanged.
+
+Verification uses the Cargo commands above with lld, dev opt-level 1, no debug
+info or incremental compilation, `RUST_MIN_STACK=16777216`, and one test thread.
+The `add_fifth_integration` suite drives a terminal through `expect`, which is
+not installed on this host, so it cannot run here. `HF_FUNES_TEST_TOKEN` stays
+empty, so credential-gated Hub tests return early. No `funes update`, release
+tag/artifact, Hugging Face upload, or memory publication is part of this
+refresh. AI-assisted by Claude.
