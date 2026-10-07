@@ -502,7 +502,8 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
         bail!("push aborted");
     }
 
-    let repo = hub::client(Some(token.as_str()), true)?.dataset(owner, name);
+    // No HTTP retries, as `remote::reindex` requires.
+    let repo = hub::client(Some(token.as_str()), false)?.dataset(owner, name);
     // No revision pinning: always the `main` branch head.
     let rev = "main".to_string();
     let dataset_uri = format!("{uri}/{}.lance", dataset::TABLE);
@@ -773,6 +774,12 @@ async fn reindex_forced(
         .await?
         {
             Reindexed::Committed(oid) => return Ok(format!("  reindexed (commit {oid})\n")),
+            Reindexed::Uncleaned(oid, e) => {
+                return Ok(format!(
+                    "  reindexed (commit {oid})\n  note: old versions not deleted ({e:#}); \
+                     re-run push --force-reindex\n"
+                ))
+            }
             Reindexed::AlreadyCurrent => return Ok("  index already current\n".to_string()),
             Reindexed::Conflict => continue,
         }
@@ -799,11 +806,15 @@ async fn reindex_auto(
     .await
     {
         Ok(Reindexed::Committed(oid)) => format!("  reindexed (commit {oid})\n"),
+        Ok(Reindexed::Uncleaned(oid, e)) => format!(
+            "  reindexed (commit {oid})\n  note: old versions not deleted ({e:#}); \
+             will retry on a later push\n"
+        ),
         Ok(Reindexed::AlreadyCurrent) => String::new(),
         Ok(Reindexed::Conflict) => {
             "  note: index not refreshed (remote head moved); will retry on a later push\n".to_string()
         }
-        Err(e) => format!("  note: index not refreshed ({e}); will retry on a later push\n"),
+        Err(e) => format!("  note: index not refreshed ({e:#}); will retry on a later push\n"),
     }
 }
 

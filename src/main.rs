@@ -49,6 +49,10 @@ enum Cmd {
         /// Restrict to a block type: text | thinking | tool_use | tool_result.
         #[arg(long = "type", value_name = "BLOCK_TYPE")]
         block_type: Option<String>,
+        /// Restrict to a role, as the turns carry it (an agent's turns say user | assistant | tool |
+        /// system).
+        #[arg(long)]
+        role: Option<String>,
         /// Restrict to a harness facet, as the turns carry it (`claude` also matches the older
         /// `claude_code`).
         #[arg(long)]
@@ -355,6 +359,7 @@ async fn run(cli: Cli) -> Result<()> {
             candidates,
             neighbors,
             block_type,
+            role,
             harness,
             since,
             until,
@@ -376,6 +381,7 @@ async fn run(cli: Cli) -> Result<()> {
                 neighbors,
                 recall::RecallFilter {
                     block_type,
+                    role,
                     harness,
                     since,
                     until,
