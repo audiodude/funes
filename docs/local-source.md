@@ -447,9 +447,10 @@ rmcp 3.5.1 and (transitively) sysinfo 0.39. Custom OMP steering/mode
 normalization and the local source protocol are unchanged.
 
 Verification uses the Cargo commands above with lld, dev opt-level 1, no debug
-info or incremental compilation, `RUST_MIN_STACK=16777216`, and one test thread.
-The `add_fifth_integration` suite drives a terminal through `expect`, which is
-not installed on this host, so it cannot run here. `HF_FUNES_TEST_TOKEN` stays
-empty, so credential-gated Hub tests return early. No `funes update`, release
-tag/artifact, Hugging Face upload, or memory publication is part of this
-refresh. AI-assisted by Claude.
+info or incremental compilation, `RUST_MIN_STACK=16777216`, and one test thread:
+clippy and fmt pass, and all 376 tests across 44 suites pass. The
+`add_fifth_integration` suite drives a terminal through `expect`; this host has
+no system `expect`, so that suite ran against a locally built Expect 5.45.4.
+`HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
+No `funes update`, release tag/artifact, Hugging Face upload, or memory
+publication is part of this refresh. AI-assisted by Claude.
