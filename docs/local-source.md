@@ -454,3 +454,28 @@ no system `expect`, so that suite ran against a locally built Expect 5.45.4.
 `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
 No `funes update`, release tag/artifact, Hugging Face upload, or memory
 publication is part of this refresh. AI-assisted by Claude.
+
+### October 8, 2026 OMP 18.8.4 stable consumer refresh
+
+The isolated `update-stable1884` branch starts from custom revision
+`f158631a303e396440476b9f16b1c23fd9407620` (`update-stable1870`); origin had no
+newer commits. Upstream `huggingface/funes` main (`b04007f`, 18 commits past
+`v1.7.0`: multilingual-e5-small memories, standalone `compact`, per-memory
+locks, and the dropped `vendored-openssl` feature) merged with conflicts in
+`Cargo.toml`, `src/main.rs`, `src/commands/index.rs` and
+`src/commands/update.rs`. The fork keeps stable `hf-hub` 1.0.0, the explicit
+`--harness omp` indexing path (`--omp-max-chunks`, which now also honors
+`--multilingual`), GitHub-only software updates, and its refusal to treat an
+unreadable local memory as absent. A local memory classified as empty is
+reopened before indexing so the embedding model stamped at creation survives
+the first write (covered by upstream's `multilingual_index` test). `cargo
+update` changed only `zerocopy` 0.8.62 and dropped `openssl-src`. The custom
+source protocol and OMP normalization are unchanged.
+
+Verification uses the Cargo commands above with lld, dev opt-level 1, no debug
+info or incremental compilation, `RUST_MIN_STACK=16777216`, and one test thread:
+fmt and clippy (`-D warnings`) pass, and all 405 tests across 52 suites pass.
+`add_fifth_integration` ran against Arch's Expect 5.45.4 extracted under
+`/tmp`. `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return
+early. No `funes update`, release tag/artifact, Hugging Face upload, or memory
+publication is part of this refresh. AI-assisted by Claude.
