@@ -8,7 +8,7 @@
 //!
 //! Below it: [`dataset`], [`fetch_store`] and [`capture_store`] are **mechanics** — Lance and object
 //! stores, knowing nothing about the Hub. [`remote`] is **transport** — the pinned reads and the
-//! single guarded commit an append or reindex lands as, over the Hub client in [`crate::hub`].
+//! commits of an append or a compaction, over the Hub client in [`crate::hub`].
 //! [`card`] serves a published memory's dataset card, [`lock`] the local writer lock.
 //!
 //! The commands ask this module what state a memory is in; they never infer it from error shapes.
@@ -29,7 +29,7 @@ use hf_hub::HFError;
 use lance::dataset::Dataset;
 
 use crate::hub::{client, hf_token, is_offline_error, is_remote_shorthand, parse_hf};
-use dataset::{DIM, MODEL};
+use dataset::DIM;
 
 /// A memory to recall from: a local Lance directory or a remote dataset on the HF Hub.
 #[derive(Debug, Clone)]
@@ -145,6 +145,7 @@ impl Memory {
             }
         }
         match self.open().await {
+            Ok(ds) if matches!(self, Memory::Local { .. }) && ds.count_rows(None).await? == 0 => Ok(MemoryState::Empty),
             Ok(ds) => Ok(MemoryState::Ready(ds)),
             // A gated repo answers `info()` fine and 403s only here, on the file read — so the open
             // is the only place this is knowable. Local paths keep their own error: a
@@ -201,7 +202,7 @@ impl Memory {
 pub enum MemoryState {
     /// Opened, compatible, ready to query.
     Ready(Dataset),
-    /// Nothing there yet: a local memory with no dataset, or a repo never pushed to.
+    /// Nothing there yet: a local memory with no dataset or no rows, or a repo never pushed to.
     Empty,
     /// A remote repo that doesn't exist on the Hub. funes never creates it.
     Missing,
@@ -275,19 +276,11 @@ fn dataset_absent(err: &anyhow::Error) -> bool {
 
 /// Reject a memory funes can't query with its own embeddings: the `vector` dimension must be
 /// funes's `DIM`, and — when the memory records an embedding model in its schema metadata — that
-/// model must be funes's. A memory with no recorded model (pre-metadata) is guarded by the
+/// model must be one funes runs. A memory with no recorded model (pre-metadata) is guarded by the
 /// dimension alone.
 fn check_compat(ds: &Dataset) -> Result<()> {
+    dataset::embedding_model(ds)?;
     let schema = arrow_schema::Schema::from(ds.schema());
-
-    if let Some(model) = schema.metadata().get("embedding_model") {
-        if model != MODEL {
-            return Err(anyhow!(
-                "memory built with embedding model {model:?}, not funes's {MODEL:?}"
-            ));
-        }
-    }
-
     let field = schema
         .field_with_name("vector")
         .map_err(|_| anyhow!("memory has no `vector` column"))?;
@@ -485,6 +478,34 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let ds = Dataset::write(reader, &uri, None).await.unwrap();
         let err = check_compat(&ds).unwrap_err().to_string();
-        assert!(err.contains("other-model") && err.contains("not funes's"), "{err}");
+        assert!(err.contains("other-model") && err.contains("does not run"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_local_memory_with_no_rows_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        dataset::create_empty(&dataset::table_uri(&path), dataset::model::ENGLISH)
+            .await
+            .unwrap();
+        assert!(matches!(
+            Memory::parse(&path).state().await.unwrap(),
+            MemoryState::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_compat_accepts_a_model_funes_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let e5 = crate::inference::EmbeddingModel::MultilingualE5Small;
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![Field::new("id", DataType::Int64, true), vector_field(DIM)],
+            HashMap::from([("embedding_model".to_string(), e5.id().to_string())]),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids(2), vectors(2, DIM)]).unwrap();
+        let uri = format!("{}/chunks.lance", dir.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let ds = Dataset::write(reader, &uri, None).await.unwrap();
+        assert!(check_compat(&ds).is_ok());
     }
 }

@@ -5,7 +5,7 @@
 //! `recall_hits`/`get_turns` return the structured results for other renderings (see `render`).
 
 use crate::chunk;
-use crate::inference::{self, Embedder, Reranker};
+use crate::inference::{self, Embedder, EmbeddingModel, Reranker};
 use crate::memory::dataset;
 use crate::memory::{Memory, MemoryState};
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +14,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, ROW_ID};
 use lance_index::scalar::FullTextSearchQuery;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use tokio::sync::{Mutex, OnceCell};
@@ -367,17 +368,26 @@ pub fn memory_hint(read: Option<&str>) -> String {
     }
 }
 
-/// The embedder, and the reranker once a rerank has asked for it, loaded once and shared. Loading
-/// a model is the costly part of a recall, so a long-lived process (the MCP server) pays it on the
-/// first call and reuses the models after, and a search that never reranks never loads the
-/// reranker. The `Mutex` serializes recalls (both models run with `&mut`), which is fine: the work
-/// is CPU-bound and the server's calls are serial anyway.
+/// The embedder of each model, and the reranker once a rerank has asked for it, loaded once and
+/// shared. Loading a model is the costly part of a recall, so a long-lived process (the MCP server)
+/// pays it on the first call and reuses the models after, and a search that never reranks never
+/// loads the reranker. The `Mutex` serializes recalls (the models run with `&mut`), which is fine:
+/// the work is CPU-bound and the server's calls are serial anyway.
+#[derive(Default)]
 struct Models {
-    embedder: Box<dyn Embedder>,
+    embedders: HashMap<EmbeddingModel, Box<dyn Embedder>>,
     reranker: Option<Box<dyn Reranker>>,
 }
 
 impl Models {
+    fn embedder(&mut self, model: EmbeddingModel) -> Result<&mut dyn Embedder> {
+        let embedder = match self.embedders.entry(model) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(inference::embedder(model)?),
+        };
+        Ok(embedder.as_mut())
+    }
+
     /// The reranker, built on its first use.
     fn reranker(&mut self) -> Result<&mut dyn Reranker> {
         if self.reranker.is_none() {
@@ -390,16 +400,8 @@ impl Models {
 static MODELS: OnceCell<Mutex<Models>> = OnceCell::const_new();
 
 /// The shared model cache, built on first use.
-async fn models() -> Result<&'static Mutex<Models>> {
-    MODELS
-        .get_or_try_init(|| async {
-            let embedder = inference::embedder()?;
-            Ok::<_, anyhow::Error>(Mutex::new(Models {
-                embedder,
-                reranker: None,
-            }))
-        })
-        .await
+async fn models() -> &'static Mutex<Models> {
+    MODELS.get_or_init(|| async { Mutex::new(Models::default()) }).await
 }
 
 /// A recall's defaults, owned here so the CLI and the MCP server search the same way.
@@ -452,7 +454,7 @@ pub async fn recall_hits(
     filter: RecallFilter,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Vec<(Hit, f64)>)> {
-    let search = Search::new(query, candidates, filter, progress).await?;
+    let search = Search::new(query, candidates, filter)?;
     let pool = search.candidates(&memory, progress).await?;
     search.rank(vec![pool], k, neighbors, progress).await
 }
@@ -485,7 +487,7 @@ impl RecallFilter {
 /// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
 pub struct Search {
     query: String,
-    qv: Vec<f32>,
+    qv: OnceCell<(EmbeddingModel, Vec<f32>)>,
     candidates: usize,
     harness_filtered: bool,
     where_clause: Option<String>,
@@ -508,24 +510,9 @@ impl Candidates {
 }
 
 impl Search {
-    /// Embed `query` for searching up to `candidates` rows per memory that `filter` keeps.
-    pub async fn new(
-        query: String,
-        candidates: usize,
-        filter: RecallFilter,
-        progress: &(dyn Fn(&str) + Sync),
-    ) -> Result<Self> {
+    /// Search for `query`, up to `candidates` rows per memory that `filter` keeps.
+    pub fn new(query: String, candidates: usize, filter: RecallFilter) -> Result<Self> {
         let harness = filter.harness.clone().map(harness_spellings).unwrap_or_default();
-        progress("loading model…");
-        let qv: Vec<f32> = models()
-            .await?
-            .lock()
-            .await
-            .embedder
-            .embed(&[query.as_str()])?
-            .into_iter()
-            .next()
-            .context("empty embedding")?;
         Ok(Self {
             where_clause: build_where(
                 filter.block_type.as_deref(),
@@ -535,7 +522,7 @@ impl Search {
             )?,
             harness_filtered: !harness.is_empty(),
             query,
-            qv,
+            qv: OnceCell::new(),
             candidates,
             rerank: None,
         })
@@ -559,14 +546,26 @@ impl Search {
                 "this memory predates the harness facet — reindex it, or drop --harness"
             ));
         }
-        let mut hits = hybrid_candidates(
-            &read.ds,
-            &self.qv,
-            &self.query,
-            self.candidates,
-            self.where_clause.as_deref(),
-        )
-        .await?;
+        let model = dataset::embedding_model(&read.ds)?;
+        let (embedded_by, qv) = self
+            .qv
+            .get_or_try_init(|| async {
+                progress("loading model…");
+                let qv = models().await.lock().await.embedder(model)?.embed_query(&self.query)?;
+                Ok::<_, anyhow::Error>((model, qv))
+            })
+            .await?;
+        if *embedded_by != model {
+            bail!(
+                "{} is embedded with {}, and the other memory of this search with {}",
+                memory.label(),
+                model.id(),
+                embedded_by.id()
+            );
+        }
+        progress(&format!("searching {}…", memory.label()));
+        let mut hits =
+            hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
         let label = read.memory_label.unwrap_or_default();
         for h in &mut hits {
             h.memory = label.clone();
@@ -613,7 +612,7 @@ impl Search {
             let docs: Vec<&str> = hits.iter().map(|(_, h)| h.text.as_str()).collect();
             progress(&format!("reranking {} candidates…", docs.len()));
             let scores = models()
-                .await?
+                .await
                 .lock()
                 .await
                 .reranker()?
@@ -1577,20 +1576,20 @@ async fn index_lines(ds: &Dataset, now: DateTime<Utc>) -> Result<String> {
     Ok(out)
 }
 
-/// A remote memory's published state: when it was last pushed to and its unindexed backlog.
+/// A remote memory's published state: when it was last written to and its unindexed backlog.
 async fn remote_lines(ds: &Dataset, now: DateTime<Utc>) -> String {
     let mut out = String::new();
-    // Every write to a remote memory is a `funes push` (data or reindex commit), so the head
-    // version's timestamp is when it was last pushed to.
+    // Every write to a remote memory is a push or a compaction, so the head version's timestamp is
+    // when it was last written to.
     let t = ds.version().timestamp;
     if t.timestamp() > 0 {
-        let _ = writeln!(out, "last push: {}", stamp(t, now));
+        let _ = writeln!(out, "last write: {}", stamp(t, now));
     }
     let unindexed = crate::memory::remote::max_unindexed_rows(ds).await;
     if unindexed > 0 {
         let _ = writeln!(
             out,
-            "unindexed: {unindexed} chunks (searched brute-force until a push reindexes)"
+            "unindexed: {unindexed} chunks (searched brute-force until the next compaction)"
         );
     }
     out
@@ -1769,8 +1768,8 @@ mod tests {
     async fn memory_of(turns: &[Turn], dir: &Path) -> Dataset {
         let chunks = chunk::chunks_from_turns(turns, &chunk::Tier::ALL, true);
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
-        let batch = dataset::build_batch(&chunks, Some(&vectors)).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema());
+        let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema(dataset::model::ENGLISH));
         Dataset::write(reader, dir.to_str().unwrap(), None).await.unwrap()
     }
 
@@ -1799,8 +1798,8 @@ mod tests {
             text_turn("session", 1, "assistant", "Each line becomes a typed turn."),
         ];
         let chunks = chunk::chunks_from_turns(&turns, &chunk::Tier::ALL, true);
-        let batch = dataset::build_batch(&chunks, None).unwrap();
-        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema());
+        let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
         let mut ds = Dataset::write(reader, &dataset::table_uri(&memory.label()), None)
             .await
             .unwrap();

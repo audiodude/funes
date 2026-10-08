@@ -139,6 +139,9 @@ the Hub yet, `funes add` offers to create it (default no, to catch typos). Datas
 funes creates are **private by default**; changing their visibility later is an explicit action on
 the Hub. An existing repository keeps its existing visibility.
 
+A memory holds one [embedding model](index.md#sessions-not-in-english), so `funes add` refuses a
+memory embedded with another model than your local memory, before anything is installed.
+
 With **no memory named** and none bound yet, and an HF token present in a terminal, `funes add` offers to set up
 `<user>/funes-memory` for you so your memory follows you across machines; decline and it stays local.
 Without a token it stays local and tells you how to enable syncing later.
@@ -155,13 +158,22 @@ integration that never publishes, does not need it.
 
 `funes add` runs the one-time bootstrap the hooks can't do unattended:
 
-1. **Asks** before your first index. Declining aborts the add; nothing is installed.
+1. **Asks** before your first index. Declining aborts the add; nothing is installed. At a terminal,
+   with no memory yet, it also asks whether your sessions are English or multilingual, which picks
+   the memory's [embedding model](index.md#sessions-not-in-english). The default is multilingual
+   when your locale (`LC_ALL`, `LC_MESSAGES`, then `LANG`) is in another language than English
+   (an unset, `C` or `POSIX` locale counts as English, `C.UTF-8` too), and off a terminal funes
+   takes that default without asking. When the memory it binds already has a model, the local
+   memory takes it instead, and nothing is asked.
+   If funes can't read that memory (offline, or your token has no access), the add stops here.
 2. **Installs the hooks and registers the MCP server** (baking in the bound memory). This is where
    the integration converts the agent's existing sessions into its spool.
 3. **Builds your first index** from that spool if you don't have one. Indexed content is ready
    to recall; [unfinished work continues on later turns](index.md#progress-and-resuming).
 4. **Does the first push** to a freshly-bound memory — the publish the hook refuses to do off a
-   terminal (the wrong-memory guard; see [automation.md](automation.md)).
+   terminal (the wrong-memory guard; see [automation.md](automation.md)). With nothing indexed yet,
+   it still gives a memory with no dataset your local memory's model. A memory at a local path is
+   not pushed to.
 
 ### The spool
 

@@ -24,7 +24,11 @@ you wrote yourself is never touched.
 | Flag | Meaning |
 | --- | --- |
 | `-y`, `--yes` | Skip the wrong-memory confirmation (below). |
-| `--force-reindex` | Refresh the remote index after pushing even if the backlog is below the auto-reindex threshold; with nothing new to push, reindex only. |
+| `--compact` | Compact the remote after pushing, even if the unindexed backlog is below the threshold that triggers it. With nothing new to push, compact only. `--force-reindex` is the old name. |
+
+Once 500 pushed rows sit unindexed on the remote, a push also compacts it: it merges the small
+fragments, adds those rows to the search indexes, and deletes the old versions.
+`funes compact <memory>` does the same without pushing ([index.md](index.md#compaction)).
 
 **The wrong-memory guard.** A push to a memory that holds none of the chunks it would publish — a
 first push, a new host, sessions named with `--sessions` that it lacks, or genuinely the wrong memory —
@@ -34,6 +38,10 @@ push interactively — once that machine has an index of its own to push.)
 
 If your token can't write the target, push says so — recall can still read a memory you can't publish
 to.
+
+A memory holds one embedding model's vectors, so a push into a memory embedded with another model than
+the local one is refused. A first publish with no chunks to upload still creates the memory with the
+local one's model, so every host that binds it next embeds with the same.
 
 One publish per memory at a time on a machine: a push that starts while another is still running
 says so and stops, and the next one picks up what it left. The hooks [`funes add`](add.md) installs

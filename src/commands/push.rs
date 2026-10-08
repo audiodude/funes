@@ -11,11 +11,11 @@
 //! - **Append:** [`remote::append`] lands the new fragment + manifest + transaction in one
 //!   guarded `create_commit`, retried against a fresh head if a concurrent push moved it. The new
 //!   rows are left unindexed (a query still finds them by brute force).
-//! - **Reindex:** a *separate* guarded commit ([`remote::reindex`]), kept off the data commit so
-//!   the data commit stays small. `push` runs it after the data commit when the unindexed backlog
-//!   crosses [`REINDEX_THRESHOLD`] or the remote has no text index (best-effort: a head-moved
-//!   conflict is a warning, the next push retries), or eagerly with `--force-reindex` (retried until
-//!   it lands).
+//! - **Compaction:** separate commits ([`remote::compact`]), kept off the data commit so the
+//!   data commit stays small. `push` runs it after the data commit when the unindexed backlog
+//!   crosses [`COMPACT_THRESHOLD`] or the remote has no text index (best-effort: a head-moved
+//!   conflict is a warning, the next push retries), or eagerly with `--compact` (retried until it
+//!   lands).
 //!
 //! What a push ships is the embedded chunks the remote doesn't hold, optionally restricted to the
 //! sessions named with `--sessions`. Rows awaiting embedding stay local until a later push.
@@ -24,7 +24,7 @@ use crate::hub;
 use crate::memory::card::{self, CardAction, CardCtx};
 use crate::memory::dataset;
 use crate::memory::lock;
-use crate::memory::remote::{self, Appended, Reindexed};
+use crate::memory::remote::{self, Appended, Compacted};
 use crate::memory::{Memory, MemoryState};
 use crate::{chunk, scan, ui};
 use anyhow::{bail, Context, Result};
@@ -42,14 +42,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Reindex the remote once this many appended rows are sitting unindexed (answered by a
+/// Compact the remote once this many appended rows are sitting unindexed (answered by a
 /// brute-force scan until folded in). Bounds per-query cost, not push count, and is stateless —
 /// [`remote::append`] reads it straight from Lance's index stats. Nonzero so tiny per-push
 /// deltas don't pile up between compactions.
-const REINDEX_THRESHOLD: u64 = 500;
+const COMPACT_THRESHOLD: u64 = 500;
 
-/// Cap on CAS-conflict retries (the data append, and a forced reindex) when the branch head keeps
-/// moving under us, so a busy remote can't spin forever.
+/// Cap on CAS-conflict retries (the data append, and a forced compaction) when the branch head
+/// keeps moving under us, so a busy remote can't spin forever.
 const MAX_COMMIT_RETRIES: u32 = 10;
 
 /// Every chunk id in a memory, or empty if it can't be opened (absent local index, not-yet-created
@@ -407,13 +407,14 @@ fn named_ids(by_session: &HashMap<String, Vec<String>>, sessions: &[String]) -> 
 }
 
 /// Publish the local memory's new embedded chunks to `target` (a remote memory on the HF Hub). With
-/// `force_reindex`, refresh the remote index after the data commit (retrying until it lands) even
-/// if the unindexed backlog is below [`REINDEX_THRESHOLD`]; with no new chunks pending it's a pure
-/// index refresh. `confirm` gates a publish to a memory holding none of the chunks to publish.
+/// `compact`, compact the remote after the data commit (retrying until it goes through) even if
+/// the unindexed backlog is below [`COMPACT_THRESHOLD`]. With no new chunks pending, it only
+/// compacts, or gives a remote with no dataset yet the local memory's embedding model. `confirm`
+/// gates a publish to a memory holding none of the chunks to publish.
 ///
 /// `sessions`, when non-empty, restricts candidates to those sessions' embedded chunks.
 /// Empty publishes all embedded chunks the local memory holds that the remote does not.
-pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, sessions: &[String]) -> Result<Pushed> {
+pub async fn run_push(target: Memory, compact: bool, confirm: Confirm, sessions: &[String]) -> Result<Pushed> {
     let uri = match &target {
         Memory::Remote { uri } => uri.clone(),
         Memory::Local { .. } => {
@@ -452,13 +453,23 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
 
     // Only `Empty` can land here: a local path has no Hub states, and an unreadable memory is an
     // `Err`. A host whose first index isn't built yet has nothing to publish — that is not a failure.
-    let MemoryState::Ready(local) = Memory::local().state().await? else {
+    // A local memory with no rows still has a model, which a remote with no dataset takes, so the
+    // next host to bind it embeds with the same.
+    let local = match Memory::local().state().await? {
+        MemoryState::Ready(ds) => Some(ds),
+        MemoryState::Empty if remote.is_none() => Memory::local().open().await.ok(),
+        _ => None,
+    };
+    let Some(local) = local else {
         return Ok(format!(
             "{}: nothing indexed on this machine yet — nothing to publish\n",
             target.label()
         )
         .into());
     };
+    if let Some(ds) = &remote {
+        same_model(&local, ds, &target.label())?;
+    }
 
     eprintln!("comparing local and remote indexes…");
     let remote_ids = match &remote {
@@ -485,9 +496,9 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
         record_pushed(&uri, candidates.intersection(&remote_ids))?;
     }
 
-    // Nothing to push => done (no token needed), unless this is a forced reindex of an existing
-    // remote, which is still work.
-    if to_push.is_empty() && (first_publish || !force_reindex) {
+    // Nothing to push => done (no token needed), unless this is a first publish, which still gives
+    // the remote its model, or a forced compaction of an existing remote, which is still work.
+    if to_push.is_empty() && !first_publish && !compact {
         return Ok(format!("{}: already up to date ({} chunks)\n", target.label(), remote_ids.len()).into());
     }
 
@@ -502,17 +513,17 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
         bail!("push aborted");
     }
 
-    // No HTTP retries, as `remote::reindex` requires.
+    // No HTTP retries, as `remote::compact` requires.
     let repo = hub::client(Some(token.as_str()), false)?.dataset(owner, name);
     // No revision pinning: always the `main` branch head.
     let rev = "main".to_string();
     let dataset_uri = format!("{uri}/{}.lance", dataset::TABLE);
     let opts = HashMap::from([("hf_token".to_string(), token), ("revision".to_string(), rev.clone())]);
 
-    // 3. Forced reindex with no new data: just refresh the remote index and stop.
-    if to_push.is_empty() {
-        eprintln!("refreshing the remote index…");
-        let note = reindex_forced(&repo, &dataset_uri, &opts, &rev).await?;
+    // 3. Forced compaction with no new data: just compact the remote and stop.
+    if to_push.is_empty() && !first_publish {
+        eprintln!("compacting the remote…");
+        let note = compact_remote(&repo, &dataset_uri, &opts, &rev, "funes push: compact").await?;
         return Ok(format!("{}: up to date ({} chunks)\n{note}", target.label(), remote_ids.len()).into());
     }
 
@@ -538,7 +549,7 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
     eprintln!("scanning {n_scanning} chunk(s) for secrets…");
     let (batches, skipped) = drop_secret_rows(batches)?;
     let n_chunks: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if n_chunks == 0 {
+    if n_chunks == 0 && skipped.rows > 0 {
         // Everything was held back: nothing reached the Hub. Mark `blocked` so the CLI exits non-zero
         // — automation must not read this as a successful publish.
         return Ok(Pushed {
@@ -597,8 +608,12 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
             return Ok(format!("{}: nothing new to upload\n", target.label()).into());
         };
         record_pushed(&uri, &pushed_ids)?;
+        let pushed = match n_chunks {
+            0 => format!("created with {}, no chunks yet", embedding_model(&schema)),
+            n => format!("pushed {n} chunks"),
+        };
         return Ok(format!(
-            "{}: pushed {n_chunks} chunks (commit {oid})\n{card_note}{}",
+            "{}: {pushed} (commit {oid})\n{card_note}{}",
             target.label(),
             skipped.warning()
         )
@@ -639,15 +654,15 @@ pub async fn run_push(target: Memory, force_reindex: bool, confirm: Confirm, ses
     let mut out = format!("{}: pushed {n_chunks} chunks (commit {oid})\n", target.label());
     out.push_str(&card_note);
 
-    // 7. Reindex as a separate commit: forced (retried until it lands), or best-effort (one shot,
+    // 7. Compact in separate commits: forced (retried until it lands), or best-effort (one shot,
     // warn on a conflict — the next push retries) past the threshold or when the remote has no text
     // index, which recall cannot do without.
-    if force_reindex {
-        eprintln!("refreshing the remote index…");
-        out.push_str(&reindex_forced(&repo, &dataset_uri, &opts, &rev).await?);
-    } else if unindexed > REINDEX_THRESHOLD || !text_indexed {
-        eprintln!("refreshing the remote index…");
-        out.push_str(&reindex_auto(&repo, &dataset_uri, &opts, &rev).await);
+    if compact {
+        eprintln!("compacting the remote…");
+        out.push_str(&compact_remote(&repo, &dataset_uri, &opts, &rev, "funes push: compact").await?);
+    } else if unindexed >= COMPACT_THRESHOLD || !text_indexed {
+        eprintln!("compacting the remote…");
+        out.push_str(&compact_auto(&repo, &dataset_uri, &opts, &rev).await);
     }
     out.push_str(&skipped.warning());
     Ok(out.into())
@@ -712,6 +727,16 @@ impl Skipped {
 /// chunk of a block is dirty, the whole block is held back (its other chunks carry the rest of the
 /// secret). Fail-closed on the scanner — a push must scan before it uploads.
 fn drop_secret_rows(batches: Vec<RecordBatch>) -> Result<(Vec<RecordBatch>, Skipped)> {
+    // Nothing to scan needs no scanner.
+    if batches.iter().all(|b| b.num_rows() == 0) {
+        return Ok((
+            batches,
+            Skipped {
+                rows: 0,
+                summary: String::new(),
+            },
+        ));
+    }
     let scanner = scan::Trufflehog::find()?;
     // Row order across batches matches `chunks_from_batches`, so a chunk's index is its global row.
     let chunks = chunk::chunks_from_batches(&batches);
@@ -754,68 +779,82 @@ fn drop_secret_rows(batches: Vec<RecordBatch>) -> Result<(Vec<RecordBatch>, Skip
     Ok((clean, Skipped { rows: dropped, summary }))
 }
 
-/// Forced reindex: ask [`remote::reindex`] to refresh and commit, retrying on a head-moved
-/// conflict (it re-reads the head each call) until it lands or [`MAX_COMMIT_RETRIES`] is exceeded.
-async fn reindex_forced(
+/// Forced compaction: ask [`remote::compact`] to compact and commit under `message`, retrying on a
+/// head-moved conflict (it re-reads the head each call) until it lands or [`MAX_COMMIT_RETRIES`] is
+/// exceeded.
+pub(crate) async fn compact_remote(
     repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     opts: &HashMap<String, String>,
     rev: &str,
+    message: &str,
 ) -> Result<String> {
     for _ in 0..=MAX_COMMIT_RETRIES {
-        match remote::reindex(
+        match remote::compact(
             repo,
             dataset_uri,
             opts.clone(),
             rev,
-            "funes push: reindex".to_string(),
+            message.to_string(),
             ui::index_progress,
         )
         .await?
         {
-            Reindexed::Committed(oid) => return Ok(format!("  reindexed (commit {oid})\n")),
-            Reindexed::Uncleaned(oid, e) => {
+            Compacted::Committed(oid) => return Ok(format!("  compacted (commit {oid})\n")),
+            Compacted::Uncleaned(oid, e) => {
                 return Ok(format!(
-                    "  reindexed (commit {oid})\n  note: old versions not deleted ({e:#}); \
-                     re-run push --force-reindex\n"
+                    "  compacted (commit {oid})\n  note: old versions not deleted ({e:#}); \
+                     compact it again\n"
                 ))
             }
-            Reindexed::AlreadyCurrent => return Ok("  index already current\n".to_string()),
-            Reindexed::Conflict => continue,
+            Compacted::AlreadyCompact => return Ok("  already compact\n".to_string()),
+            Compacted::Conflict => continue,
         }
     }
-    bail!("reindex still conflicting after {MAX_COMMIT_RETRIES} retries; re-run push --force-reindex")
+    bail!("compaction still conflicting after {MAX_COMMIT_RETRIES} retries; compact it again")
 }
 
-/// Best-effort reindex during a normal push: one attempt, never retried. The data is already
+/// Best-effort compaction during a normal push: one attempt, never retried. The data is already
 /// committed, so any failure here is a warning — the next push past the threshold tries again.
-async fn reindex_auto(
+async fn compact_auto(
     repo: &HFRepository<RepoTypeDataset>,
     dataset_uri: &str,
     opts: &HashMap<String, String>,
     rev: &str,
 ) -> String {
-    match remote::reindex(
+    match remote::compact(
         repo,
         dataset_uri,
         opts.clone(),
         rev,
-        "funes push: reindex".to_string(),
+        "funes push: compact".to_string(),
         ui::index_progress,
     )
     .await
     {
-        Ok(Reindexed::Committed(oid)) => format!("  reindexed (commit {oid})\n"),
-        Ok(Reindexed::Uncleaned(oid, e)) => format!(
-            "  reindexed (commit {oid})\n  note: old versions not deleted ({e:#}); \
+        Ok(Compacted::Committed(oid)) => format!("  compacted (commit {oid})\n"),
+        Ok(Compacted::Uncleaned(oid, e)) => format!(
+            "  compacted (commit {oid})\n  note: old versions not deleted ({e:#}); \
              will retry on a later push\n"
         ),
-        Ok(Reindexed::AlreadyCurrent) => String::new(),
-        Ok(Reindexed::Conflict) => {
-            "  note: index not refreshed (remote head moved); will retry on a later push\n".to_string()
+        Ok(Compacted::AlreadyCompact) => String::new(),
+        Ok(Compacted::Conflict) => {
+            "  note: not compacted (remote head moved); will retry on a later push\n".to_string()
         }
-        Err(e) => format!("  note: index not refreshed ({e:#}); will retry on a later push\n"),
+        Err(e) => format!("  note: not compacted ({e:#}); will retry on a later push\n"),
     }
+}
+
+fn same_model(local: &Dataset, remote: &Dataset, label: &str) -> Result<()> {
+    let (here, there) = (dataset::embedding_model(local)?, dataset::embedding_model(remote)?);
+    if here != there {
+        bail!(
+            "{label} is embedded with {}, and the local memory with {}: a memory takes one embedding model",
+            there.id(),
+            here.id()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -831,7 +870,8 @@ mod tests {
         assert!(must_confirm(1, 1));
         // Some overlap (fewer to push than there are to publish) → no prompt, it's a memory you add to.
         assert!(!must_confirm(5, 3));
-        // Nothing to push (up to date, or a reindex-only run) → never prompt, even with 0 overlap.
+        // Nothing to push (up to date, or a compaction-only run) → never prompt, even with 0
+        // overlap.
         assert!(!must_confirm(5, 0));
         assert!(!must_confirm(0, 0));
     }
@@ -938,7 +978,10 @@ mod tests {
     fn batch(turns: &[Turn]) -> (RecordBatch, Vec<chunk::Chunk>) {
         let chunks = chunk::chunks_from_turns(turns, &chunk::Tier::ALL, true);
         let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
-        (dataset::build_batch(&chunks, Some(&vectors)).unwrap(), chunks)
+        (
+            dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap(),
+            chunks,
+        )
     }
 
     #[test]
@@ -1041,6 +1084,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_memory_embedded_with_another_model_is_refused() {
+        let (dir, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let bge = two_session_ds(dir.path()).await;
+        let e5_model = crate::inference::EmbeddingModel::MultilingualE5Small;
+        let chunks = chunk::chunks_from_turns(&[turn_sess("s", 0, "un passage")], &chunk::Tier::ALL, true);
+        let b = dataset::build_batch(e5_model, &chunks, None).unwrap();
+        let uri = dataset::table_uri(&other.path().to_string_lossy());
+        let e5 = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(b)], dataset::schema(e5_model)),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(same_model(&bge, &bge, "acme/kb").is_ok());
+        let err = same_model(&bge, &e5, "acme/kb").unwrap_err().to_string();
+        assert!(
+            err.contains(e5_model.id()) && err.contains(dataset::model::ENGLISH.id()),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn ids_by_session_groups_the_scan() {
         let dir = tempfile::tempdir().unwrap();
         let ds = two_session_ds(dir.path()).await;
@@ -1062,8 +1129,8 @@ mod tests {
             true,
         );
         let reader = RecordBatchIterator::new(
-            vec![Ok(dataset::build_batch(&chunks, None).unwrap())],
-            dataset::schema(),
+            vec![Ok(dataset::build_batch(dataset::model::ENGLISH, &chunks, None).unwrap())],
+            dataset::schema(dataset::model::ENGLISH),
         );
         let uri = dataset::table_uri(&dir.path().to_string_lossy());
         let ds = Dataset::write(reader, &uri, None).await.unwrap();

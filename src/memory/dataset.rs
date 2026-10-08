@@ -3,11 +3,12 @@
 //! it holds the incremental state and the local memory at `…/memory` (the `chunks` Lance dataset).
 
 use crate::chunk;
+use crate::inference::EmbeddingModel;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -28,11 +29,26 @@ use lance_linalg::distance::MetricType;
 /// The table (Lance dataset) name within a memory.
 pub const TABLE: &str = "chunks";
 
-/// The embedding model a memory's vectors are built with, and their width. Pinned in the schema
-/// metadata and enforced on open ([`super::Memory::open`]): a memory built with another model
-/// can't be queried with funes's embeddings.
-pub const MODEL: &str = "BAAI/bge-small-en-v1.5";
+/// The embedding models a new memory's vectors are built with, each by the id pinned in the schema
+/// metadata and enforced on open ([`super::Memory::open`]): a memory built with a model funes
+/// doesn't run can't be queried.
+pub mod model {
+    use super::stored;
+    use crate::inference::EmbeddingModel;
+
+    pub const ENGLISH: EmbeddingModel = stored("BAAI/bge-small-en-v1.5");
+    pub const MULTILINGUAL: EmbeddingModel = stored("intfloat/multilingual-e5-small");
+}
+
+/// The width of every model's vectors.
 pub const DIM: i32 = 384;
+
+const fn stored(id: &str) -> EmbeddingModel {
+    match EmbeddingModel::from_id(id) {
+        Some(model) => model,
+        None => panic!("a memory stores an embedding model funes does not run"),
+    }
+}
 
 /// funes's home directory: `$FUNES_HOME`, else `~/.funes`. Holds the incremental state and the
 /// local memory.
@@ -127,8 +143,32 @@ pub(crate) const VECTOR_INDEX: &str = "vector_idx";
 pub enum IndexBuildEvent {
     Building(&'static str),
     MergingFragments(usize),
-    Compacting { index: String, deltas: usize },
+    MergingDeltas { index: String, deltas: usize },
     VectorIndexFailed(anyhow::Error),
+}
+
+const UNSTAMPED: EmbeddingModel = stored("BAAI/bge-small-en-v1.5");
+
+/// A memory from before the model was recorded holds bge-small-en vectors.
+pub fn embedding_model(ds: &Dataset) -> Result<EmbeddingModel> {
+    stamped_model(&Schema::from(ds.schema()))
+}
+
+/// The model a memory's `schema` records, as [`embedding_model`] reads it.
+pub(crate) fn stamped_model(schema: &Schema) -> Result<EmbeddingModel> {
+    match schema.metadata().get("embedding_model") {
+        None => Ok(UNSTAMPED),
+        Some(id) => EmbeddingModel::from_id(id)
+            .ok_or_else(|| anyhow!("memory built with embedding model {id:?}, which funes does not run")),
+    }
+}
+
+/// The default analyzer splits text only on spaces and punctuation, so a Chinese clause is one token.
+fn fts_params(model: EmbeddingModel) -> InvertedIndexParams {
+    match model {
+        EmbeddingModel::BgeSmallEn => InvertedIndexParams::default(),
+        EmbeddingModel::MultilingualE5Small => InvertedIndexParams::default().base_tokenizer("icu".to_string()),
+    }
 }
 
 /// Build or refresh the required text index and optional vector index.
@@ -136,7 +176,8 @@ pub enum IndexBuildEvent {
 pub async fn build_indexes(ds: &mut Dataset, on_event: impl Fn(IndexBuildEvent)) -> Result<()> {
     sweep_shuffle_leftovers(&std::env::temp_dir());
     let existing = sub_index_counts(ds).await?;
-    refresh_or_build(ds, &FTS, &existing, &InvertedIndexParams::default(), &on_event).await?;
+    let fts = fts_params(embedding_model(ds)?);
+    refresh_or_build(ds, &FTS, &existing, &fts, &on_event).await?;
     if let Some(ivf_pq) = ivf_pq_params(ds) {
         let result: Result<()> = async {
             let embedded = ds
@@ -271,7 +312,7 @@ fn holds_only_shuffle_files(dir: &std::path::Path) -> bool {
 /// every delta (and per-segment BM25 stats drift), so the pile must stay bounded. Only the deltas
 /// are merged — the base is never re-read, which would be the full-index rewrite [`optimize_index`]
 /// exists to avoid.
-pub(crate) const COMPACT_DELTAS: usize = 8;
+pub(crate) const MERGE_DELTAS: usize = 8;
 
 /// Sub-index count per index name (the base plus its deltas, which share the index's name), from
 /// the index metadata alone: `index_statistics` can write a stats migration.
@@ -285,8 +326,8 @@ pub(crate) async fn sub_index_counts(ds: &Dataset) -> Result<BTreeMap<String, us
 }
 
 /// Add a delta sub-index over the rows appended since `name` was last built, or at
-/// [`COMPACT_DELTAS`] deltas merge them into one, sparing the base. `subs` is base + deltas.
-/// `on_event` gets [`IndexBuildEvent::Compacting`] before a merge.
+/// [`MERGE_DELTAS`] deltas merge them into one, sparing the base. `subs` is base + deltas.
+/// `on_event` gets [`IndexBuildEvent::MergingDeltas`] before a merge.
 pub(crate) async fn optimize_index(
     ds: &mut Dataset,
     name: &str,
@@ -294,8 +335,8 @@ pub(crate) async fn optimize_index(
     on_event: impl Fn(IndexBuildEvent),
 ) -> Result<()> {
     let deltas = subs.saturating_sub(1);
-    let opts = if deltas >= COMPACT_DELTAS {
-        on_event(IndexBuildEvent::Compacting {
+    let opts = if deltas >= MERGE_DELTAS {
+        on_event(IndexBuildEvent::MergingDeltas {
             index: name.to_string(),
             deltas,
         });
@@ -413,8 +454,13 @@ fn ivf_pq_params(ds: &Dataset) -> Option<VectorIndexParams> {
     ))
 }
 
+pub(crate) async fn create_empty(uri: &str, model: EmbeddingModel) -> Result<Dataset> {
+    let reader = RecordBatchIterator::new(std::iter::empty(), schema(model));
+    Dataset::write(reader, uri, None).await.context("creating the memory")
+}
+
 /// The table schema (column order is load-bearing for Lance).
-pub(crate) fn schema() -> Arc<Schema> {
+pub(crate) fn schema(model: EmbeddingModel) -> Arc<Schema> {
     let utf8 = |name: &str| Field::new(name, DataType::Utf8, true);
     let i64f = |name: &str| Field::new(name, DataType::Int64, true);
     Arc::new(Schema::new_with_metadata(
@@ -444,12 +490,16 @@ pub(crate) fn schema() -> Arc<Schema> {
             utf8("harness"),
             utf8("repo"),
         ],
-        HashMap::from([("embedding_model".to_string(), MODEL.to_string())]),
+        HashMap::from([("embedding_model".to_string(), model.id().to_string())]),
     ))
 }
 
 /// `None` writes every row with a null `vector`.
-pub(crate) fn build_batch(chunks: &[chunk::Chunk], vectors: Option<&[Vec<f32>]>) -> Result<RecordBatch> {
+pub(crate) fn build_batch(
+    model: EmbeddingModel,
+    chunks: &[chunk::Chunk],
+    vectors: Option<&[Vec<f32>]>,
+) -> Result<RecordBatch> {
     let s = |f: &dyn Fn(&chunk::Chunk) -> Option<String>| -> StringArray { chunks.iter().map(f).collect() };
     let i = |f: &dyn Fn(&chunk::Chunk) -> i64| -> Int64Array { chunks.iter().map(|c| Some(f(c))).collect() };
     let vector = match vectors {
@@ -460,7 +510,7 @@ pub(crate) fn build_batch(chunks: &[chunk::Chunk], vectors: Option<&[Vec<f32>]>)
         ),
     };
     Ok(RecordBatch::try_new(
-        schema(),
+        schema(model),
         vec![
             Arc::new(s(&|c| Some(c.id.clone()))),
             Arc::new(s(&|c| Some(c.text.clone()))),
@@ -496,9 +546,10 @@ fn vector_array(vectors: &[Vec<f32>]) -> FixedSizeListArray {
 /// column of the touched fragments, so no row moves. Fail-closed on an id the dataset doesn't hold —
 /// that is a lost row, not a no-op.
 pub(crate) async fn fill_vectors(ds: &Dataset, ids: &[&str], vectors: &[Vec<f32>]) -> Result<Dataset> {
+    let fields = Schema::from(ds.schema());
     let source_schema = Arc::new(Schema::new(vec![
-        schema().field_with_name("id")?.clone(),
-        schema().field_with_name("vector")?.clone(),
+        fields.field_with_name("id")?.clone(),
+        fields.field_with_name("vector")?.clone(),
     ]));
     let source = RecordBatch::try_new(
         source_schema.clone(),
@@ -577,11 +628,11 @@ mod tests {
 
     fn embedded(turns: &[Turn]) -> RecordBatch {
         let chunks = chunk::chunks_from_turns(turns, &chunk::Tier::ALL, true);
-        build_batch(&chunks, Some(&vectors(chunks.len()))).unwrap()
+        build_batch(model::ENGLISH, &chunks, Some(&vectors(chunks.len()))).unwrap()
     }
 
     fn reader(batch: RecordBatch) -> impl arrow_array::RecordBatchReader + Send + 'static {
-        RecordBatchIterator::new(vec![Ok(batch)], schema())
+        RecordBatchIterator::new(vec![Ok(batch)], schema(model::ENGLISH))
     }
 
     /// Enough rows to train IVF_PQ (lance wants 256 per PQ codebook).
@@ -607,14 +658,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = table_uri(&dir.path().to_string_lossy());
         let chunks = chunk::chunks_from_turns(&turns(0, 2), &chunk::Tier::ALL, true);
-        let mut ds = Dataset::write(reader(build_batch(&chunks[..1], None).unwrap()), &uri, None)
-            .await
-            .unwrap();
+        let mut ds = Dataset::write(
+            reader(build_batch(model::ENGLISH, &chunks[..1], None).unwrap()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(fts_needs_refresh(&ds).await.unwrap(), "no FTS index was committed");
         build_indexes(&mut ds, |_| {}).await.unwrap();
         assert!(!fts_needs_refresh(&ds).await.unwrap());
 
-        ds.append(reader(build_batch(&chunks[1..], None).unwrap()), None)
+        ds.append(reader(build_batch(model::ENGLISH, &chunks[1..], None).unwrap()), None)
             .await
             .unwrap();
         assert!(
@@ -644,7 +699,7 @@ mod tests {
             .await
             .unwrap();
         let pending = chunk::chunks_from_turns(&turns(255, 3), &chunk::Tier::ALL, true);
-        ds.append(reader(build_batch(&pending, None).unwrap()), None)
+        ds.append(reader(build_batch(model::ENGLISH, &pending, None).unwrap()), None)
             .await
             .unwrap();
 
@@ -699,7 +754,7 @@ mod tests {
             .value(0);
         ds.append(reader(appended), None).await.unwrap();
         let pending = chunk::chunks_from_turns(&turns(TRAINABLE + 4, 1), &chunk::Tier::ALL, true);
-        ds.append(reader(build_batch(&pending, None).unwrap()), None)
+        ds.append(reader(build_batch(model::ENGLISH, &pending, None).unwrap()), None)
             .await
             .unwrap();
         build_indexes(&mut ds, |event| {
@@ -852,6 +907,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_e5_memory_indexes_chinese_words() {
+        let mut zh = turns(0, 1);
+        zh[0].blocks[0].text = "我们修改了向量索引的构建方式".into();
+        let chunks = chunk::chunks_from_turns(&zh, &chunk::Tier::ALL, true);
+        for (model, found) in [(model::ENGLISH, false), (EmbeddingModel::MultilingualE5Small, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = table_uri(&dir.path().to_string_lossy());
+            let batch = build_batch(model, &chunks, None).unwrap();
+            let mut ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema(model)), &uri, None)
+                .await
+                .unwrap();
+            build_indexes(&mut ds, |_| {}).await.unwrap();
+            let mut fts = ds.scan();
+            fts.full_text_search(FullTextSearchQuery::new("向量".to_string()))
+                .unwrap();
+            assert_eq!(!turn_uuids(fts).await.is_empty(), found, "{}", model.id());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_memory_names_its_embedding_model() {
+        let chunks = chunk::chunks_from_turns(&turns(0, 1), &chunk::Tier::ALL, true);
+        let e5 = EmbeddingModel::MultilingualE5Small;
+        let unstamped = Arc::new(Schema::new(schema(model::ENGLISH).fields().clone()));
+        for (stamp, model) in [(schema(e5), e5), (unstamped, EmbeddingModel::BgeSmallEn)] {
+            let dir = tempfile::tempdir().unwrap();
+            let columns = build_batch(model, &chunks, None).unwrap().columns().to_vec();
+            let batch = RecordBatch::try_new(stamp.clone(), columns).unwrap();
+            let uri = table_uri(&dir.path().to_string_lossy());
+            let ds = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], stamp), &uri, None)
+                .await
+                .unwrap();
+            assert_eq!(embedding_model(&ds).unwrap(), model);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_memory_is_stamped_with_its_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let e5 = EmbeddingModel::MultilingualE5Small;
+        let ds = create_empty(&table_uri(&dir.path().to_string_lossy()), e5)
+            .await
+            .unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 0);
+        assert_eq!(embedding_model(&ds).unwrap(), e5);
+    }
+
     async fn turn_uuids(mut scan: lance::dataset::scanner::Scanner) -> Vec<String> {
         scan.project(&["turn_uuid"]).unwrap();
         let batches: Vec<RecordBatch> = scan.try_into_stream().await.unwrap().try_collect().await.unwrap();
@@ -915,15 +1018,15 @@ mod tests {
             .uuid;
 
         let compactions = std::sync::Mutex::new(Vec::new());
-        for i in 0..=COMPACT_DELTAS {
-            if i == COMPACT_DELTAS {
-                assert_eq!(sub_index_counts(&ds).await.unwrap()[FTS_INDEX], 1 + COMPACT_DELTAS);
+        for i in 0..=MERGE_DELTAS {
+            if i == MERGE_DELTAS {
+                assert_eq!(sub_index_counts(&ds).await.unwrap()[FTS_INDEX], 1 + MERGE_DELTAS);
                 assert!(compactions.lock().unwrap().is_empty(), "merged below the threshold");
             }
             ds.append(batch(&format!("charlie delta {i}")), None).await.unwrap();
             let subs = sub_index_counts(&ds).await.unwrap()[FTS_INDEX];
             optimize_index(&mut ds, FTS_INDEX, subs, |event| {
-                if let IndexBuildEvent::Compacting { index, deltas } = event {
+                if let IndexBuildEvent::MergingDeltas { index, deltas } = event {
                     compactions.lock().unwrap().push((index, deltas));
                 }
             })
@@ -939,7 +1042,7 @@ mod tests {
         );
         assert_eq!(
             compactions.into_inner().unwrap(),
-            [(FTS_INDEX.to_string(), COMPACT_DELTAS)]
+            [(FTS_INDEX.to_string(), MERGE_DELTAS)]
         );
     }
 
@@ -963,13 +1066,13 @@ mod tests {
             .find(|i| i.name == FTS_INDEX)
             .unwrap()
             .uuid;
-        for run in 0..COMPACT_DELTAS {
+        for run in 0..MERGE_DELTAS {
             ds.append(reader(embedded(&turns(TRAINABLE + run, 1))), None)
                 .await
                 .unwrap();
             build_indexes(&mut ds, |_| {}).await.unwrap();
         }
-        assert_eq!(sub_index_counts(&ds).await.unwrap()[FTS_INDEX], 1 + COMPACT_DELTAS);
+        assert_eq!(sub_index_counts(&ds).await.unwrap()[FTS_INDEX], 1 + MERGE_DELTAS);
         // The next refresh merges the deltas, so it has to read this broken one.
         let indices = ds.load_indices().await.unwrap();
         let delta = indices
@@ -982,7 +1085,7 @@ mod tests {
             std::fs::write(file.unwrap().path(), b"corrupt").unwrap();
         }
 
-        ds.append(reader(embedded(&turns(TRAINABLE + COMPACT_DELTAS, 1))), None)
+        ds.append(reader(embedded(&turns(TRAINABLE + MERGE_DELTAS, 1))), None)
             .await
             .unwrap();
         let built = std::sync::Mutex::new(Vec::new());
@@ -992,9 +1095,9 @@ mod tests {
         assert!(matches!(
             built.into_inner().unwrap().as_slice(),
             [
-                IndexBuildEvent::Compacting { index: fts, deltas: COMPACT_DELTAS },
+                IndexBuildEvent::MergingDeltas { index: fts, deltas: MERGE_DELTAS },
                 IndexBuildEvent::Building("text search index"),
-                IndexBuildEvent::Compacting { index: vector, deltas: COMPACT_DELTAS },
+                IndexBuildEvent::MergingDeltas { index: vector, deltas: MERGE_DELTAS },
             ] if fts == FTS_INDEX && vector == VECTOR_INDEX
         ));
         assert_eq!(
@@ -1082,7 +1185,7 @@ mod tests {
     #[test]
     fn build_batch_preserves_rows_without_embeddings() {
         let chunks = chunk::chunks_from_turns(&turns(0, 3), &chunk::Tier::ALL, true);
-        let pending = build_batch(&chunks, None).unwrap();
+        let pending = build_batch(model::ENGLISH, &chunks, None).unwrap();
         let embedded = embedded(&turns(0, 3));
         assert_eq!(pending.num_rows(), 3);
         for (i, field) in pending.schema().fields().iter().enumerate() {
@@ -1100,7 +1203,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uri = table_uri(&dir.path().to_string_lossy());
         let chunks = chunk::chunks_from_turns(&turns(0, 3), &chunk::Tier::ALL, true);
-        let unembedded = build_batch(&chunks, None).unwrap();
+        let unembedded = build_batch(model::ENGLISH, &chunks, None).unwrap();
         let ds = Dataset::write(reader(unembedded), &uri, Some(WriteParams::default()))
             .await
             .unwrap();
@@ -1146,7 +1249,7 @@ mod tests {
     fn schema_column_order_is_load_bearing() {
         // Column order must match build_batch's array order exactly, or Lance writes the
         // wrong column. Pin it so a reorder can't slip through.
-        let s = schema();
+        let s = schema(model::ENGLISH);
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,

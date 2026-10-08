@@ -84,9 +84,7 @@ async fn root_readme(repo: &HFRepository<RepoTypeDataset>) -> Option<String> {
 async fn recall_with_unpushed(uri: &str, query: &str) -> String {
     let memory = Memory::parse(uri);
     let quiet = |_: &str| ();
-    let search = recall::Search::new(query.into(), 30, Default::default(), &quiet)
-        .await
-        .unwrap();
+    let search = recall::Search::new(query.into(), 30, Default::default()).unwrap();
     let mut pools = vec![search.candidates(&memory, &quiet).await.unwrap()];
     pools.extend(funes::commands::mcp::unpushed(&search, &memory).await.unwrap());
     let (note, hits) = search.rank(pools, 5, 0, &quiet).await.unwrap();
@@ -167,9 +165,9 @@ async fn push_round_trip_create_append_recall() {
         .await
         .expect("querying the remote for the declined scratch path");
 
-    // create (first publish): accept the same gate → grow → append (data-only, no reindex) → recall
-    // both. The appended turn is left unindexed, so recalling it back exercises Lance's brute-force
-    // fallback. Then force a reindex and recall it again, now served by the index.
+    // create (first publish): accept the same gate → grow → append (data-only, no compaction) →
+    // recall both. The appended turn is left unindexed, so recalling it back exercises Lance's
+    // brute-force fallback. Then force a compaction and recall it again, now served by the index.
     let create = funes::commands::push::run_push(Memory::parse(&uri), false, Confirm::Ask(accept), &[]).await;
     write_session(
         src.path(),
@@ -188,11 +186,11 @@ async fn push_round_trip_create_append_recall() {
     let prompts_after_append = PROMPTS.load(Ordering::SeqCst);
     let recall_base = recall_remote(&uri, "SYNCSMOKE parsing").await;
     let recall_new = recall_remote(&uri, "SYNCSMOKE2 continuation").await;
-    // Nothing new to push, so this is a pure forced reindex: fold the unindexed appended turn into
-    // the index as its own commit (capture_reindex + a separate commit), then recall it again.
-    let reindex = funes::commands::push::run_push(Memory::parse(&uri), true, Confirm::Yes, &[]).await;
-    let recall_reindexed = recall_remote(&uri, "SYNCSMOKE2 continuation").await;
-    let versions_reindexed = match Memory::parse(&uri).open().await {
+    // Nothing new to push, so this is a pure forced compaction: fold the unindexed appended turn
+    // into the index in commits of its own, then recall it again.
+    let compaction = funes::commands::push::run_push(Memory::parse(&uri), true, Confirm::Yes, &[]).await;
+    let recall_compacted = recall_remote(&uri, "SYNCSMOKE2 continuation").await;
+    let versions_compacted = match Memory::parse(&uri).open().await {
         Ok(ds) => ds.versions().await.map(|v| v.len()).unwrap_or(0),
         Err(_) => 0,
     };
@@ -310,16 +308,16 @@ async fn push_round_trip_create_append_recall() {
         recall_new.contains("SYNCSMOKE2"),
         "remote recall should surface the appended turn: {recall_new}"
     );
-    let reindex = reindex.expect("force reindex").report;
+    let compaction = compaction.expect("forced compaction").report;
     assert!(
-        reindex.contains("reindexed"),
-        "force-reindex should commit an index delta: {reindex}"
+        compaction.contains("compacted"),
+        "a forced compaction should commit an index delta: {compaction}"
     );
     assert!(
-        recall_reindexed.contains("SYNCSMOKE2"),
-        "remote recall should still surface the turn after reindex: {recall_reindexed}"
+        recall_compacted.contains("SYNCSMOKE2"),
+        "remote recall should still surface the turn after compaction: {recall_compacted}"
     );
-    assert_eq!(versions_reindexed, 1, "the reindex deletes the old versions");
+    assert_eq!(versions_compacted, 1, "the compaction deletes the old versions");
     let mut published = 0;
     for (who, r) in [("a", race_a), ("b", race_b)] {
         let report = r.unwrap_or_else(|e| panic!("racing push {who} failed: {e}")).report;
@@ -378,7 +376,7 @@ async fn push_round_trip_create_append_recall() {
     );
     assert_eq!(
         remote_model.as_deref(),
-        Some(funes::memory::dataset::MODEL),
+        Some(funes::memory::dataset::model::ENGLISH.id()),
         "the model id should travel with the memory via push"
     );
     assert_eq!(

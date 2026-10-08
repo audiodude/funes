@@ -137,6 +137,36 @@ recalled while embeddings are still pending. Later turns or another `funes index
 In a terminal, funes may offer to finish the remaining work. You can decline and keep the progress
 already made. Explicit imports have no time limit.
 
+## Compaction
+
+A run that writes rows or vectors ends by compacting the memory, and prints `compacting the memory…`
+when it does. It merges the small fragments no index covers yet, adds their rows to the search
+indexes, and deletes the versions older than ten minutes. Recall time grows with the number of
+fragments, so past 256 small indexed fragments a run rewrites them all. A run that writes nothing
+still compacts a memory left fragmented, or one whose text index misses rows.
+[storage.md](storage.md#maintenance) has the details.
+
+`funes compact` runs the same steps on demand, on any memory:
+
+```bash
+funes compact                  # your local memory
+funes compact ./other-memory   # a local memory at a path
+funes compact <org>/<repo>     # a remote memory (or a full hf://… URI)
+```
+
+On a remote memory it needs write access, and deletes every old version. A push also compacts its
+remote on its own, once 500 rows sit unindexed there. To compact a large remote, download it first
+with `hf download <org>/<repo> --repo-type dataset`: as long as nothing is pushed in between, the
+compaction then reads its files from that cache instead of fetching them one at a time.
+
+## Sessions not in English
+
+funes embeds with `BAAI/bge-small-en-v1.5`, an English model. For sessions in another language,
+answer multilingual when the first `funes add` asks, or create the local memory with
+`funes index --multilingual` before anything is indexed: it embeds with
+`intfloat/multilingual-e5-small`, and its keyword search splits Chinese and Japanese text into
+words. A memory keeps the model it was created with.
+
 ## Flags
 
 | Flag | Meaning |
@@ -146,6 +176,7 @@ already made. Explicit imports have no time limit.
 | `--limit <N>` | Index only the most recent N sessions per source. Omit to index all. A Hub repo ignores it and indexes every shard. |
 | `--no-thinking` | Exclude thinking blocks. |
 | `--yes` | Don't ask: a budgeted (no-path) run finishes all remaining work; an explicit path skips the first-index size confirmation. |
+| `--multilingual` | Create the local memory with `intfloat/multilingual-e5-small`, for sessions not in English. Refused when the local memory exists with the English model. |
 
 ## See also
 

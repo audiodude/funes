@@ -8,17 +8,17 @@
 //! only chunks whose id is new — a grown session (the same memory) contributes just its new turns,
 //! nothing is re-embedded or deleted.
 
+use super::compact;
 use crate::chunk::{self, Tier};
 use crate::hub;
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, schema};
+use crate::memory::dataset::{self, build_batch, model, schema};
 use crate::memory::lock;
 use crate::memory::{Memory, MemoryState};
 use crate::scan;
 use crate::traces::spool;
 use crate::traces::{self, omp, repo, source};
-use crate::ui;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_array::{Array, RecordBatchIterator, StringArray, UInt64Array};
 use futures::TryStreamExt;
 use lance::dataset::{Dataset, WriteParams, ROW_ID};
@@ -59,6 +59,30 @@ async fn acquire_lock(interactive: bool) -> Result<lock::MemoryLock> {
         }
     }
     Err(IndexBusy.into())
+}
+
+pub async fn local_memory_model() -> Result<Option<inference::EmbeddingModel>> {
+    match dataset::open(&dataset::table_uri(&dataset::local_memory_dir()), HashMap::new()).await {
+        Ok(ds) => Ok(Some(dataset::embedding_model(&ds)?)),
+        Err(_) => Ok(None),
+    }
+}
+
+pub async fn ensure_local_memory(model: inference::EmbeddingModel) -> Result<()> {
+    std::fs::create_dir_all(dataset::funes_dir())?;
+    let _lock = acquire_lock(std::io::stdin().is_terminal()).await?;
+    match local_memory_model().await? {
+        Some(current) if current != model => Err(anyhow!(
+            "the local memory is embedded with {}, not {}: a memory keeps the model it was created with",
+            current.id(),
+            model.id()
+        )),
+        Some(_) => Ok(()),
+        None => {
+            dataset::create_empty(&dataset::table_uri(&dataset::local_memory_dir()), model).await?;
+            Ok(())
+        }
+    }
 }
 
 /// Every chunk id already stored. Re-indexing keeps only the chunks whose id isn't here, so a grown
@@ -541,7 +565,7 @@ struct Indexer {
     omp_previous: HashMap<String, OmpReceipt>,
     omp_max_chunks: Option<usize>,
     batch_scanner: ScannerState,
-    /// The memory didn't exist when this run opened it — the first index.
+    /// The memory held no rows when this run opened it — the first index.
     first_index: bool,
     /// A human is watching (stdin is a terminal) — probed once here, so every prompt-or-proceed
     /// choice in a run agrees.
@@ -605,13 +629,26 @@ impl Indexer {
         let _lock = acquire_lock(interactive).await?;
 
         let uri = dataset::table_uri(&dataset::local_memory_dir());
-        let ds = writable_dataset(Memory::local().state().await?)?;
+        // A classified-empty local memory may still hold an empty dataset whose schema pins the
+        // embedding model chosen at creation; reopen it so the model survives the first write.
+        let ds = match writable_dataset(Memory::local().state().await?)? {
+            Some(ds) => Some(ds),
+            None => dataset::open(&uri, HashMap::new()).await.ok(),
+        };
 
-        let first_index = ds.is_none();
+        let model = match &ds {
+            Some(ds) => dataset::embedding_model(ds)?,
+            None => model::ENGLISH,
+        };
+        let existing = match &ds {
+            Some(d) => stored_ids(d).await?,
+            None => HashSet::new(),
+        };
+        let first_index = existing.is_empty();
 
         // Incremental state: path -> {change stamp, level/refusal}; an unreadable or old-schema file →
-        // empty. A first index (memory missing) owes everything, whatever an old state.json says — a
-        // stale one would silently skip every unit against the empty memory.
+        // empty. A first index (memory missing or empty) owes everything, whatever an old state.json
+        // says — a stale one would silently skip every unit against the empty memory.
         let state_path = dir.join("state.json");
         let coverage_path = dir.join("index-coverage.json");
         let mut state: HashMap<String, UnitState> = if first_index {
@@ -629,13 +666,8 @@ impl Indexer {
             read_omp_receipts(&omp_receipts_path)?
         };
 
-        let embedder: Box<dyn Embedder> = inference::embedder()?;
+        let embedder: Box<dyn Embedder> = inference::embedder(model)?;
         let scanner = find_scanner();
-
-        let existing = match &ds {
-            Some(d) => stored_ids(d).await?,
-            None => HashSet::new(),
-        };
 
         let units = collect_units(&sources)?;
         if !no_thinking {
@@ -964,7 +996,7 @@ impl Indexer {
             t0.elapsed().as_secs_f64()
         );
 
-        let batch = build_batch(new_chunks, Some(&vectors))?;
+        let batch = build_batch(self.embedder.model(), new_chunks, Some(&vectors))?;
         self.append(batch).await?;
         self.existing.extend(new_chunks.iter().map(|c| c.id.clone()));
         self.n_embedded += n as u64;
@@ -976,13 +1008,14 @@ impl Indexer {
         if chunks.is_empty() {
             return Ok(0);
         }
-        self.append(build_batch(chunks, None)?).await?;
+        let model = self.embedder.model();
+        self.append(build_batch(model, chunks, None)?).await?;
         self.existing.extend(chunks.iter().map(|c| c.id.clone()));
         Ok(chunks.len() as u64)
     }
 
     async fn append(&mut self, batch: arrow_array::RecordBatch) -> Result<()> {
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema(self.embedder.model()));
         let uri = self.uri.clone();
         match &mut self.ds {
             Some(d) => {
@@ -1026,19 +1059,7 @@ impl Indexer {
                 || dataset::fts_needs_refresh(d).await?
                 || dataset::fragments_to_compact(d).await? > 0
             {
-                dataset::compact_fragments(d, ui::index_progress).await?;
-                dataset::build_indexes(d, ui::index_progress).await?;
-
-                // Reap superseded versions — best-effort; on failure the reap waits for next run.
-                match d.cleanup_old_versions(chrono::Duration::minutes(10), None, None).await {
-                    Ok(stats) if stats.bytes_removed > 0 => eprintln!(
-                        "reclaimed {:.1} MB from {} old version(s)",
-                        stats.bytes_removed as f64 / 1e6,
-                        stats.old_versions
-                    ),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("note: version cleanup skipped — {e}"),
-                }
+                compact::compact_local(d).await?;
             }
         }
         if !self.omp_pending.is_empty() {
@@ -1718,7 +1739,11 @@ mod tests {
     }
 
     impl Embedder for TestEmbedder {
-        fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        fn model(&self) -> inference::EmbeddingModel {
+            model::ENGLISH
+        }
+
+        fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.texts.extend(texts.iter().map(|text| text.to_string()));
             Ok(vec![vec![1.0; dataset::DIM as usize]; texts.len()])
         }
@@ -1748,7 +1773,10 @@ mod tests {
                 })
             })
             .collect();
-        let reader = RecordBatchIterator::new([Ok(build_batch(&chunks, None).unwrap())], schema());
+        let reader = RecordBatchIterator::new(
+            [Ok(build_batch(model::ENGLISH, &chunks, None).unwrap())],
+            schema(model::ENGLISH),
+        );
         Dataset::write(reader, path.to_str().unwrap(), None).await.unwrap()
     }
 

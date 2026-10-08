@@ -4,7 +4,7 @@
 
 use super::{push, recall};
 use crate::agents::{self, registry};
-use crate::memory::Memory;
+use crate::memory::{Memory, MemoryState};
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -221,9 +221,7 @@ impl Funes {
                     since,
                     until,
                 },
-                &quiet,
-            )
-            .await?;
+            )?;
             // The server's own memory, as it will be after this host's next push. The local search
             // runs while the remote one waits on the network.
             let (read, owed) = tokio::join!(search.candidates(&memory, &quiet), async {
@@ -431,6 +429,10 @@ pub async fn unpushed(search: &recall::Search, memory: &Memory) -> Result<Option
     let Some(pushed) = push::load_pushed(uri) else {
         return Ok(None);
     };
+    // A local memory with no rows has nothing unpushed, and searching it is an error.
+    if !matches!(Memory::local().state().await?, MemoryState::Ready(_)) {
+        return Ok(None);
+    }
     let mut pool = search.candidates(&Memory::local(), &|_| ()).await?;
     pool.retain(|h| !pushed.contains(&h.id));
     Ok(Some(pool))

@@ -5,8 +5,9 @@
 //! `$FUNES_HOME` or `~/.funes`.
 
 use funes::agents::{self, registry};
-use funes::commands::{ask, index, mcp, push, recall, scrub, sketch, update};
+use funes::commands::{ask, compact, index, mcp, push, recall, scrub, sketch, update};
 use funes::hub;
+use funes::inference::EmbeddingModel;
 use funes::memory;
 use funes::traces::spool;
 
@@ -92,7 +93,7 @@ enum Cmd {
         #[command(subcommand)]
         agent: AskAgent,
     },
-    /// Build or update your local memory from session transcripts.
+    /// Build or update your local memory from session transcripts, then compact it.
     Index {
         /// A `.funes.jsonl` turns file (or a directory of them), a `.parquet` file, or a Hub
         /// trace repo `<org>/<repo>`. Omit — in a terminal — to index every integration's spool
@@ -120,6 +121,10 @@ enum Cmd {
         /// Limit new chunks embedded this invocation (positive; explicit --harness omp only).
         #[arg(long)]
         omp_max_chunks: Option<usize>,
+        /// Create the local memory with the multilingual embedding model, for sessions not in English.
+        /// A memory keeps the model it was created with, so an existing English memory refuses it.
+        #[arg(long, conflicts_with = "check")]
+        multilingual: bool,
     },
     /// Find a literal string everywhere in one session — exhaustive, unranked.
     Scan {
@@ -193,14 +198,24 @@ enum Cmd {
         /// Skip the confirmation when the target holds none of the chunks to publish.
         #[arg(short, long)]
         yes: bool,
-        /// Refresh the remote index after pushing (retrying on conflict) even if the unindexed
-        /// backlog is below the auto-reindex threshold. With nothing new to push, reindex only.
-        #[arg(long)]
-        force_reindex: bool,
+        /// Compact the remote after pushing (retrying on conflict) even if the unindexed backlog is
+        /// below the auto-compaction threshold. With nothing new to push, compact only.
+        #[arg(long, alias = "force-reindex")]
+        compact: bool,
         /// Publish embedded chunks from these sessions. Omit to publish every embedded chunk the
         /// remote does not already hold.
         #[arg(long, value_name = "SESSION")]
         sessions: Vec<String>,
+    },
+    /// Compact a memory: merge its small fragments, add its unindexed rows to the search indexes, and
+    /// delete its old versions.
+    ///
+    /// `funes index` and `funes push` also compact on their own.
+    Compact {
+        /// Memory to compact: a local path, `<org>/<repo>`, or a full `hf://…` URI. Omit for your
+        /// local memory.
+        #[arg(value_name = "MEMORY")]
+        memory: Option<String>,
     },
     /// Redact secrets from your local memory in place — for rows indexed before redaction existed (or
     /// flagged by an updated ruleset); needs no source transcript. Cleans the local memory only: it
@@ -462,6 +477,7 @@ async fn run(cli: Cli) -> Result<()> {
             limit,
             yes,
             omp_max_chunks,
+            multilingual,
         } => {
             let is_omp = harness.as_deref() == Some("omp");
             anyhow::ensure!(
@@ -493,6 +509,9 @@ async fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             if is_omp {
+                if multilingual {
+                    index::ensure_local_memory(memory::dataset::model::MULTILINGUAL).await?;
+                }
                 return index::run_index_omp(
                     Path::new(path.as_ref().expect("OMP path checked")),
                     no_thinking,
@@ -515,6 +534,9 @@ async fn run(cli: Cli) -> Result<()> {
                     let memory::Memory::Remote { uri } = memory::Memory::parse(&p) else {
                         return Err(anyhow!("expected a Hub repo, got {p:?}"));
                     };
+                    if multilingual {
+                        index::ensure_local_memory(memory::dataset::model::MULTILINGUAL).await?;
+                    }
                     return index::run_index_remote(&uri, no_thinking).await;
                 }
                 (Some(p), _) => return Err(anyhow!("no such path: {p}")),
@@ -544,6 +566,9 @@ async fn run(cli: Cli) -> Result<()> {
                     spool::spools()
                 }
             };
+            if multilingual {
+                index::ensure_local_memory(memory::dataset::model::MULTILINGUAL).await?;
+            }
             if roots.is_empty() {
                 println!(
                     "no agent converts its sessions here yet — `funes add <agent>` sets that up, \
@@ -572,7 +597,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Push {
             memory: remote,
             yes,
-            force_reindex,
+            compact,
             sessions,
         } => {
             let confirm = if yes {
@@ -580,7 +605,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 push::Confirm::Ask(prompt_new_memory)
             };
-            match push::run_push(memory::Memory::parse(&remote), force_reindex, confirm, &sessions).await {
+            match push::run_push(memory::Memory::parse(&remote), compact, confirm, &sessions).await {
                 Ok(pushed) => {
                     print!("{}", pushed.report);
                     // Secrets held back everything — surface a non-zero exit so automation can react.
@@ -591,6 +616,20 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 Err(e) if push::is_read_only(&e) => Err(anyhow!(
                     "{remote} is read-only for your token — recall can read it, but publishing needs write access (check your HF token)"
+                )),
+                Err(e) => Err(e),
+            }
+        }
+        Cmd::Compact { memory } => {
+            let target = memory::Memory::resolve(memory);
+            let label = target.label();
+            match compact::run(target).await {
+                Ok(report) => {
+                    print!("{report}");
+                    Ok(())
+                }
+                Err(e) if push::is_read_only(&e) => Err(anyhow!(
+                    "{label} is read-only for your token — compacting it needs write access (check your HF token)"
                 )),
                 Err(e) => Err(e),
             }
@@ -819,6 +858,8 @@ async fn remove_agent(id: &str) -> Result<()> {
 /// them, since its contract decides which releases they take; one this host cannot replace does not
 /// hold them back.
 async fn update_funes(force: bool) -> Result<()> {
+    // First: an older release that just replaced its binary hands over to this `funes update`.
+    update::wait_for_older_writers().await?;
     let binary = update::run(force).await;
     if let Ok(Some(exe)) = &binary {
         let e = Command::new(exe).arg("update").exec();
@@ -916,20 +957,15 @@ async fn resolve_add_memory(memory: Option<String>) -> Result<Option<Resolved>> 
     }
 }
 
-/// Validate an explicitly-named memory: fine if it exists; offer to create it if missing (default
-/// **no**, to catch typos); warn but proceed if the Hub is unreachable. Returns whether it created
-/// the repo.
+/// Validate an explicitly-named memory: fine if it exists or the Hub is unreachable; offer to create
+/// it if missing (default **no**, to catch typos). Returns whether it created the repo.
 async fn ensure_remote_exists(remote: &str) -> Result<bool> {
     let target = memory::Memory::parse(remote);
     let memory::Memory::Remote { uri } = &target else {
         return Ok(false); // a local path — nothing to check on the Hub
     };
     match memory::remote_reachability(uri).await {
-        memory::Reachability::Ok => Ok(false),
-        memory::Reachability::Offline => {
-            eprintln!("note: can't reach {remote} right now — proceeding; it'll be used once it's back.");
-            Ok(false)
-        }
+        memory::Reachability::Ok | memory::Reachability::Offline => Ok(false),
         memory::Reachability::Missing => {
             let (owner, name, _) = hub::parse_hf(uri)?;
             if std::io::stdin().is_terminal()
@@ -1023,12 +1059,77 @@ fn parse_confirm(input: &str, default_yes: bool) -> bool {
     }
 }
 
+/// The embedding model `memory` records, `None` when it holds no dataset or is unreachable.
+/// When the local memory `takes` its model from it, a memory whose model can't be read is an error:
+/// a guess could pin the local memory to another model.
+async fn bound_model(memory: &str, takes: bool) -> Result<Option<EmbeddingModel>> {
+    let target = memory::Memory::parse(memory);
+    async {
+        let ds = match target.state().await? {
+            memory::MemoryState::Ready(ds) => ds,
+            // A dataset with no rows still records its model.
+            memory::MemoryState::Empty => match target.open().await {
+                Ok(ds) => ds,
+                Err(_) => return Ok(None),
+            },
+            memory::MemoryState::Offline if takes => bail!(
+                "it is unreachable, and the local memory takes its embedding model: run `funes add` again once it is back"
+            ),
+            memory::MemoryState::Offline => {
+                eprintln!("note: can't reach {memory} right now — proceeding; it'll be used once it's back.");
+                return Ok(None);
+            }
+            memory::MemoryState::Unauthorized if takes => return Err(target.unauthorized_error()),
+            _ => return Ok(None),
+        };
+        memory::dataset::embedding_model(&ds).map(Some)
+    }
+    .await
+    .with_context(|| format!("can't read {memory}"))
+}
+
+fn ask_model(default: EmbeddingModel) -> EmbeddingModel {
+    let choices = if default == memory::dataset::model::MULTILINGUAL {
+        "[e/M]"
+    } else {
+        "[E/m]"
+    };
+    eprint!("Index your sessions as English, or multilingual for other languages too? {choices} ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    parse_model(&answer, default)
+}
+
+fn parse_model(input: &str, default: EmbeddingModel) -> EmbeddingModel {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "e" | "english" => memory::dataset::model::ENGLISH,
+        "m" | "multilingual" => memory::dataset::model::MULTILINGUAL,
+        _ => default,
+    }
+}
+
+fn host_model() -> EmbeddingModel {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()));
+    model_for_locale(locale.as_deref())
+}
+
+fn model_for_locale(locale: Option<&str>) -> EmbeddingModel {
+    let language = locale.and_then(|l| l.split(['_', '.', '@']).next()).unwrap_or_default();
+    match language.to_ascii_lowercase().as_str() {
+        "" | "c" | "posix" | "en" => memory::dataset::model::ENGLISH,
+        _ => memory::dataset::model::MULTILINGUAL,
+    }
+}
+
 /// `funes add <agent> [memory]`: bootstrap the one-time steps the hooks can't do unattended,
 /// around the integration's own `setup add` (converts the agent's history into its spool,
 /// registers hooks + MCP).
 ///
-/// 1. on a first add (no local memory yet), ask — the first index is about a minute of work, and
-///    declining aborts the add before anything is installed, so nothing is wired up;
+/// 1. on a first add (no rows in the local memory yet), ask — the first index is about a minute of
+///    work, and declining aborts the add before anything is installed, so nothing is wired up;
 /// 2. `install` — writes the spool, bakes the memory in;
 /// 3. build the first index from that spool, so recall and the push have content;
 /// 4. first push if a memory is bound — clears the overlap guard so the push hook works thereafter.
@@ -1037,7 +1138,23 @@ where
     F: FnOnce(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let first_add = memory::Memory::local().open().await.is_err();
+    let local = index::local_memory_model().await?;
+    let bound = match &resolved {
+        Some(Resolved { memory, .. }) => bound_model(memory, local.is_none())
+            .await?
+            .map(|model| (memory.as_str(), model)),
+        None => None,
+    };
+    if let (Some((memory, there)), Some(here)) = (bound, local) {
+        if there != here {
+            bail!(
+                "{memory} is embedded with {}, and the local memory with {}: a memory takes one embedding model",
+                there.id(),
+                here.id()
+            );
+        }
+    }
+    let first_add = !matches!(memory::Memory::local().state().await, Ok(memory::MemoryState::Ready(_)));
     if first_add
         && !confirm(
             &format!("funes will index your existing {agent} sessions, if any, so recall works (about a minute). Proceed? [Y/n] "),
@@ -1047,24 +1164,41 @@ where
         eprintln!("funes: skipped — nothing was wired up. Run `funes add {agent}` again when you're ready.");
         return Ok(());
     }
+    if local.is_none() {
+        let model = match bound {
+            Some((memory, model)) => {
+                eprintln!(
+                    "funes: embedding the local memory with {}, the model of {memory}.",
+                    model.id()
+                );
+                model
+            }
+            None if std::io::stdin().is_terminal() => ask_model(host_model()),
+            None => {
+                let model = host_model();
+                eprintln!(
+                    "funes: embedding the local memory with {}, this host's default off a terminal.",
+                    model.id()
+                );
+                model
+            }
+        };
+        index::ensure_local_memory(model).await?;
+    }
     install(resolved.as_ref().map(|r| r.memory.clone())).await?;
     if first_add {
         seed_local_index(agent).await;
     }
-    // First push only when there's actually a local index to publish. Without one (a failed first
-    // build, or no sessions yet) there's nothing to push, and running it would just error on the
-    // absent memory.
+    // A memory at a local path is read where it is: push only publishes to the Hub.
     if let Some(Resolved { memory, created }) = resolved {
-        if memory::Memory::local().open().await.is_ok() {
+        if matches!(memory::Memory::parse(&memory), memory::Memory::Remote { .. }) {
             // The integration is in place by now; only the push is owed, and it takes a terminal.
             first_push(&memory, created).await.with_context(|| {
                 format!(
                     "funes is added to {agent}, bound to {memory}, but the first push there did not go \
-                     through — run `funes push {memory}` at a terminal once it is reachable"
+                     through — run `funes push {memory}` at a terminal to publish there"
                 )
             })?;
-        } else {
-            eprintln!("funes: nothing indexed yet — nothing to publish to {memory} yet.");
         }
     }
     Ok(())
@@ -1198,7 +1332,41 @@ fn prompt_new_memory(label: &str, chunks: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_confirm;
+    use super::{model_for_locale, parse_confirm, parse_model, Cli, Cmd};
+    use clap::Parser;
+    use funes::memory::dataset::model::{ENGLISH, MULTILINGUAL};
+
+    #[test]
+    fn an_answer_names_the_model_and_anything_else_takes_the_default() {
+        for default in [ENGLISH, MULTILINGUAL] {
+            for answer in ["\n", "nope"] {
+                assert_eq!(parse_model(answer, default), default, "{answer:?}");
+            }
+            for answer in ["e", "English\n"] {
+                assert_eq!(parse_model(answer, default), ENGLISH, "{answer:?}");
+            }
+            for answer in ["m\n", " M ", "multilingual"] {
+                assert_eq!(parse_model(answer, default), MULTILINGUAL, "{answer:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_locale_in_another_language_than_english_defaults_to_multilingual() {
+        for locale in [
+            None,
+            Some("C"),
+            Some("C.UTF-8"),
+            Some("POSIX"),
+            Some("en_US.UTF-8"),
+            Some("en"),
+        ] {
+            assert_eq!(model_for_locale(locale), ENGLISH, "{locale:?}");
+        }
+        for locale in ["zh_CN.UTF-8", "fr_FR", "ja_JP.eucJP", "de_DE@euro", "pt"] {
+            assert_eq!(model_for_locale(Some(locale)), MULTILINGUAL, "{locale}");
+        }
+    }
 
     #[test]
     fn parse_confirm_honors_default_and_answers() {
@@ -1212,5 +1380,13 @@ mod tests {
         // Anything unrecognized is a conservative no, even under a yes default.
         assert!(!parse_confirm("nope", true));
         assert!(!parse_confirm("maybe", true));
+    }
+
+    #[test]
+    fn push_still_takes_force_reindex() {
+        for flag in ["--compact", "--force-reindex"] {
+            let cli = Cli::try_parse_from(["funes", "push", "org/memory", flag]).unwrap();
+            assert!(matches!(cli.cmd, Cmd::Push { compact: true, .. }), "{flag}");
+        }
     }
 }

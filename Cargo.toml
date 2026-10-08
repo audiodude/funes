@@ -1,6 +1,6 @@
 [package]
 name = "funes"
-version = "1.6.0+dev"
+version = "1.7.0+dev"
 edition = "2021"
 description = "Recall over your past AI agent sessions — the man who forgets nothing, with discrimination."
 license = "Apache-2.0"
@@ -40,13 +40,9 @@ walkdir = "2"                    # recursive *.jsonl walk
 rmcp = { version = "3", features = ["server", "macros", "transport-io", "schemars"] }  # MCP stdio server
 tempfile = "3"                   # temp dir for the pre-publish secret scan; temp files/dirs in tests
 hf-hub = { version = "1.0.0", features = ["rustls-tls", "blocking"] }  # native create_commit + parent_commit CAS + Xet upload; blocking: model download in the blas backend
-# Optional handle on the transitively-pulled openssl-sys (native-tls, via lance).
-# The `vendored-openssl` feature builds OpenSSL from source so the aarch64-linux cross-build
-# needs no target sysroot. Off by default — native and macOS builds keep their system TLS.
-openssl-sys = { version = "0.9", optional = true }
 # The `blas` backend (feature below): a from-scratch forward that loads safetensors weights
 # and tokenizes itself. macOS runs it on Accelerate, Linux on faer.
-tokenizers = { version = "0.22", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }  # onig: the reranker's normalizer is a regex
 safetensors = { version = "0.8", optional = true }
 
 # The `blas` backend's Linux seam. Both are pure Rust with runtime CPU dispatch, so release
@@ -57,7 +53,6 @@ multiversion = { version = "0.8", optional = true }  # per-CPU clones of the vec
 
 [features]
 default = ["blas"]
-vendored-openssl = ["openssl-sys/vendored"]
 # BLAS inference backend (src/inference/blas.rs), the default: macOS wires it to Accelerate (see build.rs),
 # Linux to faer + a polynomial exp.
 blas = ["dep:tokenizers", "dep:safetensors", "dep:faer", "dep:multiversion"]
