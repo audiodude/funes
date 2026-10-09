@@ -479,3 +479,21 @@ fmt and clippy (`-D warnings`) pass, and all 405 tests across 52 suites pass.
 `/tmp`. `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return
 early. No `funes update`, release tag/artifact, Hugging Face upload, or memory
 publication is part of this refresh. AI-assisted by Claude.
+
+### October 9, 2026 OMP 18.8.7 stable consumer refresh
+
+The isolated `update-stable1887` branch starts from custom revision
+`626a8b5ffaed2f00da5f066cdd4253310e67422f` (`update-stable1884`); origin had no
+newer commits. Upstream `huggingface/funes` main (`727d2f1`, the `1.8.0+dev`
+version bump after tagging `v1.8.0` at the previously merged `b04007f`) merged
+without conflicts. `cargo update` changed only `indoc` 2.0.8 and `tokio-util`
+0.7.20. The custom source protocol, OMP normalization and `--harness omp`
+indexing path are unchanged.
+
+Verification uses the Cargo commands above with lld, dev opt-level 1, no debug
+info or incremental compilation, `RUST_MIN_STACK=16777216`, and one test thread:
+fmt and clippy (`-D warnings`) pass, and all 405 tests pass.
+`add_fifth_integration` ran against Arch's Expect 5.45.4 extracted under
+`/tmp`. `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return
+early. No `funes update`, release tag/artifact, Hugging Face upload, or memory
+publication is part of this refresh. AI-assisted by Claude.
