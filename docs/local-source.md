@@ -516,3 +516,23 @@ across 52 suites pass. `add_fifth_integration` ran against Arch's Expect 5.45.4
 stays empty, so credential-gated Hub tests return early. No `funes update`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### October 12, 2026 OMP 18.10.1 stable consumer refresh
+
+The isolated `update-stable18101` branch starts from custom revision
+`976c897b2010f93f3793f2b1ca068d4526520376` (`update-stable1891`). It merges
+upstream `huggingface/funes` main `93e6999` (Metal GPU embedding on macOS and
+macOS CI); the only conflict was `Cargo.lock`, re-resolved from ours. `cargo
+update` changed `cc` 1.8.0, `litrs` 1.0.1, `serde_json` 1.0.154, `syn` 3.0.8
+and `unicode-ident` 1.0.27. The custom source protocol, OMP normalization and
+`--harness omp` indexing path are unchanged; the new macOS-only dependencies do
+not build on Linux.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` passes all 405
+tests across 48 suites. `add_fifth_integration` needs the `/tmp`-extracted Arch
+Expect 5.45.4 on both `PATH` and `LD_LIBRARY_PATH`
+(`usr/lib/expect5.45.4`); without the library its 23 tests fail at launch.
+`HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
+No `funes update`, release tag/artifact, Hugging Face upload, or memory
+publication is part of this refresh. AI-assisted by Claude.
