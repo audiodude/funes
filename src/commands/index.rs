@@ -1167,7 +1167,10 @@ async fn embed_pending(
         let t0 = Instant::now();
         for (n, (_, rows)) in sessions.iter().enumerate() {
             rows_to_fill.extend(rows);
-            if rows_to_fill.len() < EMBED_BATCH && n + 1 < sessions.len() {
+            // Two calls' worth per fill: each fill is a merge over the memory, so an embedder that
+            // turns out fast gets fewer, larger ones.
+            let fill_rows = EMBED_BATCH.max(2 * embedder.batch_size());
+            if rows_to_fill.len() < fill_rows && n + 1 < sessions.len() {
                 continue;
             }
             fill(ds, embedder, &rows_to_fill).await?;
@@ -1276,8 +1279,8 @@ pub async fn run_index_remote(uri: &str, no_thinking: bool) -> Result<()> {
 /// embed-fill boundary past this. Deeper tiers and older sessions backfill on later runs.
 const INDEX_BUDGET_SECS: u64 = 60;
 
-/// Rows embedded per fill. A fill rewrites the vector column of every fragment it touches, so fills
-/// span whole sessions and are not cut small.
+/// Rows embedded per fill, at least (a fast embedder's fills are larger). A fill rewrites the vector
+/// column of every fragment it touches, so fills span whole sessions and are not cut small.
 const EMBED_BATCH: usize = 512;
 
 /// What a budgeted run does when the budget expires with work still owed.

@@ -2,10 +2,14 @@
 //! funes talks to these traits via the [`embedder`]/[`reranker`] factories, never a concrete ML
 //! stack, so an alternative backend slots in behind the same interface. The backend is chosen at
 //! build time in one place — the `Default*` aliases below: default build → BLAS (a from-scratch
-//! forward on Accelerate/faer); `--no-default-features --features onnx` → fastembed/ort.
+//! forward on Accelerate/faer); `--no-default-features --features onnx` → fastembed/ort. On macOS
+//! the default build also carries `metal`, the same encoder on the GPU, which [`embedder`] hands
+//! the bulk calls to (see [`metal::Hybrid`]).
 
 #[cfg(feature = "blas")]
 pub mod blas;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 
 use anyhow::{Context, Result};
 
@@ -79,6 +83,12 @@ pub trait Embedder: Send {
     /// Encode each text as given, in input order.
     fn encode(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 
+    /// How many texts a call should carry. A caller reports progress and checks its budget between
+    /// calls, so this is about a few seconds' work; a GPU wants many texts per call to stay busy.
+    fn batch_size(&self) -> usize {
+        EMBED_BATCH
+    }
+
     fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let prefix = self.model().prefixes().1;
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
@@ -99,6 +109,9 @@ pub trait Reranker: Send {
 /// Build the embedder for `model` on the compiled-in backend. Call sites use this instead of
 /// naming a concrete type, so the backend is decided only by the `Default*` alias above.
 pub fn embedder(model: EmbeddingModel) -> Result<Box<dyn Embedder>> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    return Ok(Box::new(metal::Hybrid::new(model)?));
+    #[allow(unreachable_code)]
     Ok(Box::new(DefaultEmbedder::new(model)?))
 }
 
@@ -166,16 +179,25 @@ impl Reranker for OnnxReranker {
     }
 }
 
-/// Embed `texts` in batches of [`EMBED_BATCH`], calling `on_batch(embedded_so_far)` after each so a
-/// caller can report progress (or pass a no-op).
+/// Embed `texts` in batches of the embedder's [`Embedder::batch_size`], calling
+/// `on_batch(embedded_so_far)` after each so a caller can report progress (or pass a no-op).
 pub(crate) fn embed_batched(
     embedder: &mut dyn Embedder,
     texts: &[&str],
     mut on_batch: impl FnMut(usize),
 ) -> Result<Vec<Vec<f32>>> {
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-    for group in texts.chunks(EMBED_BATCH) {
-        vectors.extend(embedder.embed(group)?);
+    // Asked per call: the first call may bring up a faster backend that wants larger ones.
+    while vectors.len() < texts.len() {
+        let end = texts.len().min(vectors.len() + embedder.batch_size().max(1));
+        let batch = embedder.embed(&texts[vectors.len()..end])?;
+        anyhow::ensure!(
+            batch.len() == end - vectors.len(),
+            "the embedder returned {} vector(s) for {} text(s)",
+            batch.len(),
+            end - vectors.len()
+        );
+        vectors.extend(batch);
         on_batch(vectors.len());
     }
     Ok(vectors)
