@@ -860,9 +860,12 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("sessions");
+            // macOS temp dirs live under the `/var` -> `/private/var` symlink,
+            // which the every-component symlink check rightly rejects.
+            let base = fs::canonicalize(temp.path()).unwrap();
+            let root = base.join("sessions");
             fs::create_dir(&root).unwrap();
-            let scope = temp.path().join("scope.json");
+            let scope = base.join("scope.json");
             let enrollment = json!({"version":1,"roots":{"claude":[],"codex":[],"omp":[root]}});
             let mut file = OpenOptions::new()
                 .write(true)
@@ -871,7 +874,7 @@ mod tests {
                 .open(&scope)
                 .unwrap();
             file.write_all(enrollment.to_string().as_bytes()).unwrap();
-            let corpus = temp.path().join("corpus");
+            let corpus = base.join("corpus");
             Self {
                 _temp: temp,
                 corpus,
