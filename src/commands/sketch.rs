@@ -3,7 +3,7 @@
 //! Selects the passages most distinctive within one session, from the vectors already stored,
 //! always keeping the opening ask and the last word of the range digested.
 
-use crate::memory::Memory;
+use super::target::Target;
 use crate::session_sketch::{self, SketchOptions};
 use anyhow::{bail, Result};
 
@@ -17,13 +17,16 @@ const DEFAULT_CHARS: usize = 8_000;
 /// Digest one session, rendered in the agent format. `units` and `max_chars` are requests: both are
 /// clamped to what a reply can carry, and any narrowing is reported rather than applied quietly.
 pub async fn run(
-    memory: Memory,
+    target: impl Into<Target>,
     session_id: String,
     from: Option<i64>,
     to: Option<i64>,
     units: Option<usize>,
     max_chars: Option<usize>,
 ) -> Result<String> {
+    let target = target.into();
+    let hint = target.hint();
+    let memory = target.holder(&session_id).await?;
     let asked = SketchOptions {
         budget: units.unwrap_or(DEFAULT_UNITS),
         char_budget: max_chars.unwrap_or(DEFAULT_CHARS),
@@ -49,10 +52,5 @@ pub async fn run(
     if sketch.evidence.is_empty() {
         bail!("nothing to sketch in session {session_id} — it holds no text worth selecting");
     }
-    Ok(crate::ui::render::sketch_agent(
-        "",
-        &super::recall::memory_hint(Some(&memory.label())),
-        &sketch,
-        clamped,
-    ))
+    Ok(crate::ui::render::sketch_agent("", &hint, &sketch, clamped))
 }

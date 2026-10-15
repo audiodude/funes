@@ -39,6 +39,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use arrow_array::{RecordBatch, RecordBatchIterator};
@@ -663,8 +664,12 @@ pub(crate) async fn fetch_readme(repo: &HFRepository<RepoTypeDataset>, rev: &str
     }
 }
 
+/// How many times a commit the Hub refused as busy is sent again, waiting 1, 2, 4… seconds.
+const BUSY_RESENDS: u32 = 5;
+
 /// One `create_commit` of `ops` on branch `rev`, guarded by `parent` when there is one. Returns the
 /// raw hf-hub result so callers can tell a head-moved [`HFError::Conflict`] from other failures.
+/// A commit the Hub refuses as busy did not land, so it is sent again after a wait.
 async fn send_commit(
     repo: &HFRepository<RepoTypeDataset>,
     ops: Vec<CommitOperation>,
@@ -676,22 +681,39 @@ async fn send_commit(
         .iter()
         .filter(|op| matches!(op, CommitOperation::Delete { .. }))
         .count();
-    repo.create_commit()
-        .operations(ops)
-        .commit_message(message)
-        .maybe_parent_commit(parent)
-        .revision(rev.to_string())
-        .progress(upload_progress(deletes))
-        .send()
-        .await
+    let mut resends = 0;
+    loop {
+        let sent = repo
+            .create_commit()
+            .operations(ops.clone())
+            .commit_message(message.clone())
+            .maybe_parent_commit(parent.clone())
+            .revision(rev.to_string())
+            .progress(upload_progress(deletes))
+            .send()
+            .await;
+        match sent {
+            Err(e) if repo_busy(&e) && resends < BUSY_RESENDS => {
+                tokio::time::sleep(Duration::from_secs(1 << resends)).await;
+                resends += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether the Hub refused a commit because another is in progress on the repo, in its own words.
+fn repo_busy(e: &HFError) -> bool {
+    matches!(e, HFError::Conflict { context } if context.body.contains("Another commit operation is in progress"))
 }
 
 /// Whether a [`send_commit`] failure is the Hub rejecting a stale `parent_commit`: the commit API
 /// answers a moved head with 412 Precondition Failed, which hf-hub leaves as a generic
-/// [`HFError::Http`] (only 409 is typed as [`HFError::Conflict`]).
+/// [`HFError::Http`] (only 409 is typed as [`HFError::Conflict`]). A busy repo's 409 is not one:
+/// [`send_commit`] has already waited it out.
 fn head_moved(e: &HFError) -> bool {
     match e {
-        HFError::Conflict { .. } => true,
+        HFError::Conflict { .. } => !repo_busy(e),
         HFError::Http { context } => context.status.as_u16() == 412,
         _ => false,
     }

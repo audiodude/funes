@@ -30,11 +30,12 @@ Once 500 pushed rows sit unindexed on the remote, a push also compacts it: it me
 fragments, adds those rows to the search indexes, and deletes the old versions.
 `funes compact <memory>` does the same without pushing ([index.md](index.md#compaction)).
 
-**The wrong-memory guard.** A push to a memory that holds none of the chunks it would publish — a
-first push, a new host, sessions named with `--sessions` that it lacks, or genuinely the wrong memory —
-asks before uploading. Off a terminal it refuses
-rather than guess; `--yes` overrides. ([`funes add`](add.md) clears this for you by doing the first
-push interactively — once that machine has an index of its own to push.)
+**The wrong-memory guard.** A push to a memory that holds none of the chunks it would publish asks
+before uploading, and says which case it found: sessions named with `--sessions` that the memory
+lacks, an empty memory (a first publish), chunks from other hosts only (a new host of yours), or
+nothing in common with a memory that held chunks from this host before (what the wrong memory looks like).
+Off a terminal it refuses rather than guess; `--yes` overrides. ([`funes add`](add.md) clears this
+for you by doing the first push interactively — once that machine has an index of its own to push.)
 
 If your token can't write the target, push says so — recall can still read a memory you can't publish
 to.
@@ -68,7 +69,7 @@ $ echo $?
 ```
 
 A hold-back is easy to miss when the hooks push in the background, so `funes status` scans this
-host's pending rows for each bound memory the same way and reports what a push would hold back, until a
+host's pending rows for the bound memory the same way and reports what a push would hold back, until a
 scrub lets them publish.
 
 `funes push` and `funes scrub` refuse to run unscanned when TruffleHog is unavailable. See the
@@ -127,16 +128,15 @@ against your criteria and reports them, and the person publishing passes that li
 
 ## Inspecting a memory: `status`
 
-`funes status` shows your local memory, then each memory your agents are bound to (by
-[`funes add <agent> <memory>`](add.md)), naming the agents bound to it, and an update check. An
-agent installed with no memory recorded — placed by hand, or by a funes older than 1.4.0 — is named
-at the end; if it publishes somewhere, `funes add <agent> <memory>` records where.
+`funes status` shows your local memory, then the memory this host is bound to (by
+[`funes bind`](add.md#binding-a-memory)), and an update check. A host set up by a funes from
+before the binding is told what its agents were bound to, and what binds it.
 
 `funes status` tells you whether recall is reading your own memory yet, and whether a newer funes
 release is out. Its local-index sections distinguish chunks awaiting embedding from source
 sessions not yet indexed. Run `funes index` to continue either.
 
-For each bound memory, one `local push` line says either that this host is up to date or how many
+For the bound memory, one `local push` line says either that this host is up to date or how many
 local sessions are pending. This comes from a per-remote receipt kept on this host, so sessions
 contributed by other hosts do not distort the result and status never scans the remote to compute
 it. Run `funes push <memory>` once to initialize the receipt for an existing memory.

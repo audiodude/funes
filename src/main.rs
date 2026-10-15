@@ -5,6 +5,7 @@
 //! `$FUNES_HOME` or `~/.funes`.
 
 use funes::agents::{self, registry};
+use funes::commands::target::Target;
 use funes::commands::{ask, compact, index, mcp, push, recall, scrub, sketch, update};
 use funes::hub;
 use funes::inference::EmbeddingModel;
@@ -13,6 +14,7 @@ use funes::traces::spool;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -187,8 +189,8 @@ enum Cmd {
         #[command(flatten)]
         memory: MemoryOpts,
     },
-    /// Show the local index, and each memory your agents are bound to with what this host has yet
-    /// to push there.
+    /// Show the local index, and the memory this host is bound to with what this host has yet to
+    /// push there.
     Status,
     /// Publish your local memory's new embedded chunks to a remote memory on the HF Hub.
     Push {
@@ -232,15 +234,23 @@ enum Cmd {
     /// Run as an MCP server over stdio (for Claude Code, Cursor, …).
     Mcp {
         /// Memory to serve — an `<org>/<repo>` shorthand, an `hf://…` URI, a local path, or `local`.
-        /// Defaults to your local memory.
+        /// Defaults to the memory this host is bound to, else your local memory.
         #[arg(value_name = "MEMORY")]
         memory: Option<String>,
     },
+    /// Bind this host to a memory: every installed agent recalls from it and publishes to it.
+    ///
+    /// Re-runs each installed agent's setup on the memory, and does the first push when this host
+    /// has a local memory it has never published there. `local` unbinds.
+    Bind {
+        /// The memory — an `<org>/<repo>` shorthand, an `hf://…` URI, a local path, or `local`.
+        #[arg(value_name = "MEMORY")]
+        memory: String,
+    },
     /// Add funes to a coding agent.
     ///
-    /// Installs funes's read tools and automatic per-turn indexing. Name a memory the agent recalls
-    /// from — and publishes to — an `<org>/<repo>` shorthand or an `hf://…` URI; omit it and an
-    /// installed agent keeps the memory it is bound to, a first add stays local.
+    /// Installs funes's read tools and automatic per-turn indexing, on the memory this host is
+    /// bound to. Naming a memory binds the host to it first, as `funes bind` does.
     Add {
         /// Agent to add: `claude`, `codex`, `pi`, `hermes`, or any other registered agent.
         #[arg(value_name = "AGENT")]
@@ -268,21 +278,10 @@ enum Cmd {
 // comes from the field doc below.
 #[derive(Args)]
 struct AddMemory {
-    /// Memory this agent recalls from — `<org>/<repo>`, an `hf://…` URI, or `local`. Omitted, the
-    /// memory the agent is bound to stays; a first add's is local.
+    /// Memory to bind this host to first, as `funes bind` does — `<org>/<repo>`, an `hf://…` URI, or
+    /// `local`. Omitted, the agent takes the memory the host is bound to.
     #[arg(value_name = "MEMORY")]
     memory: Option<String>,
-}
-
-/// The memory to bake into an agent's `funes mcp` registration: blank/`local` → the local memory
-/// (a bare `funes mcp`); none named → `bound`, the memory the install is recorded as bound to;
-/// else the named remote/explicit memory (`funes mcp <memory>`).
-fn baked_memory(memory: AddMemory, bound: Option<String>) -> Option<String> {
-    match memory.memory.map(|s| s.trim().to_string()) {
-        None => bound,
-        Some(s) if s.is_empty() || s == "local" => None,
-        Some(s) => Some(s),
-    }
 }
 
 // Flattened into every ask agent so they share the question positional and the read `--memory`
@@ -311,26 +310,37 @@ enum AskAgent {
 /// Which memory the read commands act on. Shared by `recall`/`get`/`status`/`ask` and `mcp`.
 #[derive(Args)]
 struct MemoryOpts {
-    /// The memory to read — an `<org>/<repo>` shorthand, an `hf://…` URI, a local path, or `local`.
-    /// Defaults to your local memory.
+    /// The memory to read, as it stands — an `<org>/<repo>` shorthand, an `hf://…` URI, a local
+    /// path, or `local`. Omitted, the memory this host is bound to, with this host's turns not yet
+    /// pushed to it; your local memory when the host is local.
     #[arg(long = "memory", value_name = "MEMORY")]
     memory: Option<String>,
 }
 
 impl MemoryOpts {
-    fn resolve(self) -> memory::Memory {
-        memory::Memory::resolve(self.memory)
+    fn resolve(self) -> Result<Target> {
+        Target::resolve(self.memory.as_deref())
     }
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    // The local source protocol never talks to the Hub, so it neither needs the Hub User-Agent
+    // origin nor mints an install id.
     if matches!(&cli.cmd, Cmd::Source) {
         return funes::local_source::stdio();
     }
+    // Before the runtime starts its worker threads: this sets a process environment variable.
+    hub::configure_user_agent_origin();
     let omp_index = matches!(&cli.cmd, Cmd::Index { harness: Some(h), .. } if h == "omp");
-    match run(cli).await {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(cli)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) if e.downcast_ref::<index::IndexBusy>().is_some() => {
             eprintln!("funes: memory writer busy; retry later");
@@ -362,7 +372,7 @@ async fn run(cli: Cli) -> Result<()> {
             | Cmd::Status
             | Cmd::Ask { .. }
     ) {
-        if let Some(note) = agents::stale_install_notice(None) {
+        if let Some(note) = agents::stale_install_notice() {
             eprint!("{note}");
         }
     }
@@ -380,7 +390,7 @@ async fn run(cli: Cli) -> Result<()> {
             until,
             memory,
         } => {
-            let memory = memory.resolve();
+            let memory = memory.resolve()?;
             let query = query.join(" ");
             let spinner = Spinner::start("recalling…");
             let progress = |label: &str| {
@@ -419,7 +429,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             print!(
                 "{}",
-                recall::scan(memory.resolve(), needle, session_id, from, to, ignore_case, context).await?
+                recall::scan(memory.resolve()?, needle, session_id, from, to, ignore_case, context).await?
             );
             Ok(())
         }
@@ -438,7 +448,7 @@ async fn run(cli: Cli) -> Result<()> {
                 limit,
                 offset,
             };
-            print!("{}", recall::sessions(memory.resolve(), filter).await?);
+            print!("{}", recall::sessions(memory.resolve()?, filter).await?);
             Ok(())
         }
         Cmd::Sketch {
@@ -451,7 +461,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             print!(
                 "{}",
-                sketch::run(memory.resolve(), session_id, from, to, units, max_chars).await?
+                sketch::run(memory.resolve()?, session_id, from, to, units, max_chars).await?
             );
             Ok(())
         }
@@ -462,12 +472,12 @@ async fn run(cli: Cli) -> Result<()> {
             memory,
         } => {
             let range = recall::TurnRange { from, to };
-            print!("{}", recall::get(memory.resolve(), session_id, range).await?);
+            print!("{}", recall::get(memory.resolve()?, session_id, range).await?);
             Ok(())
         }
         Cmd::Ask { agent } => match agent {
-            AskAgent::Claude { args } => ask::claude(args.question.join(" "), args.memory.resolve()).await,
-            AskAgent::Codex { args } => ask::codex(args.question.join(" "), args.memory.resolve()).await,
+            AskAgent::Claude { args } => ask::claude(args.question.join(" "), args.memory.resolve()?).await,
+            AskAgent::Codex { args } => ask::codex(args.question.join(" "), args.memory.resolve()?).await,
         },
         Cmd::Index {
             path,
@@ -584,8 +594,19 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Status => {
-            let (bound, unrecorded) = registry::bindings(&registry::default_root()?)?;
-            print!("{}", recall::host_status(&bound, &unrecorded).await?);
+            let bound = memory::binding()?;
+            let note = match bound {
+                Some(_) => None,
+                None => match legacy_bindings(&registry::default_root()?)?.as_slice() {
+                    [] => None,
+                    [(spec, ids)] => Some(format!(
+                        "{} bound to {spec} by an older funes; `funes update` binds this host to it",
+                        are(ids)
+                    )),
+                    several => Some(disagreement(several)),
+                },
+            };
+            print!("{}", recall::host_status(bound.as_deref(), note.as_deref()).await?);
             // Show the status body before the (bounded, best-effort) update check, so a slow or
             // offline Hub can't delay the useful output.
             std::io::stdout().flush().ok();
@@ -637,6 +658,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Scrub => scrub::run().await,
         Cmd::Update { force } => update_funes(force).await,
         Cmd::Mcp { memory } => mcp::run(memory).await,
+        Cmd::Bind { memory } => bind_memory(&memory).await,
         // `add` bootstraps the local pipeline: build the first index and do the first push — the
         // two one-time steps the automation can't do unattended — so nothing is left to run by hand.
         Cmd::Add { agent, memory, from } => add_agent(&agent, memory, from.as_deref()).await,
@@ -661,19 +683,25 @@ async fn add_agent(id: &str, memory: AddMemory, from: Option<&str>) -> Result<()
     let ran = &installed;
     let result = async {
         let refresh = fresh || from.is_some() || registry::refreshes_on_every_run(&root, id);
-        // The memory the last setup that ran here was bound to.
-        let bound = registry::binding(&root, id)?;
         let (integration, provisioned) = prepare_agent(id, refresh, from).await?;
-        let resolved = resolve_add_memory(baked_memory(memory, bound)).await?;
+        // Naming a memory binds the host to it, as `funes bind` does. Naming none, the agent takes
+        // the host's.
+        let (resolved, binds) = match memory.memory.as_deref() {
+            Some(spec) => (resolve_named(spec).await?, true),
+            None => adopt_host_memory(&root, id).await?,
+        };
         let record = provisioned.map(|(origin, files)| registry::Installed::new(&integration.manifest, origin, files));
         let registry_root = &root;
         let install = |memory: Option<String>| async move {
             // Counted as run before it runs: a setup that fails part-way may have wired some of
             // the agent to these files, and `remove` must find them recorded to run unasked.
             ran.set(true);
-            setup_add(registry_root, &integration, memory.as_deref())
+            setup_add(&integration, memory.as_deref())?;
+            // The note an older funes kept beside the agent is obsolete once its setup ran on the
+            // host's memory; left, a later bare add would bind the host to it again.
+            registry::bind(registry_root, id, None)
         };
-        let outcome = bootstrap_add(id, resolved, install).await;
+        let outcome = bootstrap_add(id, resolved, binds, install).await;
         // Recorded once setup has run, whatever came after: a first push that failed leaves the
         // new files installed, and the record must say so.
         if ran.get() {
@@ -694,14 +722,11 @@ async fn add_agent(id: &str, memory: AddMemory, from: Option<&str>) -> Result<()
     result
 }
 
-/// Run `integration`'s `setup add`, bound to `memory`, and note what it ran with.
-fn setup_add(root: &Path, integration: &registry::Integration, memory: Option<&str>) -> Result<()> {
-    let id = &integration.manifest.id;
+/// Run `integration`'s `setup add`, bound to `memory`.
+fn setup_add(integration: &registry::Integration, memory: Option<&str>) -> Result<()> {
     integration.add(memory)?;
-    // Bound only once setup ran with it: a failed setup left the agent bound as it was.
-    registry::bind(root, id, memory)?;
     // Whatever an older hook asked for, this install's hooks are the ones that ask now.
-    spool::forget_missing(id)
+    spool::forget_missing(&integration.manifest.id)
 }
 
 /// Resolve `id`'s integration for a run and confirm it when funes can't vouch for it — all before
@@ -872,6 +897,13 @@ async fn update_funes(force: bool) -> Result<()> {
 /// Bring every installed integration forward.
 async fn update_agents() -> Result<()> {
     let root = registry::default_root()?;
+    // A host from before the binding is bound as its agents were; one that cannot be is still
+    // brought forward, each agent bound as it was.
+    match migrate_bindings(&root, None).await {
+        Ok(Some(disagreement)) => eprintln!("note: {disagreement}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("note: this host could not be bound as an older funes bound its agents: {e:#}"),
+    }
     let mut failed = Vec::new();
     for id in registry::registered_ids(&root)
         .into_iter()
@@ -894,28 +926,34 @@ async fn update_agents() -> Result<()> {
 /// Bring `id`'s install to what its source holds now and re-run its setup, bound as it was — only
 /// when that changed its files. What it did, as a line to print.
 async fn update_agent(root: &Path, id: &str) -> Result<String> {
-    if !registry::refreshes_on_every_run(root, id) {
-        return Ok(match registry::installed(root, id) {
-            Some(record) => format!(
-                "The {id} integration stays as installed from {} until `funes add {id} --from` names its source again.",
-                record.origin
-            ),
-            None => format!("The {id} integration stays as placed: funes has no record of installing it."),
-        });
+    // Named with `--from`, an install stays as named: the one copy not refreshed on every run.
+    let record = registry::installed(root, id);
+    if let Some(record) = record.as_ref().filter(|_| !registry::refreshes_on_every_run(root, id)) {
+        return Ok(format!(
+            "The {id} integration stays as installed from {} until `funes add {id} --from` names its source again.",
+            record.origin
+        ));
     }
     let previous = registry::installed_manifest(root, id);
     let ran = std::cell::Cell::new(false);
     let result: Result<String> = async {
-        let fetched = registry::provision(root, id, None).await?;
+        let fetched = match registry::provision(root, id, None).await {
+            // A copy nothing recorded, that its source does not list: nothing to bring it forward to.
+            Err(e) if record.is_none() && e.downcast_ref::<registry::Absent>().is_some() => {
+                return Ok(format!("The {id} integration stays as placed: {e}."));
+            }
+            fetched => fetched?,
+        };
         let Some(provisioned) = fetched.filter(|p| !registry::is_recorded(root, id, &p.origin, &p.files)) else {
             return Ok(format!("The {id} integration is up to date."));
         };
         let integration = registry::open(root, id)?;
         confirm_trust(&integration, provisioned.provenance)?;
         let record = registry::Installed::new(&integration.manifest, provisioned.origin, provisioned.files);
-        let bound = registry::binding(root, id)?;
+        // Bound as the host is; on a host without the binding, as an older funes bound the agent.
+        let bound = memory::binding()?.or(registry::binding(root, id)?);
         ran.set(true);
-        let outcome = setup_add(root, &integration, bound.as_deref());
+        let outcome = setup_add(&integration, bound.as_deref());
         // Recorded however setup ended: `remove` must run what a failed setup may have wired in.
         registry::record(root, &record)?;
         outcome?;
@@ -939,22 +977,194 @@ async fn update_agent(root: &Path, id: &str) -> Result<String> {
 /// A resolved memory binding: the memory spec, and whether funes just created the repo this run — the
 /// signal the first push uses to skip the wrong-memory guard (an empty repo funes made for the user
 /// is plainly not "the wrong memory").
+#[derive(Clone)]
 struct Resolved {
     memory: String,
     created: bool,
 }
 
-/// Resolve the memory `funes add` binds. A named memory is validated — offer to create it if it's
-/// missing on the Hub (a typo guard). With none, offer to set one up on the Hub when a token is
-/// present (`<user>/funes-memory`); otherwise stay local.
-async fn resolve_add_memory(memory: Option<String>) -> Result<Option<Resolved>> {
-    match memory {
-        Some(memory) => {
-            let created = ensure_remote_exists(&memory).await?;
-            Ok(Some(Resolved { memory, created }))
-        }
-        None => offer_hub_memory().await,
+/// The memory `spec` names, checked on the Hub (a typo guard, offering to create it); `None` for
+/// `local`.
+async fn resolve_named(spec: &str) -> Result<Option<Resolved>> {
+    match spec.trim() {
+        "" | "local" => Ok(None),
+        spec => Ok(Some(Resolved {
+            memory: spec.to_string(),
+            created: ensure_remote_exists(spec).await?,
+        })),
     }
+}
+
+/// `funes bind`: bind this host to `spec`, `local` to unbind, every installed agent following, then
+/// the first push when this host has a local memory and the memory is on the Hub.
+async fn bind_memory(spec: &str) -> Result<()> {
+    let resolved = resolve_named(spec).await?;
+    bind_host(resolved.clone(), None).await?;
+    let Some(Resolved { memory, created }) = resolved else {
+        return Ok(());
+    };
+    if matches!(memory::Memory::parse(&memory), memory::Memory::Remote { .. })
+        && index::local_memory_model().await?.is_some()
+    {
+        first_push(&memory, created).await.with_context(|| {
+            format!(
+                "this host is bound to {memory}, but the first push there did not go through — run \
+                 `funes push {memory}` at a terminal to publish there"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Bind this host to `resolved`, `None` for its local memory: check its embedding model against
+/// the local memory's, record it, and run every installed agent's setup on it, `except` the one
+/// an add is about to install. The record stands whatever the setups do: an agent that fails to
+/// follow is reported, and `bind` again brings it along. The first push is the caller's.
+async fn bind_host(resolved: Option<Resolved>, except: Option<&str>) -> Result<()> {
+    let memory = resolved.as_ref().map(|r| r.memory.as_str());
+    if let (Some(memory), Some(here)) = (memory, index::local_memory_model().await?) {
+        if let Some(there) = bound_model(memory, false).await? {
+            if there != here {
+                bail!(
+                    "{memory} is embedded with {}, and the local memory with {}: a memory takes one embedding model",
+                    there.id(),
+                    here.id()
+                );
+            }
+        }
+    }
+    memory::bind(memory)?;
+    let root = registry::default_root()?;
+    let mut followed = Vec::new();
+    let mut failed = Vec::new();
+    for id in registry::registered_ids(&root)
+        .into_iter()
+        .filter(|id| spool::is_id(id) && except != Some(id.as_str()))
+    {
+        match follow(&root, &id, memory).await {
+            Ok(()) => followed.push(id),
+            Err(e) => {
+                eprintln!("the {id} integration could not follow: {e:#}");
+                failed.push(id);
+            }
+        }
+    }
+    let bound = match memory {
+        Some(memory) => format!("bound this host to {memory}"),
+        None => "this host is local".to_string(),
+    };
+    if followed.is_empty() {
+        println!("{bound}.");
+    } else {
+        println!("{bound}: {} follow.", followed.join(", "));
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{} did not follow — fix what it says above, then run `funes bind` again",
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Run `id`'s installed setup on `memory`, and forget the binding an older funes noted beside it.
+/// A copy refreshed to run here is recorded however setup ended, as `add` and `update` record
+/// theirs.
+async fn follow(root: &Path, id: &str, memory: Option<&str>) -> Result<()> {
+    let (integration, provisioned) = prepare_agent(id, registry::speaks_another_contract(root, id), None).await?;
+    let outcome = setup_add(&integration, memory);
+    if let Some((origin, files)) = provisioned {
+        registry::record(root, &registry::Installed::new(&integration.manifest, origin, files))?;
+    }
+    outcome?;
+    registry::bind(root, id, None)
+}
+
+/// The memory a bare add installs an agent on: the host's. A host from before the binding is
+/// bound as an older funes bound its agents first; one whose agents disagree is `funes bind`'s to
+/// settle. A local host is offered a memory on the Hub, which the add then binds the host to, as
+/// the flag says.
+async fn adopt_host_memory(root: &Path, id: &str) -> Result<(Option<Resolved>, bool)> {
+    if let Some(disagreement) = migrate_bindings(root, Some(id)).await? {
+        bail!("{disagreement}");
+    }
+    if let Some(memory) = memory::binding()? {
+        return Ok((Some(Resolved { memory, created: false }), false));
+    }
+    let offered = offer_hub_memory().await?;
+    let binds = offered.is_some();
+    Ok((offered, binds))
+}
+
+/// Bind a host from before the binding as an older funes bound its agents: the one memory they
+/// noted becomes the host's, every installed agent following, the ones that older funes left
+/// local included, `except` the one an add is about to install. Agents that noted different
+/// memories come back as the sentence for the caller to print or refuse on, and nothing is bound.
+async fn migrate_bindings(root: &Path, except: Option<&str>) -> Result<Option<String>> {
+    if memory::binding()?.is_some() {
+        return Ok(None);
+    }
+    let groups = legacy_bindings(root)?;
+    match groups.as_slice() {
+        [] => Ok(None),
+        [(spec, ids)] => {
+            println!(
+                "an older funes bound {} to {spec}; binding this host to it.",
+                ids.join(", ")
+            );
+            let memory = Resolved {
+                memory: spec.clone(),
+                created: false,
+            };
+            bind_host(Some(memory), except).await?;
+            Ok(None)
+        }
+        several => Ok(Some(disagreement(several))),
+    }
+}
+
+/// The memories an older funes bound this host's agents to, each as first typed with the agents
+/// bound to it. A binding is kept as typed, so one memory may be noted under two spellings. A
+/// note saying `local` is no binding: funes never wrote one, and taken as one it would be handed
+/// to the setups as a memory.
+fn legacy_bindings(root: &Path) -> Result<Vec<(String, Vec<String>)>> {
+    let mut by_label: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    for (spec, ids) in registry::bindings(root)?.0 {
+        if spec == "local" {
+            continue;
+        }
+        let label = memory::Memory::parse(&spec).label();
+        by_label
+            .entry(label)
+            .or_insert_with(|| (spec, Vec::new()))
+            .1
+            .extend(ids);
+    }
+    Ok(by_label.into_values().collect())
+}
+
+/// The sentence for agents an older funes bound to different memories, with its cure.
+fn disagreement(groups: &[(String, Vec<String>)]) -> String {
+    let parts: Vec<String> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, (spec, ids))| {
+            if i == 0 {
+                format!("{} bound to {spec}", are(ids))
+            } else {
+                format!("{} to {spec}", ids.join(", "))
+            }
+        })
+        .collect();
+    format!(
+        "{}; this host reads local until `funes bind <memory>` binds it to one",
+        parts.join(", ")
+    )
+}
+
+/// `ids`, as the subject of "bound": "claude is", "claude, codex are".
+fn are(ids: &[String]) -> String {
+    format!("{} {}", ids.join(", "), if ids.len() == 1 { "is" } else { "are" })
 }
 
 /// Validate an explicitly-named memory: fine if it exists or the Hub is unreachable; offer to create
@@ -1130,10 +1340,12 @@ fn model_for_locale(locale: Option<&str>) -> EmbeddingModel {
 ///
 /// 1. on a first add (no rows in the local memory yet), ask — the first index is about a minute of
 ///    work, and declining aborts the add before anything is installed, so nothing is wired up;
-/// 2. `install` — writes the spool, bakes the memory in;
-/// 3. build the first index from that spool, so recall and the push have content;
-/// 4. first push if a memory is bound — clears the overlap guard so the push hook works thereafter.
-async fn bootstrap_add<F, Fut>(agent: &str, resolved: Option<Resolved>, install: F) -> Result<()>
+/// 2. bind the host when the memory was named or offered, every other agent following — once the
+///    add is going ahead, so a declined one leaves the host as it was;
+/// 3. `install` — writes the spool, bakes the memory in;
+/// 4. build the first index from that spool, so recall and the push have content;
+/// 5. first push if a memory is bound — clears the overlap guard so the push hook works thereafter.
+async fn bootstrap_add<F, Fut>(agent: &str, resolved: Option<Resolved>, binds: bool, install: F) -> Result<()>
 where
     F: FnOnce(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -1184,6 +1396,9 @@ where
             }
         };
         index::ensure_local_memory(model).await?;
+    }
+    if binds {
+        bind_host(resolved.clone(), Some(agent)).await?;
     }
     install(resolved.as_ref().map(|r| r.memory.clone())).await?;
     if first_add {
@@ -1310,18 +1525,12 @@ impl Drop for Spinner {
 /// The push confirmation for a target holding none of the chunks to publish. Fails closed (returns
 /// false) off a terminal, so an unattended push can't silently publish to the wrong memory — there it
 /// must be re-run with `--yes`.
-fn prompt_new_memory(label: &str, chunks: usize) -> bool {
+fn prompt_new_memory(label: &str, chunks: usize, why: push::Disjoint) -> bool {
     if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "refusing to push {chunks} chunk(s) to {label}: it holds none of them \
-             (a first push, a new host, sessions it lacks, or the wrong memory) — re-run with `--yes` to confirm."
-        );
+        eprintln!("{}", disjoint_refusal(label, chunks, why));
         return false;
     }
-    eprint!(
-        "{label} holds none of the {chunks} chunk(s) to publish — a first push here, a new host of yours, \
-         sessions it lacks, or the wrong memory. Publish anyway? [y/N] "
-    );
+    eprint!("{}", disjoint_prompt(label, chunks, why));
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer).is_err() {
@@ -1330,11 +1539,74 @@ fn prompt_new_memory(label: &str, chunks: usize) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// What the push found about the target and the chunks to publish, in the words of that case.
+fn disjoint_finding(label: &str, chunks: usize, why: push::Disjoint) -> String {
+    match why {
+        push::Disjoint::Selection { sessions } => {
+            format!("{label} holds none of the {chunks} chunk(s) of the {sessions} named session(s)")
+        }
+        push::Disjoint::FirstPublish => {
+            format!("{label} is empty, so these {chunks} chunk(s) would be its first publish")
+        }
+        push::Disjoint::NewHost { remote_chunks } => {
+            format!("{label} holds {remote_chunks} chunk(s), none from this host: a new host of yours")
+        }
+        push::Disjoint::Unexplained { remote_chunks } => format!(
+            "{label} holds {remote_chunks} chunk(s) and none of the {chunks} to publish, although it held \
+             chunks from this host before: check that it is the right memory"
+        ),
+    }
+}
+
+/// The question put to the user at a terminal: the finding, then a question that fits it.
+fn disjoint_prompt(label: &str, chunks: usize, why: push::Disjoint) -> String {
+    let question = match why {
+        push::Disjoint::Selection { .. } => "Publish them?",
+        push::Disjoint::FirstPublish => "Publish?",
+        push::Disjoint::NewHost { .. } | push::Disjoint::Unexplained { .. } => "Publish anyway?",
+    };
+    format!("{}. {question} [y/N] ", disjoint_finding(label, chunks, why))
+}
+
+/// The refusal off a terminal, where no question can be asked.
+fn disjoint_refusal(label: &str, chunks: usize, why: push::Disjoint) -> String {
+    format!(
+        "refusing to push: {}. Re-run with `--yes` to confirm.",
+        disjoint_finding(label, chunks, why)
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{model_for_locale, parse_confirm, parse_model, Cli, Cmd};
+    use super::{disjoint_prompt, disjoint_refusal, model_for_locale, parse_confirm, parse_model, Cli, Cmd};
     use clap::Parser;
+    use funes::commands::push::Disjoint;
     use funes::memory::dataset::model::{ENGLISH, MULTILINGUAL};
+
+    #[test]
+    fn the_push_prompt_says_which_case_it_found() {
+        let label = "hf://datasets/acme/memory";
+        assert_eq!(
+            disjoint_prompt(label, 1339, Disjoint::Selection { sessions: 3 }),
+            "hf://datasets/acme/memory holds none of the 1339 chunk(s) of the 3 named session(s). Publish them? [y/N] "
+        );
+        assert_eq!(
+            disjoint_prompt(label, 40, Disjoint::FirstPublish),
+            "hf://datasets/acme/memory is empty, so these 40 chunk(s) would be its first publish. Publish? [y/N] "
+        );
+        assert_eq!(
+            disjoint_prompt(label, 40, Disjoint::NewHost { remote_chunks: 67339 }),
+            "hf://datasets/acme/memory holds 67339 chunk(s), none from this host: a new host of yours. Publish anyway? [y/N] "
+        );
+        assert_eq!(
+            disjoint_prompt(label, 40, Disjoint::Unexplained { remote_chunks: 67339 }),
+            "hf://datasets/acme/memory holds 67339 chunk(s) and none of the 40 to publish, although it held chunks from this host before: check that it is the right memory. Publish anyway? [y/N] "
+        );
+        assert_eq!(
+            disjoint_refusal(label, 1339, Disjoint::Selection { sessions: 3 }),
+            "refusing to push: hf://datasets/acme/memory holds none of the 1339 chunk(s) of the 3 named session(s). Re-run with `--yes` to confirm."
+        );
+    }
 
     #[test]
     fn an_answer_names_the_model_and_anything_else_takes_the_default() {

@@ -4,6 +4,7 @@
 //! `recall`/`get` return results rendered in the agent format;
 //! `recall_hits`/`get_turns` return the structured results for other renderings (see `render`).
 
+use super::target::Target;
 use crate::chunk;
 use crate::inference::{self, Embedder, EmbeddingModel, Reranker};
 use crate::memory::dataset;
@@ -58,6 +59,8 @@ pub struct Hit {
     pub block_type: String,
     pub harness: String,
     pub neighbors: Vec<Neighbor>,
+    /// The `--memory` the hit's drill-down repeats, as the call named it; empty for a call naming
+    /// none.
     pub memory: String,
     pub fused: f32,
 }
@@ -113,6 +116,8 @@ pub struct Session {
     pub session_id: String,
     /// First timestamp in the session.
     pub ts: String,
+    /// Timestamp of the last indexed turn, the one with the highest seq.
+    pub last_ts: String,
     pub workdir: String,
     pub harness: String,
     /// The session's source repo(s) as `owner/name`, space-joined; empty when unresolvable.
@@ -126,11 +131,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// The `YYYY-MM-DD` the session started.
-    pub fn date(&self) -> &str {
-        day(&self.ts)
-    }
-
     /// Best available provenance: the repo when the checkout resolved, else the working directory.
     pub fn origin(&self) -> &str {
         self.repo.split_whitespace().next().unwrap_or(&self.workdir)
@@ -419,16 +419,17 @@ pub fn reranks(k: usize, candidates: usize) -> bool {
     candidates >= RERANK_RATIO * k
 }
 
-/// Run the recall pipeline over one memory and return the results rendered in the agent format.
+/// Run the recall pipeline over what `target` reads and return the results rendered in the agent
+/// format.
 pub async fn recall(
-    memory: Memory,
+    target: impl Into<Target>,
     query: String,
     k: usize,
     candidates: usize,
     neighbors: i64,
     filter: RecallFilter,
 ) -> Result<String> {
-    let (note, hits) = recall_hits(memory, query, k, candidates, neighbors, filter, &|_| ()).await?;
+    let (note, hits) = recall_hits(target, query, k, candidates, neighbors, filter, &|_| ()).await?;
     Ok(rendered(&note, &hits))
 }
 
@@ -440,13 +441,14 @@ pub fn rendered(note: &str, hits: &[(Hit, f64)]) -> String {
     crate::ui::render::recall_agent(note, hits)
 }
 
-/// Run the recall pipeline over one memory: hybrid retrieval → rank, reranked when the pool is
-/// several times `k` → neighbor expansion.
+/// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's
+/// unpushed turns for the bound memory → rank, reranked when the pool is several times `k` →
+/// neighbor expansion.
 /// Returns the degradation note (empty when the memory opened normally) and the scored hits, best
 /// first — rendering is the caller's choice. `progress` hears a short label as each slow phase
 /// starts (model load, search, rerank); pass a no-op to run silently.
 pub async fn recall_hits(
-    memory: Memory,
+    target: impl Into<Target>,
     query: String,
     k: usize,
     candidates: usize,
@@ -455,8 +457,8 @@ pub async fn recall_hits(
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Vec<(Hit, f64)>)> {
     let search = Search::new(query, candidates, filter)?;
-    let pool = search.candidates(&memory, progress).await?;
-    search.rank(vec![pool], k, neighbors, progress).await
+    let pools = target.into().candidates(&search, progress).await?;
+    search.rank(pools, k, neighbors, progress).await
 }
 
 /// What narrows a search.
@@ -503,6 +505,18 @@ pub struct Candidates {
 }
 
 impl Candidates {
+    /// Whether the pool came from the local memory in place of an unreachable remote.
+    pub(crate) fn degraded(&self) -> bool {
+        !self.note.is_empty()
+    }
+
+    /// Give every hit the `--memory` its drill-down repeats.
+    pub(crate) fn hint(&mut self, memory: &str) {
+        for h in &mut self.hits {
+            h.memory = memory.to_string();
+        }
+    }
+
     /// Keep only the candidates `keep` accepts.
     pub fn retain(&mut self, keep: impl Fn(&Hit) -> bool) {
         self.hits.retain(keep);
@@ -564,12 +578,7 @@ impl Search {
             );
         }
         progress(&format!("searching {}…", memory.label()));
-        let mut hits =
-            hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
-        let label = read.memory_label.unwrap_or_default();
-        for h in &mut hits {
-            h.memory = label.clone();
-        }
+        let hits = hybrid_candidates(&read.ds, qv, &self.query, self.candidates, self.where_clause.as_deref()).await?;
         Ok(Candidates {
             ds: read.ds,
             note: read.note.unwrap_or_default(),
@@ -887,7 +896,8 @@ pub struct TurnRange {
 pub const DEFAULT_SPAN: i64 = 20;
 
 /// Read a range of a session's turns, rendered in the agent format.
-pub async fn get(memory: Memory, session_id: String, range: TurnRange) -> Result<String> {
+pub async fn get(target: impl Into<Target>, session_id: String, range: TurnRange) -> Result<String> {
+    let memory = target.into().holder(&session_id).await?;
     let label = memory.label();
     let (note, turns, total) = get_turns(memory, session_id.clone(), range).await?;
     // A session with no rows is absent, not empty: only a range can come back empty.
@@ -1026,10 +1036,10 @@ impl SessionFilter {
     }
 }
 
-/// The sessions of a memory that `filter` keeps, oldest first, rendered in the agent format.
-pub async fn sessions(memory: Memory, filter: SessionFilter) -> Result<String> {
+/// The sessions `target` reads that `filter` keeps, oldest first, rendered in the agent format.
+pub async fn sessions(target: impl Into<Target>, filter: SessionFilter) -> Result<String> {
     check_filter(&filter)?;
-    list_sessions(vec![SessionPool::open(&memory).await?], filter).await
+    list_sessions(target.into().session_pools().await?, filter).await
 }
 
 /// One memory's sessions, before a listing pools, filters and pages them.
@@ -1205,7 +1215,13 @@ async fn scan_sessions(ds: &Dataset) -> Result<Vec<Session>> {
     }
     let batches = dataset::scan_rows(ds, &cols, None, None).await?;
 
-    let mut by_id: HashMap<String, (Session, HashSet<(i64, String)>)> = HashMap::new();
+    // A session's fold: its distinct turns and the highest seq seen, which names the last one.
+    struct Fold {
+        session: Session,
+        turns: HashSet<(i64, String)>,
+        last_seq: i64,
+    }
+    let mut by_id: HashMap<String, Fold> = HashMap::new();
     for batch in &batches {
         let (sid, ts, wd, turn, harness, repo) = (
             scol(batch, "session_id"),
@@ -1218,34 +1234,41 @@ async fn scan_sessions(ds: &Dataset) -> Result<Vec<Session>> {
         let seq = icol(batch, "seq");
         for i in 0..batch.num_rows() {
             let id = sval(sid, i);
-            let (session, turns) = by_id.entry(id.clone()).or_insert_with(|| {
-                (
-                    Session {
-                        session_id: id,
-                        ts: sval(ts, i),
-                        workdir: sval(wd, i),
-                        harness: sval(harness, i),
-                        repo: sval(repo, i),
-                        turns: 0,
-                        first_prompt: String::new(),
-                    },
-                    HashSet::new(),
-                )
+            let row_seq = ival(seq, i);
+            let fold = by_id.entry(id.clone()).or_insert_with(|| Fold {
+                session: Session {
+                    session_id: id,
+                    ts: sval(ts, i),
+                    last_ts: sval(ts, i),
+                    workdir: sval(wd, i),
+                    harness: sval(harness, i),
+                    repo: sval(repo, i),
+                    turns: 0,
+                    first_prompt: String::new(),
+                },
+                turns: HashSet::new(),
+                last_seq: row_seq,
             });
             // Rows arrive in scan order, not time order, so the first one seen isn't the earliest.
             let row_ts = sval(ts, i);
-            if row_ts < session.ts {
-                session.ts = row_ts;
+            if row_ts < fold.session.ts {
+                fold.session.ts = row_ts.clone();
             }
-            turns.insert((ival(seq, i), sval(turn, i)));
+            // The last turn is the highest seq, whatever its stamp: a source may stamp its turns
+            // out of order.
+            if row_seq > fold.last_seq {
+                fold.last_seq = row_seq;
+                fold.session.last_ts = row_ts;
+            }
+            fold.turns.insert((row_seq, sval(turn, i)));
         }
     }
 
     let mut out: Vec<Session> = by_id
         .into_values()
-        .map(|(session, turns)| Session {
-            turns: turns.len(),
-            ..session
+        .map(|fold| Session {
+            turns: fold.turns.len(),
+            ..fold.session
         })
         .collect();
     out.sort_by(|a, b| (&a.ts, &a.session_id).cmp(&(&b.ts, &b.session_id)));
@@ -1273,7 +1296,7 @@ type BlockParts = HashMap<(i64, String, i64), (Block, Vec<(i64, String)>)>;
 ///
 /// A session that isn't in the memory is an error, not an empty result.
 pub async fn scan(
-    memory: Memory,
+    target: impl Into<Target>,
     needle: String,
     session_id: String,
     from: Option<i64>,
@@ -1281,6 +1304,9 @@ pub async fn scan(
     ignore_case: bool,
     context: usize,
 ) -> Result<String> {
+    let target = target.into();
+    let hint = target.hint();
+    let memory = target.holder(&session_id).await?;
     let read = open_read(&memory).await?;
     let note = read.note.clone().unwrap_or_default();
     let label = read.memory_label.clone().unwrap_or_else(|| memory.label());
@@ -1300,12 +1326,7 @@ pub async fn scan(
         bail!("no session {session_id} in {label}");
     }
     let result = find_needle(&blocks, &needle, &session_id, from, to, ignore_case);
-    Ok(crate::ui::render::scan_agent(
-        &note,
-        &memory_hint(read.memory_label.as_deref()),
-        &result,
-        context,
-    ))
+    Ok(crate::ui::render::scan_agent(&note, &hint, &result, context))
 }
 
 /// Every block of one session, splits de-overlapped. Matching raw chunks would miss a needle that
@@ -1630,9 +1651,12 @@ async fn push_coverage_lines(local: &Dataset, memory: &Memory, uri: &str) -> Str
     out
 }
 
-/// `memory`'s status. A remote reports this host's push coverage only when an agent here is `bound`
-/// to it: coverage is a question only for a memory this host pushes to.
-pub async fn status(memory: Memory, bound: bool) -> Result<String> {
+/// The status of what `target` reads. A remote reports this host's push coverage only as the bound
+/// memory: coverage is a question only for a memory this host pushes to.
+pub async fn status(target: impl Into<Target>) -> Result<String> {
+    let target = target.into();
+    let bound = target.is_bound();
+    let memory = target.into_memory();
     match open_for_read(&memory).await? {
         ReadOutcome::Ready(ds) => {
             let now = Utc::now();
@@ -1662,7 +1686,7 @@ pub async fn status(memory: Memory, bound: bool) -> Result<String> {
         }
         // An unreachable remote shows the local index's status instead, like the read commands.
         ReadOutcome::Offline => {
-            let body = Box::pin(status(Memory::local(), false)).await?;
+            let body = Box::pin(status(Memory::local())).await?;
             Ok(format!(
                 "remote {} unreachable — showing your local memory instead\n{body}",
                 memory.label()
@@ -1677,41 +1701,37 @@ pub async fn status(memory: Memory, bound: bool) -> Result<String> {
     }
 }
 
-/// This host's status: the local memory, then each memory its integrations are bound to — `bound`
-/// pairs a memory spec with the ids bound to it — and the ids installed with no memory recorded.
-pub async fn host_status(bound: &[(String, Vec<String>)], unrecorded: &[String]) -> Result<String> {
-    let mut out = status(Memory::local(), false).await?;
-    let local = Memory::local().open().await.ok();
-    let now = Utc::now();
-    for (spec, ids) in bound {
-        let memory = Memory::parse(spec);
-        let _ = writeln!(out, "\nmemory: {} (bound: {})", memory.label(), ids.join(", "));
-        let ds = match open_for_read(&memory).await {
-            Ok(ReadOutcome::Ready(ds)) => ds,
-            Ok(ReadOutcome::Offline) => {
-                out.push_str("unreachable\n");
-                continue;
-            }
-            Ok(ReadOutcome::NoIndex) => continue,
-            Err(e) => {
-                let _ = writeln!(out, "{e:#}");
-                continue;
-            }
-        };
-        let _ = writeln!(out, "chunks: {}", ds.count_rows(None).await?);
-        if let Memory::Remote { uri } = &memory {
-            out.push_str(&remote_lines(&ds, now).await);
-            if let Some(local) = &local {
-                out.push_str(&push_coverage_lines(local, &memory, uri).await);
-            }
-        }
+/// This host's status: the local memory, then the memory it is bound to with its push coverage.
+/// `note` is what a host without the binding is told about the memories an older funes bound its
+/// agents to.
+pub async fn host_status(bound: Option<&str>, note: Option<&str>) -> Result<String> {
+    let mut out = status(Memory::local()).await?;
+    if let Some(note) = note {
+        let _ = writeln!(out, "\n{note}");
     }
-    if !unrecorded.is_empty() {
-        let _ = writeln!(
-            out,
-            "\ninstalled with no memory recorded: {} — if one publishes, `funes add <agent> <memory>` records where",
-            unrecorded.join(", ")
-        );
+    let Some(spec) = bound else {
+        return Ok(out);
+    };
+    let memory = Memory::parse(spec);
+    let _ = writeln!(out, "\nmemory: {} (bound)", memory.label());
+    let ds = match open_for_read(&memory).await {
+        Ok(ReadOutcome::Ready(ds)) => ds,
+        Ok(ReadOutcome::Offline) => {
+            out.push_str("unreachable\n");
+            return Ok(out);
+        }
+        Ok(ReadOutcome::NoIndex) => return Ok(out),
+        Err(e) => {
+            let _ = writeln!(out, "{e:#}");
+            return Ok(out);
+        }
+    };
+    let _ = writeln!(out, "chunks: {}", ds.count_rows(None).await?);
+    if let Memory::Remote { uri } = &memory {
+        out.push_str(&remote_lines(&ds, Utc::now()).await);
+        if let Ok(local) = Memory::local().open().await {
+            out.push_str(&push_coverage_lines(&local, &memory, uri).await);
+        }
     }
     Ok(out)
 }
@@ -1809,13 +1829,13 @@ mod tests {
             .iter()
             .zip(["2 chunks awaiting embedding\n", "1 chunk awaiting embedding\n"])
         {
-            let out = status(memory.clone(), false).await.unwrap();
+            let out = status(memory.clone()).await.unwrap();
             assert!(out.starts_with(&format!("{prefix}{line}")), "{out}");
             ds = dataset::fill_vectors(&ds, &[chunk.id.as_str()], &[vec![0.0; dataset::DIM as usize]])
                 .await
                 .unwrap();
         }
-        let out = status(memory, false).await.unwrap();
+        let out = status(memory).await.unwrap();
         assert!(out.starts_with(&prefix), "{out}");
         assert!(!out.contains("awaiting embedding"), "{out}");
     }

@@ -285,8 +285,9 @@ fn binding_path(root: &Path, id: &str) -> PathBuf {
     root.join(format!("{id}.memory"))
 }
 
-/// The memory `id`'s setup was last bound to, when one was. Judged as `setup` is — the user's
-/// own, writable by nobody else — since it is what `setup` is handed.
+/// The memory an older funes bound `id` to, when one did: the note it kept beside each agent,
+/// from before the host's own binding. Judged as `setup` is — the user's own, writable by nobody
+/// else — since it is what `setup` is handed.
 pub fn binding(root: &Path, id: &str) -> Result<Option<String>> {
     let path = binding_path(root, id);
     let text = match std::fs::read_to_string(&path) {
@@ -299,7 +300,8 @@ pub fn binding(root: &Path, id: &str) -> Result<Option<String>> {
     Ok((!memory.is_empty()).then(|| memory.to_string()))
 }
 
-/// Note `memory` as what `id`'s setup was bound to, once it has run with it; `None` unbinds.
+/// Note `memory` as what `id`'s setup was bound to; `None` forgets the note, once the host's own
+/// binding carries it.
 pub fn bind(root: &Path, id: &str, memory: Option<&str>) -> Result<()> {
     let path = binding_path(root, id);
     match memory {
@@ -311,9 +313,8 @@ pub fn bind(root: &Path, id: &str, memory: Option<&str>) -> Result<()> {
 /// Memories, each with the ids of the integrations bound to it.
 pub type Bound = Vec<(String, Vec<String>)>;
 
-/// Each memory the installed integrations are bound to, with the ids bound to it, and the ids
-/// installed with neither an install record nor a binding: placed by hand or by a funes older than
-/// both, so funes cannot say where, if anywhere, they publish.
+/// Each memory an older funes bound the installed integrations to, with the ids bound to it, and
+/// the ids installed with neither an install record nor such a binding.
 pub fn bindings(root: &Path) -> Result<(Bound, Vec<String>)> {
     let mut bound: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unrecorded = Vec::new();
@@ -712,11 +713,12 @@ pub async fn provision(root: &Path, id: &str, from: Option<&str>) -> Result<Opti
 }
 
 /// Whether the copy at `root/<id>` is refreshed without being named again: a catalog install runs
-/// the catalog's newest release, and a copy this funes cannot run is replaced whatever its source.
+/// the catalog's newest release, so does a copy funes has no record of installing, and a copy this
+/// funes cannot run is replaced whatever its source.
 pub fn refreshes_on_every_run(root: &Path, id: &str) -> bool {
     std::env::var_os("FUNES_INTEGRATIONS").is_some()
         || speaks_another_contract(root, id)
-        || installed(root, id).is_some_and(|record| matches!(record.origin, Origin::Catalog { .. }))
+        || installed(root, id).is_none_or(|record| matches!(record.origin, Origin::Catalog { .. }))
 }
 
 /// Whether `release` is the one recorded as installed at `root/<id>`, by the digest the catalog
@@ -1766,6 +1768,34 @@ mod tests {
         integration(root.path(), "pi", &manifest("pi", CONTRACT_VERSION), "exit 3");
         let err = open(root.path(), "pi").unwrap().add(None).unwrap_err().to_string();
         assert!(err.contains('3'), "{err}");
+    }
+
+    /// Only an install named with `--from` runs as installed: the catalog's release, and a copy
+    /// funes has no record of installing, are refreshed on every run.
+    #[test]
+    fn only_an_install_named_with_from_runs_as_installed() {
+        let root = tempfile::tempdir().unwrap();
+        integration(root.path(), "pi", &manifest("pi", CONTRACT_VERSION), "true");
+        let manifest: Manifest = serde_json::from_str(&manifest("pi", CONTRACT_VERSION)).unwrap();
+        assert!(refreshes_on_every_run(root.path(), "pi"), "no record");
+
+        let refreshed = |origin: Origin| {
+            record(root.path(), &Installed::new(&manifest, origin, Files::new())).unwrap();
+            refreshes_on_every_run(root.path(), "pi")
+        };
+        let url = "hf://buckets/acme/funes-pi/pi/1.0.0/pi.tar.gz".to_string();
+        let sha256 = "ab".repeat(32);
+        assert!(refreshed(Origin::Catalog {
+            url: url.clone(),
+            sha256: sha256.clone(),
+        }));
+        assert!(
+            !refreshed(Origin::Directory {
+                path: root.path().join("elsewhere"),
+            }),
+            "named with --from, and no $FUNES_INTEGRATIONS set"
+        );
+        assert!(!refreshed(Origin::Archive { url, sha256 }));
     }
 
     /// The catalog's newest release is fetched unless it is the one recorded as installed, by

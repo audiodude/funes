@@ -70,6 +70,14 @@ platform (`--force` reinstalls the current one), then brings your agent integrat
 release; `funes status` tells you when a newer release is out. To build it yourself, see
 [Building from source](#building-from-source).
 
+funes names itself to the Hub: the User-Agent of its Hugging Face requests carries its version and
+an anonymous install id. The id is a random UUID kept in `~/.funes/install-id`, created on the
+first run. It derives from nothing (not your hostname, user, hardware, or Hugging Face account) and
+only lets the project count installs and active installs, local-only ones included. It goes
+nowhere but the Hub. Set `DO_NOT_TRACK=1` or `FUNES_NO_TELEMETRY=1` to leave it out. Deleting the
+file starts a new one. The installer's own downloads say only which script revision and platform
+they are for.
+
 ## Works across your agents (and models)
 
 Your memory isn't tied to one tool. Because Claude Code, Codex, pi, and Hermes all index into a single
@@ -94,8 +102,9 @@ an agent can recall.
 Dataset repositories created by funes are **private by default**. Existing repositories retain their
 current visibility, and making a funes-created memory public is a deliberate change on the Hub.
 
-Bind a memory when you add funes to an agent and it recalls from there and keeps it current on its
-own; or run the two commands directly:
+Bind your host to a memory, `funes bind <user|org>/funes-memory` or the memory named when you add
+an agent, and every agent recalls from it and keeps it current on its own; or run the two commands
+directly:
 
 ```bash
 funes push <user|org>/funes-memory                    # publish your local memory's new chunks
@@ -129,7 +138,7 @@ workflow-oriented [documentation index](docs/README.md) for the complete guides.
 
 | Command | Docs |
 | --- | --- |
-| `funes add <agent> [memory]` / `funes remove <agent>` / `funes mcp [memory]` | [docs/add.md](docs/add.md) — supported agents, integration lifecycle, generic MCP clients, hooks, and memory binding |
+| `funes add <agent> [memory]` / `funes bind <memory>` / `funes remove <agent>` / `funes mcp [memory]` | [docs/add.md](docs/add.md) — supported agents, integration lifecycle, memory binding, generic MCP clients, and hooks |
 | `funes index [path]` / `funes compact [memory]` | [docs/index.md](docs/index.md) — build/update the memory and compact it; sources, incremental, flags |
 | `funes recall "…"` / `funes get …` | [docs/recall.md](docs/recall.md) — recall passages and drill into them |
 | `funes sessions` / `funes sketch …` / `funes scan …` | [docs/sessions.md](docs/sessions.md) — list sessions, digest one, find a literal in one |

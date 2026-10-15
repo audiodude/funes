@@ -9,8 +9,82 @@ use anyhow::{anyhow, bail, Context, Result};
 use hf_hub::{HFBucket, HFClient, HFError, RepoTypeDataset};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use uuid::Uuid;
+
+const USER_AGENT_ORIGIN_ENV: &str = "HF_HUB_USER_AGENT_ORIGIN";
+const FUNES_USER_AGENT_ORIGIN: &str = concat!("funes/", env!("CARGO_PKG_VERSION"));
+/// Not under `$FUNES_HOME`: the id names the install, not a memory.
+const INSTALL_ID_FILE: &str = ".funes/install-id";
+
+/// Tag every Hub client the process creates, while retaining origins supplied by the caller or an
+/// agent integration. Call this once at process startup, before starting worker threads.
+pub fn configure_user_agent_origin() {
+    let current = std::env::var(USER_AGENT_ORIGIN_ENV).ok();
+    let opted_out = ["DO_NOT_TRACK", "FUNES_NO_TELEMETRY"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    let install = (!opted_out)
+        .then(|| std::env::var_os("HOME"))
+        .flatten()
+        .and_then(|home| install_id(&PathBuf::from(home).join(INSTALL_ID_FILE)));
+    std::env::set_var(
+        USER_AGENT_ORIGIN_ENV,
+        user_agent_origin(current.as_deref(), install.as_deref()),
+    );
+}
+
+fn user_agent_origin(current: Option<&str>, install_id: Option<&str>) -> String {
+    let install = install_id.map(|id| format!("install/{id}"));
+    let mut origins = Vec::new();
+    let mut added_funes = false;
+
+    for origin in current
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        // An install/… token was inherited from the funes that spawned this process.
+        .filter(|s| !s.is_empty() && !s.starts_with("install/"))
+    {
+        if origin == "funes" || origin.starts_with("funes/") {
+            if !added_funes {
+                origins.push(FUNES_USER_AGENT_ORIGIN);
+                origins.extend(install.as_deref());
+                added_funes = true;
+            }
+        } else {
+            origins.push(origin);
+        }
+    }
+
+    if !added_funes {
+        origins.push(FUNES_USER_AGENT_ORIGIN);
+        origins.extend(install.as_deref());
+    }
+    origins.join("; ")
+}
+
+/// Read from `path`, or created there. None when it can't be kept: a fresh id per run would
+/// count one install many times.
+fn install_id(path: &Path) -> Option<String> {
+    if let Some(id) = read_install_id(path) {
+        return Some(id);
+    }
+    let id = Uuid::new_v4().hyphenated().to_string();
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    // Exclusive, so processes starting together end up with one id: the first writer's.
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(format!("{id}\n").as_bytes()).ok().map(|()| id),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => read_install_id(path),
+        Err(_) => None,
+    }
+}
+
+fn read_install_id(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(Uuid::parse_str(text.trim()).ok()?.hyphenated().to_string())
+}
 
 /// `<org>/<repo>[/…]` with no scheme and not a path (`/` `.` `~`) → an HF dataset shorthand.
 pub fn is_remote_shorthand(spec: &str) -> bool {
@@ -215,6 +289,88 @@ pub(crate) fn sha256_file(path: &Path) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_agent_origin_defaults_to_versioned_funes() {
+        assert_eq!(user_agent_origin(None, None), FUNES_USER_AGENT_ORIGIN);
+        assert_eq!(
+            user_agent_origin(None, Some("abc")),
+            format!("{FUNES_USER_AGENT_ORIGIN}; install/abc")
+        );
+    }
+
+    #[test]
+    fn user_agent_origin_keeps_caller_origins() {
+        assert_eq!(
+            user_agent_origin(Some("custom/2.0; deployment/private"), None),
+            format!("custom/2.0; deployment/private; {FUNES_USER_AGENT_ORIGIN}")
+        );
+    }
+
+    #[test]
+    fn user_agent_origin_versions_and_deduplicates_integration_token() {
+        assert_eq!(
+            user_agent_origin(Some("funes; agent/claude; agent_version/2.1.296"), Some("abc")),
+            format!("{FUNES_USER_AGENT_ORIGIN}; install/abc; agent/claude; agent_version/2.1.296")
+        );
+        assert_eq!(
+            user_agent_origin(Some("funes/1.6.0; agent/hermes; funes"), None),
+            format!("{FUNES_USER_AGENT_ORIGIN}; agent/hermes")
+        );
+    }
+
+    #[test]
+    fn user_agent_origin_replaces_an_inherited_install_token() {
+        let inherited = format!("{FUNES_USER_AGENT_ORIGIN}; install/parent; agent/hermes");
+        assert_eq!(
+            user_agent_origin(Some(&inherited), Some("child")),
+            format!("{FUNES_USER_AGENT_ORIGIN}; install/child; agent/hermes")
+        );
+        assert_eq!(
+            user_agent_origin(Some(&inherited), None),
+            format!("{FUNES_USER_AGENT_ORIGIN}; agent/hermes")
+        );
+    }
+
+    #[test]
+    fn install_id_is_created_once_and_reused() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(INSTALL_ID_FILE);
+        let id = install_id(&path).unwrap();
+        assert_eq!(Uuid::parse_str(&id).unwrap().get_version(), Some(uuid::Version::Random));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{id}\n"));
+        assert_eq!(install_id(&path).as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn install_id_ignores_a_file_that_is_not_a_uuid() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("install-id");
+        std::fs::write(&path, "not an id\n").unwrap();
+        assert_eq!(install_id(&path), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not an id\n");
+    }
+
+    #[test]
+    fn concurrent_first_runs_share_one_install_id() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("install-id");
+        let ids: Vec<Option<String>> = std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..20).map(|_| scope.spawn(|| install_id(&path))).collect();
+            runs.into_iter().map(|run| run.join().unwrap()).collect()
+        });
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(ids.iter().flatten().count() >= 1);
+        assert!(ids.iter().flatten().all(|id| format!("{id}\n") == kept));
+    }
+
+    #[test]
+    fn install_id_is_omitted_where_it_cannot_be_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(install_id(&file.join("install-id")), None);
+    }
 
     #[test]
     fn bucket_urls_split_into_owner_name_and_path() {
