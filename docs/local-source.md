@@ -536,3 +536,39 @@ Expect 5.45.4 on both `PATH` and `LD_LIBRARY_PATH`
 `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
 No `funes update`, release tag/artifact, Hugging Face upload, or memory
 publication is part of this refresh. AI-assisted by Claude.
+
+### October 14, 2026 OMP 18.11.0 stable consumer refresh
+
+The isolated `update-stable18110` branch starts from custom revision
+`32a1f5f351d40aa40fc7f063212ec9e26f5b9533` (fork `main`). It merges upstream
+`huggingface/funes` main `ea8945cd6bb4db972be557df30d69d01271720d1`: `funes
+bind` and host-bound reads (a read naming no `--memory` reads the memory in
+`$FUNES_HOME/bound`; an explicit `--memory` or `funes mcp <path>` still reads
+exactly that memory, and an unbound `FUNES_HOME` still reads its local
+memory), `funes/<version>` and an anonymous install id
+(`~/.funes/install-id`, kept out by `DO_NOT_TRACK` or `FUNES_NO_TELEMETRY`) in
+the Hub User-Agent, installer User-Agent stamping, and push/sessions/add fixes.
+
+Conflicts: `src/main.rs` keeps the fork's exit-code `main` (local `funes
+source` dispatch, exit 75 for a busy writer, redacted OMP index errors) on
+upstream's explicit Tokio runtime, so the User-Agent origin is configured
+before worker threads start; `funes source` returns first, so the source
+protocol neither mints an install id nor touches the Hub origin. `README.md`
+and `scripts/install.sh` keep the fork's GitHub Releases installer, with
+upstream's `INSTALL_REV` User-Agent added. `Cargo.lock` merged cleanly.
+`cargo update` changed `aws-lc-rs` 1.18.2, `aws-lc-sys` 0.46.0, `deranged`
+0.5.9, `equivalent` 1.0.3, `generator` 0.8.11, `rustls` 0.23.46,
+`rustls-native-certs` 0.8.5, `schemars`/`schemars_derive` 1.2.3, `sha2`
+0.11.1, `syn` 3.0.9, `tokio` 1.53.3 and `zerocopy`/`zerocopy-derive` 0.8.63.
+The custom source protocol, OMP normalization and `--harness omp` indexing
+path are unchanged.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 427 tests across 48
+suites, including the 28 `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4 on `PATH` and `LD_LIBRARY_PATH`.
+`scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty, so
+credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
