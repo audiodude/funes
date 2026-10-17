@@ -1,23 +1,30 @@
 //! `compact`: merge a memory's small fragments, add its unindexed rows to the search indexes and
 //! delete its old versions, local or remote, without indexing or pushing anything.
 
-use super::push;
 use crate::hub;
 use crate::memory::dataset;
 use crate::memory::lock;
+use crate::memory::remote::{self, Compacted};
 use crate::memory::{Memory, MemoryState};
 use crate::ui;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use lance::Dataset;
-use std::collections::HashMap;
 
 /// Compact `target`, local or remote, and report the outcome.
 pub async fn run(target: Memory) -> Result<String> {
+    let label = target.label();
+    compact(target).await.map_err(|e| {
+        if hub::is_read_only(&e) {
+            anyhow!("{label} is read-only for your token — compacting it needs write access (check your HF token)")
+        } else {
+            e
+        }
+    })
+}
+
+async fn compact(target: Memory) -> Result<String> {
     match target.state().await? {
-        MemoryState::Offline => bail!(
-            "{} is unreachable — can't compact it while offline (check your connection)",
-            target.label()
-        ),
+        MemoryState::Offline => return Err(target.offline_error()),
         MemoryState::Missing => return Err(target.missing_error()),
         MemoryState::Unauthorized => return Err(target.unauthorized_error()),
         MemoryState::Empty => return Ok(format!("{}: nothing to compact\n", target.label())),
@@ -34,16 +41,42 @@ pub async fn run(target: Memory) -> Result<String> {
         Memory::Remote { uri } => uri,
     };
 
-    let (owner, name, _) = hub::parse_hf(uri)?;
-    let token = hub::hf_token().context("no HF token (set HF_TOKEN) — required to compact a remote memory")?;
-    // No HTTP retries, as `remote::compact` requires.
-    let repo = hub::client(Some(token.as_str()), false)?.dataset(owner, name);
-    let rev = "main".to_string();
-    let dataset_uri = format!("{uri}/{}.lance", dataset::TABLE);
-    let opts = HashMap::from([("hf_token".to_string(), token), ("revision".to_string(), rev.clone())]);
+    let w = remote::writable(uri)?;
     eprintln!("compacting the remote…");
-    let note = push::compact_remote(&repo, &dataset_uri, &opts, &rev, "funes compact").await?;
+    let note = compact_remote(&w, "funes compact").await?;
     Ok(format!("{}:\n{note}", target.label()))
+}
+
+/// Forced compaction: ask [`remote::compact`] to compact and commit under `message`, retrying on a
+/// head-moved conflict (it re-reads the head each call) until it lands or [`remote::MAX_COMMIT_RETRIES`] is
+/// exceeded.
+pub(crate) async fn compact_remote(w: &remote::Writable, message: &str) -> Result<String> {
+    for _ in 0..=remote::MAX_COMMIT_RETRIES {
+        match remote::compact(
+            &w.repo,
+            &w.dataset_uri,
+            w.opts.clone(),
+            &w.rev,
+            message.to_string(),
+            ui::index_progress,
+        )
+        .await?
+        {
+            Compacted::Committed(oid) => return Ok(format!("  compacted (commit {oid})\n")),
+            Compacted::Uncleaned(oid, e) => {
+                return Ok(format!(
+                    "  compacted (commit {oid})\n  note: old versions not deleted ({e:#}); \
+                     compact it again\n"
+                ))
+            }
+            Compacted::AlreadyCompact => return Ok("  already compact\n".to_string()),
+            Compacted::Conflict => continue,
+        }
+    }
+    bail!(
+        "compaction still conflicting after {} retries; compact it again",
+        remote::MAX_COMMIT_RETRIES
+    )
 }
 
 /// Compact a local memory: merge the fragments no index covers yet, refresh the indexes, and delete
@@ -55,11 +88,11 @@ pub(crate) async fn compact_local(ds: &mut Dataset) -> Result<()> {
     dataset::build_indexes(ds, ui::index_progress).await?;
 
     // Best-effort: a failed cleanup waits for the next compaction.
-    match ds.cleanup_old_versions(chrono::Duration::minutes(10), None, None).await {
-        Ok(stats) if stats.bytes_removed > 0 => eprintln!(
+    match dataset::delete_versions_before(ds, chrono::Duration::minutes(10)).await {
+        Ok(freed) if freed.bytes > 0 => eprintln!(
             "reclaimed {:.1} MB from {} old version(s)",
-            stats.bytes_removed as f64 / 1e6,
-            stats.old_versions
+            freed.bytes as f64 / 1e6,
+            freed.versions
         ),
         Ok(_) => {}
         Err(e) => eprintln!("note: version cleanup skipped — {e}"),

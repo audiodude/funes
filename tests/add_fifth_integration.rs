@@ -7,6 +7,7 @@
 mod support;
 
 use funes::inference::EmbeddingModel;
+use funes::memory::dataset;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -272,6 +273,20 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Every file under `dir`, with its contents.
+fn files_under(dir: &Path) -> Vec<(PathBuf, String)> {
+    walkdir::WalkDir::new(dir)
+        .sort_by_file_name()
+        .into_iter()
+        .map(|entry| entry.unwrap().into_path())
+        .filter(|path| path.is_file())
+        .map(|path| {
+            let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+            (path, text)
+        })
+        .collect()
+}
+
 #[test]
 fn an_integration_supplied_outside_the_checkout_is_refreshed_each_run_and_removed_whole() {
     let tmp = tempfile::tempdir().unwrap();
@@ -398,6 +413,15 @@ fn an_integration_installs_from_a_directory_named_on_the_command_line() {
         serde_json::from_str(&fs::read_to_string(home.join(".funes/agents/clyde.json")).unwrap()).unwrap();
     assert_eq!(recorded["origin"]["path"], from);
 
+    // Neither a directory nor an archive URL is an error before anything runs.
+    let out = funes(&home, &funes_home, &log, &["add", "clyde", "--from", "/nowhere/clyde"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("is not a directory, nor an hf://buckets/… archive URL"),
+        "{}",
+        stderr(&out)
+    );
+
     // Another directory's files, off a terminal: refused, naming the same.
     let other = bundle(&tmp.path().join("other/clyde"), "clyde", 1, "other");
     fs::remove_file(&log).unwrap();
@@ -414,15 +438,6 @@ fn an_integration_installs_from_a_directory_named_on_the_command_line() {
         "{err}"
     );
     assert!(!log.exists(), "setup did not run");
-
-    // Neither a directory nor an archive URL is an error before anything runs.
-    let out = funes(&home, &funes_home, &log, &["add", "clyde", "--from", "/nowhere/clyde"]);
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("is not a directory, nor an hf://buckets/… archive URL"),
-        "{}",
-        stderr(&out)
-    );
 }
 
 /// A directory named relative to where the command ran is recorded absolute: the record says
@@ -552,34 +567,6 @@ fn a_setup_that_fails_leaves_the_host_bound_as_asked() {
     );
 }
 
-/// A copy placed in the registry by hand has no record, and keeps its binding all the same.
-#[test]
-fn a_drop_in_copy_keeps_its_binding_across_runs() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let funes_home = tmp.path().join("funes");
-    let log = tmp.path().join("setup.log");
-    install(&home, "clyde", 1);
-    let record = home.join(".funes/agents/clyde.json");
-    let memory = tmp.path().join("team-memory");
-    let memory = memory.to_str().unwrap();
-
-    let out = funes_at_a_terminal(&home, &funes_home, &log, &["add", "clyde", memory]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
-    assert!(!record.exists(), "a drop-in has no record");
-
-    fs::remove_file(&log).unwrap();
-    let out = funes_at_a_terminal(&home, &funes_home, &log, &["add", "clyde"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
-    assert!(
-        fs::read_to_string(&log)
-            .unwrap()
-            .starts_with(&format!("add {memory}\n")),
-        "bound as before"
-    );
-    assert!(!record.exists());
-}
-
 /// Setup ran, so the install is recorded — even when a later step of the bootstrap fails: the
 /// files it installed are what the agent runs, and an unattended removal must find them recorded.
 #[test]
@@ -604,7 +591,7 @@ fn a_failed_first_push_still_records_the_install() {
     let out = funes_offline_at_a_terminal(&home, &funes_home, &log, &["add", "clyde", "acme/memory"]);
     let transcript = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "{transcript}");
-    assert!(transcript.contains("can't push while offline"), "{transcript}");
+    assert!(transcript.contains("is unreachable right now"), "{transcript}");
     assert!(fs::read_to_string(&log).unwrap().starts_with("v1\nadd"), "setup ran");
     assert!(record.exists(), "recorded all the same");
 
@@ -829,6 +816,30 @@ fn an_empty_bound_memory_gives_its_model() {
         &log,
         &["index", "--multilingual", "--harness", "clyde"],
     ));
+}
+
+/// Bound with no local memory, a host takes the memory's model as an add does: the next index, a
+/// hook's included, embeds as the memory does.
+#[tokio::test]
+async fn binding_a_host_with_no_local_memory_gives_it_the_memorys_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let funes_home = tmp.path().join("funes");
+    let log = tmp.path().join("setup.log");
+    let e5 = tmp.path().join("e5-memory");
+    support::memory_of(EmbeddingModel::MultilingualE5Small, &["给表加上索引"], &e5).await;
+    let e5 = e5.to_str().unwrap();
+
+    let out = funes(&home, &funes_home, &log, &["bind", e5]);
+    support::assert_success(&out);
+    assert!(stderr(&out).contains(&format!("the model of {e5}")), "{}", stderr(&out));
+    let local = dataset::open(&dataset::table_uri(funes_home.join("memory")), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset::embedding_model(&local).unwrap(),
+        EmbeddingModel::MultilingualE5Small
+    );
 }
 
 #[test]
@@ -1079,6 +1090,11 @@ fn an_installed_only_integration_adds_and_removes_once_trusted_at_a_terminal() {
     assert!(stderr(&out).starts_with("nothing to remove"), "{}", stderr(&out));
     assert!(!log.exists(), "no setup ran");
     assert!(!stamp.exists(), "and forgets the refusals all the same");
+
+    // Without `$FUNES_INTEGRATIONS` too: `remove` runs the installed copy, so no source is asked.
+    let out = funes_pinned(&home, &funes_home, &log, &["remove", "clyde"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "nothing to remove — no clyde integration is installed.\n");
 }
 
 #[test]
@@ -1162,6 +1178,61 @@ fn update_runs_setup_only_for_changed_files_and_keeps_the_binding() {
     let recorded: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join(".funes/agents/clyde.json")).unwrap()).unwrap();
     assert_eq!(recorded["version"], "1.1.0");
+}
+
+/// A refresh refused at the trust confirmation leaves every installed file as it was, for `add`
+/// and `update` alike: the agent's hooks run those files.
+#[test]
+fn a_refused_refresh_leaves_every_installed_file_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let funes_home = tmp.path().join("funes");
+    let log = tmp.path().join("setup.log");
+    let source = bundle(&home.join("integrations/clyde"), "clyde", 1, "v1");
+    let out = funes_at_a_terminal(&home, &funes_home, &log, &["add", "clyde"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let agents = home.join(".funes/agents");
+    let installed = files_under(&agents);
+
+    bundle(&source, "clyde", 1, "v2");
+    release(&source, "1.1.0");
+    let out = funes_at_a_terminal_answering(&home, &funes_home, &log, &["add", "clyde"], DECLINE_TRUST);
+    let transcript = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success() && transcript.contains("not confirmed"),
+        "{transcript}"
+    );
+    assert_eq!(files_under(&agents), installed);
+
+    let out = update(&home, &funes_home, &log, Some(&home.join("integrations")), false);
+    let err = stderr(&out);
+    assert!(err.contains("the clyde integration could not be updated"), "{err}");
+    assert_eq!(files_under(&agents), installed);
+}
+
+/// An installed file changed since its install is put back on update, unasked: its source holds
+/// the files confirmed once.
+#[test]
+fn update_puts_back_an_installed_file_changed_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let funes_home = tmp.path().join("funes");
+    let log = tmp.path().join("setup.log");
+    let source = bundle(&home.join("integrations/clyde"), "clyde", 1, "v1");
+    let out = funes_at_a_terminal(&home, &funes_home, &log, &["add", "clyde"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let setup = home.join(".funes/agents/clyde/setup");
+    let mut edited = fs::read_to_string(&setup).unwrap();
+    edited.push_str("# edited by hand\n");
+    fs::write(&setup, edited).unwrap();
+    let out = update(&home, &funes_home, &log, Some(&home.join("integrations")), false);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("Updated the clyde integration"), "{said}{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&setup).unwrap(),
+        fs::read_to_string(source.join("setup")).unwrap()
+    );
 }
 
 /// An integration whose update is refused stays as installed, and the others still update.
@@ -1390,4 +1461,27 @@ fn bind_makes_every_installed_agent_follow() {
     assert!(said.contains("this host is local: clyde, dotty follow."), "{said}");
     assert!(!bound.exists());
     assert_eq!(fs::read_to_string(&log).unwrap().matches("add\n").count(), 2);
+}
+
+/// `funes bind local` forgets what an older funes noted beside the agents, even beside one whose
+/// setup fails to follow: a note left would bind the host back on the next bare add or update.
+#[test]
+fn bind_local_forgets_the_older_notes_whatever_the_setups_do() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let funes_home = tmp.path().join("funes");
+    let log = tmp.path().join("setup.log");
+    let source = bundle(&home.join("integrations/clyde"), "clyde", 1, "");
+    let mut setup = fs::read_to_string(source.join("setup")).unwrap();
+    setup.push_str("[ \"$1\" != add ] || exit 7\n");
+    fs::write(source.join("setup"), setup).unwrap();
+    let out = funes_at_a_terminal(&home, &funes_home, &log, &["add", "clyde"]);
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let note = home.join(".funes/agents/clyde.memory");
+    fs::write(&note, "acme/memory\n").unwrap();
+
+    let out = funes(&home, &funes_home, &log, &["bind", "local"]);
+    let err = stderr(&out);
+    assert!(!out.status.success() && err.contains("clyde did not follow"), "{err}");
+    assert!(!note.exists());
 }

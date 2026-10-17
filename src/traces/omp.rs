@@ -2,7 +2,6 @@
 //! Graph-only sidecars keep controls and excluded messages out of the searchable text schema.
 
 use super::{jsonl, Block, Turn, FORMAT_VERSION};
-use crate::memory::dataset;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -98,11 +97,7 @@ fn id(value: Option<&Value>) -> Option<&str> {
 }
 
 fn sidecar_path(session_id: &str) -> Option<PathBuf> {
-    valid_id(session_id).then(|| {
-        dataset::funes_dir()
-            .join("omp-provenance")
-            .join(format!("{session_id}.json"))
-    })
+    valid_id(session_id).then(|| crate::home::omp_provenance_dir().join(format!("{session_id}.json")))
 }
 
 fn load_provenance(session_id: &str) -> Option<Provenance> {
@@ -712,6 +707,25 @@ mod tests {
         assert_eq!(turns[0].parent_uuid.as_deref(), Some("custom"));
         let provenance = provenance.unwrap();
         assert_eq!(provenance.entries[1].parent_id.as_deref(), Some("mode"));
+        assert!(!serde_json::to_string(&provenance).unwrap().contains("excluded"));
+    }
+
+    #[test]
+    fn seance_fork_header_and_wrapped_session_init_are_tolerated() {
+        // OMP 18.11.3 seance forks name their read-only source session in the header and rewrite
+        // inherited `session_init` entries as `custom`/`source_session_init` wrappers.
+        let bytes = fixture(vec![
+            json!({"type":"session","version":3,"id":"fork","cwd":"/tmp","seanceSource":"/sessions/source.jsonl"}),
+            json!({"type":"custom","id":"init","parentId":null,"customType":"source_session_init","data":{"type":"session_init","id":"orig","parentId":null,"systemPrompt":"excluded","task":"excluded","tools":[]}}),
+            json!({"type":"message","id":"m","parentId":"init","message":{"role":"user","content":"retained"}}),
+        ]);
+        let (turns, coverage, provenance) = parse(&bytes, Path::new("/nonexistent/fork.jsonl"), "sig".into(), "");
+        assert!(coverage.complete, "{:?}", coverage.issues);
+        assert_eq!(turns.iter().map(|t| t.turn_uuid.as_str()).collect::<Vec<_>>(), ["m"]);
+        assert_eq!(turns[0].session_id, "fork");
+        assert_eq!(turns[0].parent_uuid.as_deref(), Some("init"));
+        let provenance = provenance.unwrap();
+        assert!(provenance.dependencies.is_empty());
         assert!(!serde_json::to_string(&provenance).unwrap().contains("excluded"));
     }
 }

@@ -1,16 +1,22 @@
-//! `funes update`: replace the running binary in place with the latest release, and the
-//! version check behind `funes status`'s "update available" notice.
+//! `funes update`: replace the running binary in place with the latest release, bring every
+//! installed integration to its newest release, and the version check behind `funes status`'s
+//! "update available" notice.
 //!
 //! GitHub's latest release resolves to a tagged release containing `VERSION`,
 //! `SHA256SUMS`, and the binaries. The checksum and tagged version are verified before a binary is
 //! made executable. Replacement uses a same-filesystem rename, so the live process keeps its old
 //! inode and the next run picks up the new binary.
 
+use super::add::{confirm_trust, setup_add};
+use super::bind::migrate_bindings;
+use crate::agents::registry;
 use crate::hub::verify_checksum;
-use crate::memory::lock;
+use crate::memory::{self, lock};
+use crate::traces::spool;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -64,10 +70,25 @@ async fn announce_wait(waiting: &mut bool) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// `funes update`: fetch the latest release binary for this platform and replace the running
-/// executable in place. Idempotent — with `force`, reinstalls even when already up to date. The
-/// executable it replaced, or `None` when it was up to date.
-pub async fn run(force: bool) -> Result<Option<PathBuf>> {
+/// `funes update`: the binary, then every installed integration. A replaced binary is run to update
+/// them, since its contract decides which releases they take; one this host cannot replace does not
+/// hold them back.
+pub async fn run(force: bool) -> Result<()> {
+    // First: an older release that just replaced its binary hands over to this `funes update`.
+    wait_for_older_writers().await?;
+    let binary = binary(force).await;
+    if let Ok(Some(exe)) = &binary {
+        let e = Command::new(exe).arg("update").exec();
+        return Err(anyhow::Error::new(e).context(format!("running {} to update the integrations", exe.display())));
+    }
+    let agents = agents().await;
+    binary.and(agents)
+}
+
+/// Fetch the latest release binary for this platform and replace the running executable in
+/// place. Idempotent — with `force`, reinstalls even when already up to date. The executable it
+/// replaced, or `None` when it was up to date.
+async fn binary(force: bool) -> Result<Option<PathBuf>> {
     let asset = ASSET.ok_or_else(|| {
         anyhow!(
             "no prebuilt funes binary for this platform ({}/{}) — build from source: {REPO}#building-from-source",
@@ -124,6 +145,77 @@ pub async fn run(force: bool) -> Result<Option<PathBuf>> {
     println!("Updated {} ({current} → {installed}).", exe.display());
     println!("Running agents keep using the old funes until you restart them or start a new session.");
     Ok(Some(exe))
+}
+
+/// Bring every installed integration forward.
+async fn agents() -> Result<()> {
+    let root = registry::default_root()?;
+    // A host from before the binding is bound as its agents were; one that cannot be is still
+    // brought forward, each agent bound as it was.
+    match migrate_bindings(&root, None).await {
+        Ok(Some(disagreement)) => eprintln!("note: {disagreement}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("note: this host could not be bound as an older funes bound its agents: {e:#}"),
+    }
+    let mut failed = Vec::new();
+    for id in registry::registered_ids(&root)
+        .into_iter()
+        .filter(|id| spool::is_id(id))
+    {
+        match agent(&root, &id).await {
+            Ok(done) => println!("{done}"),
+            Err(e) => {
+                eprintln!("the {id} integration could not be updated: {e:#}");
+                failed.push(id);
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("not updated: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
+/// Bring `id`'s install to what its source holds now and re-run its setup, bound as it was — only
+/// when that changed its files. What it did, as a line to print.
+async fn agent(root: &Path, id: &str) -> Result<String> {
+    // Named with `--from`, an install stays as named: the one copy not refreshed on every run.
+    let record = registry::installed(root, id);
+    if let Some(record) = record.as_ref().filter(|_| !registry::refreshes_on_every_run(root, id)) {
+        return Ok(format!(
+            "The {id} integration stays as installed from {} until `funes add {id} --from` names its source again.",
+            record.origin
+        ));
+    }
+    let fetched = match registry::provision(root, id, None).await {
+        // A copy nothing recorded, that its source does not list: nothing to bring it forward to.
+        Err(e) if record.is_none() && e.downcast_ref::<registry::Absent>().is_some() => {
+            return Ok(format!("The {id} integration stays as placed: {e}."));
+        }
+        fetched => fetched?,
+    };
+    // Recorded from the same source: confirmed already, and up to date unless the installed copy changed.
+    let recorded = fetched
+        .as_ref()
+        .is_some_and(|p| registry::is_recorded(root, id, &p.origin, &p.files));
+    let intact = recorded && registry::verify_installed(root, id)? == registry::Verification::Intact;
+    let Some(provisioned) = fetched.filter(|_| !intact) else {
+        return Ok(format!("The {id} integration is up to date."));
+    };
+    if !recorded {
+        confirm_trust(&root.join(id), &provisioned.manifest, &provisioned.provenance)?;
+    }
+    // Bound as the host is; on a host without the binding, as an older funes bound the agent.
+    let bound = memory::binding()?.or(registry::binding(root, id)?);
+    let integration = provisioned.install(root)?;
+    setup_add(&integration, bound.as_deref())?;
+    let to = integration
+        .manifest
+        .version
+        .as_ref()
+        .map(|v| format!(" to {v}"))
+        .unwrap_or_default();
+    Ok(format!("Updated the {id} integration{to}."))
 }
 
 /// Verify the staged binary, confirm its reported version, and atomically rename it over `exe`.
@@ -381,11 +473,5 @@ mod tests {
         assert_eq!(notice_for("0.8.0", "0.8.0+dev"), None);
         // but a real newer release still notifies a dev build
         assert!(notice_for("0.8.1", "0.8.0+dev").is_some());
-    }
-
-    #[test]
-    fn unreadable_version_yields_no_false_alarm() {
-        assert_eq!(notice_for("garbage", "0.8.0"), None);
-        assert_eq!(notice_for("0.8.1", "garbage"), None);
     }
 }

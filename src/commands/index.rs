@@ -10,18 +10,18 @@
 
 use super::compact;
 use crate::chunk::{self, Tier};
+use crate::home;
 use crate::hub;
 use crate::inference::{self, embed_batched, Embedder};
-use crate::memory::dataset::{self, build_batch, model, schema};
+use crate::memory::dataset::{self, build_batch, model};
 use crate::memory::lock;
 use crate::memory::{Memory, MemoryState};
 use crate::scan;
 use crate::traces::spool;
 use crate::traces::{self, omp, repo, source};
+use crate::ui::prompt::confirm;
 use anyhow::{anyhow, Context, Result};
-use arrow_array::{Array, RecordBatchIterator, StringArray, UInt64Array};
-use futures::TryStreamExt;
-use lance::dataset::{Dataset, WriteParams, ROW_ID};
+use lance::Dataset;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -61,15 +61,140 @@ async fn acquire_lock(interactive: bool) -> Result<lock::MemoryLock> {
     Err(IndexBusy.into())
 }
 
-pub async fn local_memory_model() -> Result<Option<inference::EmbeddingModel>> {
-    match dataset::open(&dataset::table_uri(&dataset::local_memory_dir()), HashMap::new()).await {
-        Ok(ds) => Ok(Some(dataset::embedding_model(&ds)?)),
-        Err(_) => Ok(None),
+/// What `funes index` was asked, as the CLI help describes each.
+pub struct IndexArgs {
+    pub path: Option<String>,
+    pub harness: Option<String>,
+    pub check: bool,
+    pub no_thinking: bool,
+    pub limit: Option<usize>,
+    pub yes: bool,
+    pub omp_max_chunks: Option<usize>,
+    pub multilingual: bool,
+}
+
+/// `funes index`: validate a path, or index a path, a Hub trace repo, one integration's spool, or
+/// every spool. A spool refresh (no path: the per-turn hook, or a terminal's "keep me fresh") is
+/// budgeted and rows-first; an explicit path or Hub repo is indexed in full.
+pub async fn run(args: IndexArgs) -> Result<()> {
+    let IndexArgs {
+        path,
+        harness,
+        check,
+        no_thinking,
+        limit,
+        yes,
+        omp_max_chunks,
+        multilingual,
+    } = args;
+    let is_omp = harness.as_deref() == Some("omp");
+    anyhow::ensure!(
+        !is_omp || path.as_ref().is_some_and(|p| PathBuf::from(p).exists()),
+        "--harness omp requires an explicit existing local path"
+    );
+    anyhow::ensure!(
+        omp_max_chunks.is_none() || (omp_max_chunks != Some(0) && is_omp),
+        "--omp-max-chunks requires positive N and explicit --harness omp"
+    );
+    // `--harness` selects a spool; a path's turns name their own harness. OMP is the exception:
+    // `--harness omp` names how to read an explicit local OMP session path.
+    if let (Some(p), Some(_)) = (&path, &harness) {
+        if !is_omp {
+            return Err(anyhow!(
+                "`--harness` selects an integration's spool and does not apply to {p}: a turns file names its own harness"
+            ));
+        }
+    }
+    if check {
+        let path = path.ok_or_else(|| anyhow!("`--check` validates a PATH, and none was given"))?;
+        let report = if is_omp {
+            check_omp(&PathBuf::from(&path), no_thinking, limit)?
+        } else {
+            self::check(&PathBuf::from(&path), no_thinking, limit)?
+        };
+        print!("{}", report.text);
+        if !report.all_accepted() {
+            return Err(anyhow!("{} unit(s) rejected", report.rejected));
+        }
+        return Ok(());
+    }
+    if is_omp {
+        if multilingual {
+            ensure_local_memory(model::MULTILINGUAL).await?;
+        }
+        let path = path.ok_or_else(|| anyhow!("--harness omp requires an explicit existing local path"))?;
+        return run_index_omp(Path::new(&path), no_thinking, limit, yes, omp_max_chunks).await;
+    }
+    let budgeted = path.is_none();
+    let roots: Vec<PathBuf> = match (path, harness) {
+        // An existing local path wins over reading the same string as a repo ref.
+        (Some(p), _) if PathBuf::from(&p).exists() => vec![PathBuf::from(p)],
+        (Some(p), _) if p.starts_with("hf://") || hub::is_remote_shorthand(&p) => {
+            // A Hub trace dataset: resolve to `hf://datasets/<owner>/<name>` and index its
+            // auto-converted parquet.
+            let Memory::Remote { uri } = Memory::parse(&p) else {
+                return Err(anyhow!("expected a Hub repo, got {p:?}"));
+            };
+            if multilingual {
+                ensure_local_memory(model::MULTILINGUAL).await?;
+            }
+            return run_index_remote(&uri, no_thinking).await;
+        }
+        (Some(p), _) => return Err(anyhow!("no such path: {p}")),
+        (None, Some(id)) => match spool::select(&id) {
+            Ok(dir) => vec![dir],
+            Err(e) => {
+                // Off a terminal this is a hook, and a hook asking for a spool nothing writes is
+                // an install older than the spool: leave the stamp the read verbs report. At a
+                // terminal the error itself is read, and a typo must not leave one.
+                if !std::io::stdin().is_terminal() && spool::is_id(&id) {
+                    spool::note_missing(&id)?;
+                }
+                return Err(e);
+            }
+        },
+        // No target at all: index every spool — but only in a terminal. An automated run (no TTY)
+        // must name a target, so a session-end hook indexes just its own spool — a Claude
+        // session-end shouldn't pull in Codex or pi sessions.
+        (None, None) => {
+            if !std::io::stdin().is_terminal() {
+                return Err(anyhow!(
+                    "automated `funes index` needs a target — pass a path or `--harness <id>`; \
+                     refusing to index every spool unattended"
+                ));
+            }
+            spool::spools()
+        }
+    };
+    if multilingual {
+        ensure_local_memory(model::MULTILINGUAL).await?;
+    }
+    if roots.is_empty() {
+        println!(
+            "no agent converts its sessions here yet — `funes add <agent>` sets that up, \
+             and funes indexes what lands in {}.",
+            home::spool_root().display()
+        );
+        return Ok(());
+    }
+    if budgeted {
+        run_index_budgeted(&roots, no_thinking, limit, yes).await
+    } else {
+        run_index_roots(&roots, no_thinking, limit, yes).await
     }
 }
 
+/// The embedding model the local memory records, `None` when there is no local memory yet.
+pub async fn local_memory_model() -> Result<Option<inference::EmbeddingModel>> {
+    Memory::local()
+        .dataset()
+        .await?
+        .map(|ds| dataset::embedding_model(&ds))
+        .transpose()
+}
+
 pub async fn ensure_local_memory(model: inference::EmbeddingModel) -> Result<()> {
-    std::fs::create_dir_all(dataset::funes_dir())?;
+    std::fs::create_dir_all(home::dir())?;
     let _lock = acquire_lock(std::io::stdin().is_terminal()).await?;
     match local_memory_model().await? {
         Some(current) if current != model => Err(anyhow!(
@@ -79,39 +204,10 @@ pub async fn ensure_local_memory(model: inference::EmbeddingModel) -> Result<()>
         )),
         Some(_) => Ok(()),
         None => {
-            dataset::create_empty(&dataset::table_uri(&dataset::local_memory_dir()), model).await?;
+            dataset::create_empty(&dataset::table_uri(home::memory_dir()), model).await?;
             Ok(())
         }
     }
-}
-
-/// Every chunk id already stored. Re-indexing keeps only the chunks whose id isn't here, so a grown
-/// session (the same memory) contributes just its new turns — nothing is re-embedded or deleted. (A
-/// rewritten turn arrives under new ids, i.e. as another memory.) Chunk ids are global, so one
-/// unfiltered scan dedups any unit, whether it holds one session or thousands.
-async fn stored_ids(ds: &Dataset) -> Result<HashSet<String>> {
-    let batches = dataset::scan_rows(ds, &["id"], None, None).await?;
-    let mut ids = HashSet::new();
-    for batch in batches {
-        if let Some(col) = batch
-            .column_by_name("id")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        {
-            for i in 0..batch.num_rows() {
-                ids.insert(col.value(i).to_string());
-            }
-        }
-    }
-    Ok(ids)
-}
-
-/// A batch's string column, row by row.
-fn str_column<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> Result<Vec<&'a str>> {
-    let col = batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .with_context(|| format!("missing or non-string column {name}"))?;
-    Ok((0..batch.num_rows()).map(|i| col.value(i)).collect())
 }
 
 /// Elide every block's inline base64 `data:` URI payloads, before [`redact_units`] scans them: a
@@ -129,22 +225,20 @@ fn elide_turns(turns: &mut [traces::Turn]) {
 /// Redact secrets from `units`' turns *before* chunking — so a long key that chunking would split
 /// across pieces is whole when scanned, and never reaches the embedding, the local memory, or (via
 /// push) the Hub. One scanner run covers every unit given: the spawn costs ~1 s, the scan itself
-/// milliseconds. Scans exactly the blocks the pass will store ([`chunk::block_selected`]), so
-/// deferred tiers aren't scanned now and a tier-major backfill doesn't re-scan each session per
-/// tier. Best-effort: removes a secret whose value byte-matches the stored text (the common case,
-/// real newlines); anything that resists is caught downstream by the fail-closed push gate.
-/// Reports to stderr what it removed, per unit.
+/// milliseconds. Scans exactly the blocks the memory stores ([`chunk::block_selected`]).
+/// Best-effort: removes a secret whose value byte-matches the stored text (the common case, real
+/// newlines); anything that resists is caught downstream by the fail-closed push gate. Reports to
+/// stderr what it removed, per unit.
 fn redact_units(
     units: &mut [&mut [traces::Turn]],
     scanner: &dyn scan::SecretScanner,
-    tiers: &[Tier],
     include_thinking: bool,
 ) -> Result<()> {
     let n_units = units.len();
     let mut blocks: Vec<(usize, &mut traces::Block)> = Vec::new();
     for (u, turns) in units.iter_mut().enumerate() {
         for b in turns.iter_mut().flat_map(|t| t.blocks.iter_mut()) {
-            if chunk::block_selected(&b.block_type, tiers, include_thinking) {
+            if chunk::block_selected(&b.block_type, include_thinking) {
                 blocks.push((u, b));
             }
         }
@@ -181,15 +275,14 @@ fn redact_units(
 /// change the text a block splits into.
 fn sanitize_units(
     units: &mut [&mut [traces::Turn]],
-    tiers: &[Tier],
     include_thinking: bool,
-    scanner: Option<&scan::Trufflehog>,
+    scanner: Option<&impl scan::SecretScanner>,
 ) -> Result<()> {
     for turns in units.iter_mut() {
         elide_turns(turns);
     }
     if let Some(scanner) = scanner {
-        redact_units(units, scanner, tiers, include_thinking)?;
+        redact_units(units, scanner, include_thinking)?;
     }
     Ok(())
 }
@@ -372,17 +465,12 @@ fn retained_scanner(
 }
 
 async fn source_chunk_count(ds: &Dataset, key: &str) -> Result<usize> {
-    let filter = format!("source_path = '{}' AND harness = 'omp'", key.replace('\'', "''"));
+    let filter = format!("{} AND harness = 'omp'", dataset::eq("source_path", key));
     // Read the actual searchable payload, not only manifest row statistics.
-    let mut scan = ds.scan();
-    scan.project(&["id", "text", "vector"])?;
-    scan.filter(&filter)?;
-    let mut stream = scan.try_into_stream().await?;
-    let mut rows = 0;
-    while let Some(batch) = stream.try_next().await? {
-        rows += batch.num_rows();
-    }
-    Ok(rows)
+    dataset::scan_fold(ds, &["id", "text", "vector"], Some(&filter), None, 0, |rows, batch| {
+        rows + batch.num_rows()
+    })
+    .await
 }
 
 #[derive(Deserialize, Serialize)]
@@ -536,7 +624,7 @@ fn write_index_coverage(
 
 /// Source sessions with rows still owed, as recorded by the last indexing sweep.
 pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
-    let path = dataset::funes_dir().join("index-coverage.json");
+    let path = home::index_coverage_file();
     path.is_file().then(|| IndexCoverage {
         pending: read_index_coverage(&path).pending.len(),
     })
@@ -622,26 +710,23 @@ impl Indexer {
     /// Acquire the memory lock, open (or plan to create) the dataset, load incremental state, bring
     /// up the embedder and secret scanner, and enumerate `sources`' units.
     async fn open(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: bool) -> Result<Indexer> {
-        let dir = dataset::funes_dir();
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(home::dir())?;
         let interactive = std::io::stdin().is_terminal();
         // Held for the whole run so the stored-id read and the appends see one stable version.
         let _lock = acquire_lock(interactive).await?;
 
-        let uri = dataset::table_uri(&dataset::local_memory_dir());
-        // A classified-empty local memory may still hold an empty dataset whose schema pins the
-        // embedding model chosen at creation; reopen it so the model survives the first write.
-        let ds = match writable_dataset(Memory::local().state().await?)? {
-            Some(ds) => Some(ds),
-            None => dataset::open(&uri, HashMap::new()).await.ok(),
-        };
+        let uri = dataset::table_uri(home::memory_dir());
+        let ds = Memory::local().dataset().await?;
 
         let model = match &ds {
             Some(ds) => dataset::embedding_model(ds)?,
             None => model::ENGLISH,
         };
+        // Re-indexing keeps only the chunks whose id isn't stored, so a grown session contributes
+        // just its new turns — nothing is re-embedded or deleted (a rewritten turn arrives under
+        // new ids). Chunk ids are global, so one unfiltered scan dedups any unit.
         let existing = match &ds {
-            Some(d) => stored_ids(d).await?,
+            Some(d) => dataset::ids(d, None).await?,
             None => HashSet::new(),
         };
         let first_index = existing.is_empty();
@@ -649,8 +734,8 @@ impl Indexer {
         // Incremental state: path -> {change stamp, level/refusal}; an unreadable or old-schema file →
         // empty. A first index (memory missing or empty) owes everything, whatever an old state.json
         // says — a stale one would silently skip every unit against the empty memory.
-        let state_path = dir.join("state.json");
-        let coverage_path = dir.join("index-coverage.json");
+        let state_path = home::index_state_file();
+        let coverage_path = home::index_coverage_file();
         let mut state: HashMap<String, UnitState> = if first_index {
             HashMap::new()
         } else {
@@ -659,7 +744,7 @@ impl Indexer {
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
         };
-        let omp_receipts_path = dir.join("omp-coverage.json");
+        let omp_receipts_path = home::omp_coverage_file();
         let omp_receipts = if first_index || !sources.iter().any(|src| src.is_omp()) {
             OmpReceipts::default()
         } else {
@@ -813,7 +898,7 @@ impl Indexer {
     ) -> Result<Vec<Option<Vec<traces::Turn>>>> {
         let mut read = take_batch(units, |n, &i| self.read_unit(i, &label(n)))?;
         let mut all: Vec<&mut [traces::Turn]> = read.iter_mut().flatten().map(Vec::as_mut_slice).collect();
-        self.batch_scanner = match sanitize_units(&mut all, &Tier::ALL, self.include_thinking, self.scanner.as_ref()) {
+        self.batch_scanner = match sanitize_units(&mut all, self.include_thinking, self.scanner.as_ref()) {
             Ok(()) if self.scanner.is_some() => ScannerState::Scanned,
             Ok(()) => ScannerState::Unavailable,
             Err(_) if self.sources.iter().all(|src| src.is_omp()) => {
@@ -847,7 +932,7 @@ impl Indexer {
             0
         };
         let (sessions, label) = unit_summary(turns, &key);
-        let mut chunks = chunk::chunks_from_turns(turns, &Tier::ALL, self.include_thinking);
+        let mut chunks = chunk::chunks_from_turns(turns, self.include_thinking);
         let mut repo_by_turn: HashMap<(&str, &str), String> = HashMap::new();
         for t in turns {
             if let Some(cwd) = &t.cwd {
@@ -1008,22 +1093,16 @@ impl Indexer {
         if chunks.is_empty() {
             return Ok(0);
         }
-        let model = self.embedder.model();
-        self.append(build_batch(model, chunks, None)?).await?;
+        let batch = build_batch(self.embedder.model(), chunks, None)?;
+        self.append(batch).await?;
         self.existing.extend(chunks.iter().map(|c| c.id.clone()));
         Ok(chunks.len() as u64)
     }
 
     async fn append(&mut self, batch: arrow_array::RecordBatch) -> Result<()> {
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema(self.embedder.model()));
-        let uri = self.uri.clone();
         match &mut self.ds {
-            Some(d) => {
-                d.append(reader, None).await?;
-            }
-            None => {
-                self.ds = Some(Dataset::write(reader, &uri, Some(WriteParams::default())).await?);
-            }
+            Some(d) => dataset::append(d, batch).await?,
+            None => self.ds = Some(dataset::create(&self.uri, batch).await?),
         }
         Ok(())
     }
@@ -1192,9 +1271,10 @@ async fn embed_pending(
 
 /// Embed stored text and fill the vectors at `row_ids` in place.
 async fn fill(ds: &mut Dataset, embedder: &mut dyn Embedder, row_ids: &[u64]) -> Result<()> {
-    let rows = ds.take_rows(row_ids, ds.schema().project(&["id", "text"])?).await?;
-    let ids = str_column(&rows, "id")?;
-    let texts = str_column(&rows, "text")?;
+    let rows = dataset::take_rows(ds, row_ids, &["id", "text"]).await?;
+    let (id, text) = (dataset::strs(&rows, "id"), dataset::strs(&rows, "text"));
+    let ids: Vec<&str> = (0..rows.num_rows()).map(|i| id.get(i)).collect();
+    let texts: Vec<&str> = (0..rows.num_rows()).map(|i| text.get(i)).collect();
     let n = texts.len();
     let vectors = embed_batched(embedder, &texts, |done| {
         eprint!("\r    embedding {done}/{n}   ");
@@ -1205,24 +1285,15 @@ async fn fill(ds: &mut Dataset, embedder: &mut dyn Embedder, row_ids: &[u64]) ->
 }
 
 async fn pending_embeddings(ds: &Dataset) -> Result<PendingEmbeddings> {
-    let mut scan = ds.scan();
-    scan.project(&["session_id", "block_type"])?;
-    scan.with_row_id();
-    scan.filter("vector IS NULL")?;
-    let mut stream = scan.try_into_stream().await?;
     let mut pending = PendingEmbeddings::default();
-    while let Some(batch) = stream.try_next().await? {
-        let sessions = str_column(&batch, "session_id")?;
-        let block_types = str_column(&batch, "block_type")?;
-        let row_ids = batch
-            .column_by_name(ROW_ID)
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .context("pending rows: missing or non-u64 row ids")?;
+    for batch in dataset::scan_rows_with_ids(ds, &["session_id", "block_type"], Some(dataset::UNEMBEDDED)).await? {
+        let (sessions, block_types) = (dataset::strs(&batch, "session_id"), dataset::strs(&batch, "block_type"));
+        let row_ids = dataset::row_ids(&batch)?;
         for i in 0..batch.num_rows() {
-            let sessions_of_tier = pending.by_tier.entry(Tier::of_block(block_types[i])).or_default();
+            let sessions_of_tier = pending.by_tier.entry(Tier::of_block(block_types.get(i))).or_default();
             match sessions_of_tier.last_mut() {
-                Some((session, rows)) if session == sessions[i] => rows.push(row_ids.value(i)),
-                _ => sessions_of_tier.push((sessions[i].to_string(), vec![row_ids.value(i)])),
+                Some((session, rows)) if session == sessions.get(i) => rows.push(row_ids.get(i)),
+                _ => sessions_of_tier.push((sessions.get(i).to_string(), vec![row_ids.get(i)])),
             }
             pending.total += 1;
         }
@@ -1521,7 +1592,7 @@ fn check_source(src: Box<dyn source::TraceSource>, path: &Path, no_thinking: boo
             }
         })?;
         let mut all: Vec<&mut [traces::Turn]> = read.iter_mut().flatten().map(Vec::as_mut_slice).collect();
-        sanitize_units(&mut all, &Tier::ALL, !no_thinking, scanner.as_ref())?;
+        sanitize_units(&mut all, !no_thinking, scanner.as_ref())?;
         let mut rejections = rejections.into_iter();
         for (n, unit_turns) in read.iter().enumerate() {
             let Some(unit_turns) = unit_turns else {
@@ -1533,7 +1604,7 @@ fn check_source(src: Box<dyn source::TraceSource>, path: &Path, no_thinking: boo
                 );
                 continue;
             };
-            let unit_chunks = chunk::chunks_from_turns(unit_turns, &Tier::ALL, !no_thinking);
+            let unit_chunks = chunk::chunks_from_turns(unit_turns, !no_thinking);
             text.push_str(&format!(
                 "  {} — {} turns, {} chunks\n",
                 units[from + n].key,
@@ -1574,29 +1645,13 @@ pub async fn run_index(path: &Path, no_thinking: bool, max_sessions: Option<usiz
 /// A first interactive index estimated at ≥ this many seconds prompts before continuing.
 const FIRST_INDEX_PROMPT_SECS: u64 = 120;
 
-/// Ask `prompt` on stderr and read one stdin line. Enter takes the default; anything but `y`/`yes`
-/// is a no, and EOF or a read error declines — never start long work off a wedged stdin.
-fn confirm(prompt: &str, default_yes: bool) -> bool {
-    eprint!("{prompt} ");
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    match std::io::stdin().read_line(&mut answer) {
-        Ok(n) if n > 0 => match answer.trim().to_ascii_lowercase().as_str() {
-            "" => default_yes,
-            "y" | "yes" => true,
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 /// Prompt before a long first embedding pass (interactive only); rows already written stay
 /// available and a later run resumes any embeddings left pending.
 fn confirm_full_index(chunks: usize, est: Duration) -> bool {
     confirm(
         &format!(
             "embedding {chunks} chunks is estimated at ~{} (rough, from the first batch). Continue? [y/N]  \
-             (the rows are in and searchable; a later `funes index` embeds the rest)",
+             (the rows are in and searchable; a later `funes index` embeds the rest) ",
             fmt_eta(est)
         ),
         false,
@@ -1612,7 +1667,7 @@ fn confirm_continue(remaining: Duration) -> bool {
         format!(" (~{} left, rough)", fmt_eta(remaining))
     };
     confirm(
-        &format!("more to index{estimate}. Finish it now? [Y/n]  (or let per-turn indexing catch up)"),
+        &format!("more to index{estimate}. Finish it now? [Y/n]  (or let per-turn indexing catch up) "),
         true,
     )
 }
@@ -1776,11 +1831,12 @@ mod tests {
                 })
             })
             .collect();
-        let reader = RecordBatchIterator::new(
-            [Ok(build_batch(model::ENGLISH, &chunks, None).unwrap())],
-            schema(model::ENGLISH),
-        );
-        Dataset::write(reader, path.to_str().unwrap(), None).await.unwrap()
+        dataset::create(
+            path.to_str().unwrap(),
+            build_batch(model::ENGLISH, &chunks, None).unwrap(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2136,106 +2192,21 @@ mod tests {
     }
 
     #[test]
-    fn redact_units_replaces_secrets_in_block_text() {
-        struct Fake(Vec<scan::Finding>);
-        impl scan::SecretScanner for Fake {
-            fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<scan::Finding>>> {
-                Ok(texts.iter().map(|_| self.0.clone()).collect())
-            }
-        }
-        let scanner = Fake(vec![
-            scan::Finding {
-                detector: "PrivateKey".into(),
-                raw: "TOPSECRET".into(),
-                decoder: "PLAIN".into(),
-            },
-            scan::Finding {
-                detector: "VirusTotal".into(),
-                raw: "cafef00d".into(),
-                decoder: "PLAIN".into(),
-            },
-        ]);
-        let mut turns = vec![traces::Turn {
-            format: traces::FORMAT_VERSION,
-            session_id: "sess".into(),
-            cwd: None,
-            workdir: "proj".into(),
-            turn_uuid: "turn".into(),
-            parent_uuid: None,
-            seq: 0,
-            ts: String::new(),
-            role: "user".into(),
-            blocks: vec![traces::Block {
-                block_type: "text".into(),
-                text: "key=TOPSECRET hash=cafef00d".into(),
-                tool_name: None,
-                tool_use_id: None,
-            }],
-            source_path: String::new(),
-            harness: "claude_code".into(),
-        }];
-        redact_units(&mut [&mut turns], &scanner, &chunk::Tier::ALL, true).unwrap();
-        assert_eq!(
-            turns[0].blocks[0].text,
-            "key=[REDACTED:PrivateKey] hash=[REDACTED:VirusTotal]"
-        );
-    }
-
-    #[test]
-    fn redact_only_scans_the_pass_tier_blocks() {
-        struct Fake;
-        impl scan::SecretScanner for Fake {
-            fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<scan::Finding>>> {
-                let hit = scan::Finding {
-                    detector: "PrivateKey".into(),
-                    raw: "SECRET".into(),
-                    decoder: "PLAIN".into(),
-                };
-                Ok(texts.iter().map(|_| vec![hit.clone()]).collect())
-            }
-        }
-        let block = |bt: &str, text: &str| traces::Block {
-            block_type: bt.into(),
-            text: text.into(),
-            tool_name: None,
-            tool_use_id: None,
-        };
-        let mut turns = vec![traces::Turn {
-            format: traces::FORMAT_VERSION,
-            session_id: "sess".into(),
-            cwd: None,
-            workdir: "proj".into(),
-            turn_uuid: "turn".into(),
-            parent_uuid: None,
-            seq: 0,
-            ts: String::new(),
-            role: "user".into(),
-            blocks: vec![
-                block("text", "note SECRET here"),
-                block("tool_result", "output SECRET dump"),
-            ],
-            source_path: String::new(),
-            harness: "claude_code".into(),
-        }];
-        // A text-only pass redacts the text block but leaves the tool_result it won't store untouched.
-        redact_units(&mut [&mut turns], &Fake, &[chunk::Tier::Text], true).unwrap();
-        assert!(
-            turns[0].blocks[0].text.contains("[REDACTED:PrivateKey]"),
-            "text block redacted"
-        );
-        assert_eq!(
-            turns[0].blocks[1].text, "output SECRET dump",
-            "unindexed tool_result untouched"
-        );
-    }
-
-    #[test]
-    fn elide_turns_strips_payloads_before_anything_scans_them() {
+    fn sanitize_elides_payloads_before_the_scanner_sees_them() {
+        // Records what it is shown, and finds the key wherever it is.
         struct Recorder(std::cell::RefCell<String>);
         impl scan::SecretScanner for Recorder {
             fn scan(&self, texts: &[&str]) -> Result<Vec<Vec<scan::Finding>>> {
                 self.0.borrow_mut().push_str(&texts.join("\n"));
-                Ok(texts.iter().map(|_| Vec::new()).collect())
+                let key = scan::Finding {
+                    detector: "PrivateKey".into(),
+                    raw: "TOPSECRET".into(),
+                    decoder: "PLAIN".into(),
+                };
+                Ok(texts
+                    .iter()
+                    .map(|t| t.contains("TOPSECRET").then(|| key.clone()).into_iter().collect())
+                    .collect())
             }
         }
         let mut turns = vec![traces::Turn {
@@ -2250,7 +2221,7 @@ mod tests {
             role: "tool".into(),
             blocks: vec![traces::Block {
                 block_type: "tool_result".into(),
-                text: r#"{"image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}"#.into(),
+                text: r#"{"image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="} key=TOPSECRET"#.into(),
                 tool_name: None,
                 tool_use_id: None,
             }],
@@ -2258,11 +2229,10 @@ mod tests {
             harness: "codex".into(),
         }];
         let scanner = Recorder(std::cell::RefCell::new(String::new()));
-        elide_turns(&mut turns);
-        redact_units(&mut [&mut turns], &scanner, &chunk::Tier::ALL, true).unwrap();
+        sanitize_units(&mut [&mut turns], true, Some(&scanner)).unwrap();
         assert_eq!(
             turns[0].blocks[0].text,
-            r#"{"image_url":"data:image/png;base64,[elided]"}"#
+            r#"{"image_url":"data:image/png;base64,[elided]"} key=[REDACTED:PrivateKey]"#
         );
         assert!(
             !scanner.0.borrow().contains("iVBORw0KGgo"),
@@ -2323,7 +2293,7 @@ mod tests {
         ])];
         let mut b = vec![turn(vec![block("tool_result", "output TOKEN dump")])];
         let scanner = Counting(std::cell::Cell::new(0));
-        redact_units(&mut [&mut a, &mut b], &scanner, &chunk::Tier::ALL, false).unwrap();
+        redact_units(&mut [&mut a, &mut b], &scanner, false).unwrap();
         assert_eq!(scanner.0.get(), 1, "one scanner run for both units");
         assert_eq!(a[0].blocks[0].text, "note [REDACTED:PrivateKey] here");
         assert_eq!(
@@ -2414,7 +2384,7 @@ mod tests {
     fn a_vanished_spool_key_is_retired() {
         let tmp = tempfile::tempdir().unwrap();
         let snapshot = tmp.path().join("index-coverage.json");
-        let gone = spool::spool_root().join("nobody/gone.funes.jsonl");
+        let gone = home::spool_root().join("nobody/gone.funes.jsonl");
         let kept = tmp.path().join("mine/kept.funes.jsonl");
         let omp = tmp.path().join("omp/native.jsonl");
         let retired = tmp.path().join("legacy/claude.jsonl");

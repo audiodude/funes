@@ -3,18 +3,15 @@
 //! and exits non-zero. A second run over that directory skips what it already read and what it
 //! already refused. Own test binary: it sets `$FUNES_HOME`.
 
+mod support;
+
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use arrow_array::{Array, StringArray};
+use funes::home;
 use funes::memory::dataset;
-
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/funes_jsonl")
-        .join(name)
-}
 
 async fn index(path: &Path) -> anyhow::Result<()> {
     funes::commands::index::run_index(path, false, None).await
@@ -22,7 +19,7 @@ async fn index(path: &Path) -> anyhow::Result<()> {
 
 /// The `session_id` of every row the local memory holds.
 async fn stored_rows() -> Vec<String> {
-    let ds = dataset::open(&dataset::table_uri(&dataset::local_memory_dir()), Default::default())
+    let ds = dataset::open(&dataset::table_uri(home::memory_dir()), Default::default())
         .await
         .expect("the memory exists");
     let mut out = Vec::new();
@@ -39,7 +36,7 @@ async fn stored_sessions() -> BTreeSet<String> {
 
 /// `(turn_uuid, repo)` of every row the local memory holds.
 async fn stored_repos() -> Vec<(String, String)> {
-    let ds = dataset::open(&dataset::table_uri(&dataset::local_memory_dir()), Default::default())
+    let ds = dataset::open(&dataset::table_uri(home::memory_dir()), Default::default())
         .await
         .expect("the memory exists");
     let mut out = Vec::new();
@@ -60,16 +57,22 @@ async fn turns_files_are_indexed_and_invalid_ones_rejected() {
     // One file at a time: a rejected file fails the run and writes nothing.
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("FUNES_HOME", home.path());
-    let err = index(&fixture("bad_line.funes.jsonl")).await.unwrap_err().to_string();
+    let err = index(&support::fixture("bad_line.funes.jsonl"))
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("bad_line.funes.jsonl:2:"), "{err}");
-    let err = index(&fixture("format2.funes.jsonl")).await.unwrap_err().to_string();
+    let err = index(&support::fixture("format2.funes.jsonl"))
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("unknown format 2"), "{err}");
-    index(&fixture("valid.funes.jsonl")).await.unwrap();
+    index(&support::fixture("valid.funes.jsonl")).await.unwrap();
     assert_eq!(stored_sessions().await, BTreeSet::from(["b3f2e0c4".to_string()]));
     // `--harness` is refused with a path: the facet is in the data.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_funes"))
         .arg("index")
-        .arg(fixture("valid.funes.jsonl"))
+        .arg(support::fixture("valid.funes.jsonl"))
         .args(["--harness", "claude"])
         .env("FUNES_HOME", home.path())
         .output()
@@ -82,7 +85,7 @@ async fn turns_files_are_indexed_and_invalid_ones_rejected() {
     // status.
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("FUNES_HOME", home.path());
-    let err = index(&fixture("")).await.unwrap_err().to_string();
+    let err = index(&support::fixture("")).await.unwrap_err().to_string();
     assert!(err.contains("2 unit(s) rejected"), "{err}");
     assert_eq!(
         stored_sessions().await,
@@ -96,7 +99,7 @@ async fn turns_files_are_indexed_and_invalid_ones_rejected() {
     // A budgeted run reads each unit once for its rows; a rejected unit is counted once.
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("FUNES_HOME", home.path());
-    let err = funes::commands::index::run_index_budgeted(&[fixture("")], false, None, true)
+    let err = funes::commands::index::run_index_budgeted(&[support::fixture("")], false, None, true)
         .await
         .unwrap_err()
         .to_string();
@@ -139,8 +142,12 @@ async fn turns_files_are_indexed_and_invalid_ones_rejected() {
     // bad one already refused, reports nothing and exits zero.
     let spool = tempfile::tempdir().unwrap();
     let refused = spool.path().join("bad_line.funes.jsonl");
-    std::fs::copy(fixture("valid.funes.jsonl"), spool.path().join("valid.funes.jsonl")).unwrap();
-    std::fs::copy(fixture("bad_line.funes.jsonl"), &refused).unwrap();
+    std::fs::copy(
+        support::fixture("valid.funes.jsonl"),
+        spool.path().join("valid.funes.jsonl"),
+    )
+    .unwrap();
+    std::fs::copy(support::fixture("bad_line.funes.jsonl"), &refused).unwrap();
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("FUNES_HOME", home.path());
     let err = index(spool.path()).await.unwrap_err().to_string();
@@ -149,7 +156,7 @@ async fn turns_files_are_indexed_and_invalid_ones_rejected() {
     index(spool.path()).await.unwrap();
 
     // The refusal is remembered against the file's content, so re-emitted content is read again.
-    std::fs::copy(fixture("github_issue.funes.jsonl"), &refused).unwrap();
+    std::fs::copy(support::fixture("github_issue.funes.jsonl"), &refused).unwrap();
     index(spool.path()).await.unwrap();
     assert_eq!(
         stored_sessions().await,
@@ -158,7 +165,7 @@ async fn turns_files_are_indexed_and_invalid_ones_rejected() {
 }
 
 async fn stored_blocks(home: &Path) -> Vec<String> {
-    let uri = dataset::table_uri(&home.join("memory").to_string_lossy());
+    let uri = dataset::table_uri(home.join("memory"));
     let ds = dataset::open(&uri, Default::default()).await.unwrap();
     let mut blocks = Vec::new();
     for batch in dataset::scan_rows(&ds, &["block_type"], None, None).await.unwrap() {

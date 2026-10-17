@@ -2,15 +2,15 @@
 //!
 //! Pipeline: parse transcripts → chunk → embed → store (lance), then read via
 //! `recall` (hybrid → neighbors, reranked when the pool is several times the hits), `get`, `status`.
-//! The binary ([`main`]) is a thin CLI over these modules; integration tests drive
-//! them directly.
+//! The binary (`main.rs`) is the CLI's definitions and dispatch, nothing else; integration
+//! tests drive the commands directly.
 //!
 //! One directory per layer, each with one job:
 //!
 //! - [`traces`] — where turns come from: turns files, the spools integrations write them into,
 //!   Hub parquet, and the `Turn`/`Block` model they all produce.
-//! - [`chunk`], [`scan`] — the two models the layers share: chunk text and its ids, and secret
-//!   findings.
+//! - [`chunk`], [`scan`], [`home`] — what the layers share: chunk text and its ids, secret
+//!   findings, and where funes's home keeps each thing.
 //! - [`inference`] — embedding and reranking behind traits, so a backend swaps at build time.
 //! - [`hub`] — *transport*: the Hugging Face Hub's client, credentials, and dataset-repo identity
 //!   and lifecycle. Knows nothing about memories; four layers call it.
@@ -33,11 +33,11 @@ compile_error!("funes is unix-only (Linux/macOS)");
 pub mod agents;
 pub mod chunk;
 pub mod commands;
+pub mod home;
 pub mod hub;
 pub mod inference;
 pub mod local_source;
 pub mod memory;
 pub mod scan;
-pub mod session_sketch;
 pub mod traces;
 pub mod ui;

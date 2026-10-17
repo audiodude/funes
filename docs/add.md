@@ -69,13 +69,14 @@ funes bind local                           # back to the local memory, every age
   instead. The next `funes update` or bare `funes add` binds the host to it when those agents all
   noted the same one, every installed agent following, and `funes status` says so until then.
   Agents that noted different memories were never meant to: the update names them, and
-  `funes bind <memory>` picks one.
+  `funes bind <memory>` picks one, or `funes bind local` none.
 - A memory that does not exist on the Hub yet: `funes add` offers to create it (default no, to
   catch typos). Repositories funes creates are **private by default**; changing that later is an
   explicit action on the Hub. An existing repository keeps its visibility.
 - A memory holds one [embedding model](index.md#sessions-not-in-english), so `funes bind` and
   `funes add` refuse a memory embedded with another model than your local memory, before anything
-  is bound.
+  is bound. On a host with no local memory yet, they create it with the memory's model, and stop
+  if they can't read that memory.
 - Publishing needs [TruffleHog](https://github.com/trufflesecurity/trufflehog): the first push
   `add` performs and every push the automation runs fail closed unless funes can scan the content
   for credentials, which agent traces commonly capture. funes looks for it on `PATH`, or at the
@@ -269,7 +270,8 @@ release for its contract and checks the archive against the digest the catalog n
 from the catalog, or found with no record of what installed it, a copy takes the catalog's newest
 release on every run, fetching nothing when that is the release installed; installed from `--from`,
 it runs as installed until named again; and a copy speaking a contract this funes cannot run is
-refreshed whatever its source. A source that cannot be reached leaves the installed copy to run.
+refreshed whatever its source. A source that cannot be reached leaves the installed copy to run,
+unless `--from` named it.
 `funes remove` fetches nothing: it runs the installed copy, unless this funes cannot run it. An id
 with no files anywhere is an error naming what is installed. A refresh rewrites only the files that
 differ and prunes nothing; `funes remove` deletes the directory whole.
@@ -280,7 +282,7 @@ funes vouches for files it published — a release the catalog names, whose dige
 them without asking. Anything else — what `--from` names, a `$FUNES_INTEGRATIONS` directory, files
 it has no record of installing — is confirmed at the terminal before `setup` runs, naming the
 package by publisher and version and where it came from; off a terminal, funes refuses rather than
-assumes. An archive's checksum proves it arrived intact, not who published it, so an archive
+assumes. A refused refresh leaves the installed copy as it was. An archive's checksum proves it arrived intact, not who published it, so an archive
 `--from` names is confirmed like a directory.
 
 What `funes add` installed is recorded beside the directory, in `~/.funes/agents/<id>.json`: the

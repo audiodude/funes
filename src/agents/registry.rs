@@ -14,8 +14,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::home;
 use crate::hub;
-use crate::memory::dataset;
 use crate::traces::spool;
 
 /// The integration contract this funes speaks.
@@ -219,7 +219,7 @@ pub fn verify_installed(root: &Path, id: &str) -> Result<Verification> {
     let Some(record) = installed(root, id) else {
         return Ok(Verification::Unrecorded);
     };
-    owned_by_me(root, &record_path(root, id), 0o022)?;
+    owned_by_me(root, &record_path(root, id))?;
     let dir = root.join(id);
     let changed: Vec<String> = record
         .files
@@ -295,7 +295,7 @@ pub fn binding(root: &Path, id: &str) -> Result<Option<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
     };
-    owned_by_me(root, &path, 0o022)?;
+    owned_by_me(root, &path)?;
     let memory = text.trim();
     Ok((!memory.is_empty()).then(|| memory.to_string()))
 }
@@ -313,19 +313,15 @@ pub fn bind(root: &Path, id: &str, memory: Option<&str>) -> Result<()> {
 /// Memories, each with the ids of the integrations bound to it.
 pub type Bound = Vec<(String, Vec<String>)>;
 
-/// Each memory an older funes bound the installed integrations to, with the ids bound to it, and
-/// the ids installed with neither an install record nor such a binding.
-pub fn bindings(root: &Path) -> Result<(Bound, Vec<String>)> {
+/// Each memory an older funes bound the installed integrations to, with the ids bound to it.
+pub fn bindings(root: &Path) -> Result<Bound> {
     let mut bound: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut unrecorded = Vec::new();
     for id in registered_ids(root) {
-        match binding(root, &id)? {
-            Some(memory) => bound.entry(memory).or_default().push(id),
-            None if installed(root, &id).is_none() => unrecorded.push(id),
-            None => {}
+        if let Some(memory) = binding(root, &id)? {
+            bound.entry(memory).or_default().push(id);
         }
     }
-    Ok((bound.into_iter().collect(), unrecorded))
+    Ok(bound.into_iter().collect())
 }
 
 /// The registry root, `~/.funes/agents` — fixed, not under `$FUNES_HOME`: an agent records the
@@ -383,7 +379,7 @@ pub fn open(root: &Path, id: &str) -> Result<Integration> {
 
     let setup = dir.join(SETUP);
     require_executable(&setup)?;
-    owned_by_me(root, &setup, 0o022)?;
+    owned_by_me(root, &setup)?;
 
     Ok(Integration { dir, manifest })
 }
@@ -442,10 +438,9 @@ fn read_manifest(path: &Path, id: &str) -> Result<Manifest> {
 
 /// Refuse a `path` that someone other than the user running funes could have written, checking
 /// every directory from `top` down as well as the file itself: funes is about to execute what it
-/// finds there. `others` is the mode bits that give it away: group and world write for the
-/// registry. Below `top`, a link is refused rather than followed: what it points at has parents of
-/// its own that this walk would never see.
-fn owned_by_me(top: &Path, path: &Path, others: u32) -> Result<()> {
+/// finds there. Group or world write gives it away. Below `top`, a link is refused rather than
+/// followed: what it points at has parents of its own that this walk would never see.
+fn owned_by_me(top: &Path, path: &Path) -> Result<()> {
     // SAFETY: `geteuid` reads a process attribute and cannot fail.
     let me = unsafe { libc::geteuid() };
     let mut path = path.to_path_buf();
@@ -462,7 +457,7 @@ fn owned_by_me(top: &Path, path: &Path, others: u32) -> Result<()> {
                 path.display()
             );
         }
-        if meta.permissions().mode() & others != 0 {
+        if meta.permissions().mode() & 0o022 != 0 {
             bail!(
                 "{} is writable by other users — funes will not run it; `chmod go-w` it or reinstall",
                 path.display()
@@ -498,22 +493,6 @@ pub fn speaks_another_contract(root: &Path, id: &str) -> bool {
         .is_some_and(|manifest| manifest.contract_version != CONTRACT_VERSION)
 }
 
-/// Put `manifest` back as `root/<id>`'s: the registry's manifest says what its `setup` last
-/// installed, so a refresh whose `setup add` never ran must not leave the new one.
-pub fn restore_manifest(root: &Path, id: &str, manifest: &[u8]) -> Result<()> {
-    let dir = root.join(id);
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    let path = dir.join("manifest.json");
-    if std::fs::read(&path).is_ok_and(|now| now == manifest) {
-        return Ok(());
-    }
-    let tmp = dir.join(format!(".manifest.json.funes-tmp{}", std::process::id()));
-    std::fs::write(&tmp, manifest).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))
-}
-
 impl Integration {
     /// Install funes into the agent, bound to `memory`; absent is the local memory.
     pub fn add(&self, memory: Option<&str>) -> Result<()> {
@@ -537,7 +516,7 @@ impl Integration {
         let status = Command::new(&setup)
             .args(args)
             .env("FUNES_BIN", &funes)
-            .env("FUNES_HOME", dataset::funes_dir())
+            .env("FUNES_HOME", home::dir())
             .env("FUNES_AGENT_ID", &self.manifest.id)
             .status()
             .with_context(|| format!("running `{command}`"))?;
@@ -595,13 +574,27 @@ pub enum Provenance {
     Unvouched(String),
 }
 
-/// What a provision resolved: whether funes vouches for the files, where they came from, and
-/// which files they are.
+/// What a provision resolved: whether funes vouches for the files, where they came from, which
+/// files they are and what they declare, staged outside the registry until they are installed.
 #[derive(Debug)]
 pub struct Provisioned {
     pub provenance: Provenance,
     pub origin: Origin,
     pub files: Files,
+    pub manifest: Manifest,
+    staged: tempfile::TempDir,
+}
+
+impl Provisioned {
+    /// Copy the staged files over `root/<id>`, resolve the integration there, and record it as
+    /// installed. Only a file that differs is rewritten, and nothing is pruned — an integration's
+    /// `setup` keeps its own state beside them.
+    pub fn install(self, root: &Path) -> Result<Integration> {
+        copy_into(self.staged.path(), &root.join(&self.manifest.id))?;
+        let integration = open(root, &self.manifest.id)?;
+        record(root, &Installed::new(&integration.manifest, self.origin, self.files))?;
+        Ok(integration)
+    }
 }
 
 /// Resolve `id`'s files: what `from` names, else `$FUNES_INTEGRATIONS` if set — authoritative, so
@@ -628,30 +621,33 @@ fn source_for(id: &str, from: Option<&str>) -> Result<Source> {
     Ok(Source::Catalog)
 }
 
-/// Install `id`'s files into the registry, from what `from` names when it names one. Only a file
-/// that differs is rewritten, and nothing is pruned — an integration's `setup` keeps its own state
-/// beside them. The id names the directory written, so it is checked here, before anything is.
-/// `None` when the catalog's newest release is the one recorded as installed: nothing is fetched,
-/// and the installed copy is judged as it stands.
+/// Stage `id`'s files outside the registry, from what `from` names when it names one: `root` is
+/// only read. The id names the directory they install into, so it is checked here, before anything
+/// is written. `None` when the catalog's newest release is the one recorded as installed: nothing
+/// is fetched, and the installed copy is judged as it stands.
 pub async fn provision(root: &Path, id: &str, from: Option<&str>) -> Result<Option<Provisioned>> {
     if !spool::is_id(id) {
         bail!("{id:?} is not an integration id (lowercase [a-z0-9_-])");
     }
     match source_for(id, from)? {
         Source::Redirected(src) => {
-            let files = install_from(root, id, &src)?;
+            let (manifest, files, staged) = stage(root, id, &src)?;
             Ok(Some(Provisioned {
                 provenance: Provenance::Unvouched(format!("$FUNES_INTEGRATIONS ({})", src.display())),
                 origin: Origin::Directory { path: src },
                 files,
+                manifest,
+                staged,
             }))
         }
         Source::Named(src) => {
-            let files = install_from(root, id, &src)?;
+            let (manifest, files, staged) = stage(root, id, &src)?;
             Ok(Some(Provisioned {
                 provenance: Provenance::Unvouched(src.display().to_string()),
                 origin: Origin::Directory { path: src },
                 files,
+                manifest,
+                staged,
             }))
         }
         Source::Archive(url) => {
@@ -660,11 +656,13 @@ pub async fn provision(root: &Path, id: &str, from: Option<&str>) -> Result<Opti
             validate_archive(&archive)?;
             let unpacked = staging.path().join("unpacked");
             unpack(&archive, &unpacked)?;
-            let files = install_from(root, id, &unpacked)?;
+            let (manifest, files, staged) = stage(root, id, &unpacked)?;
             Ok(Some(Provisioned {
                 provenance: Provenance::Unvouched(url.clone()),
                 origin: Origin::Archive { url, sha256 },
                 files,
+                manifest,
+                staged,
             }))
         }
         Source::Catalog => {
@@ -699,7 +697,7 @@ pub async fn provision(root: &Path, id: &str, from: Option<&str>) -> Result<Opti
                     release.version
                 );
             }
-            let files = install_from(root, id, &unpacked)?;
+            let (manifest, files, staged) = stage(root, id, &unpacked)?;
             Ok(Some(Provisioned {
                 provenance: Provenance::Vouched,
                 origin: Origin::Catalog {
@@ -707,6 +705,8 @@ pub async fn provision(root: &Path, id: &str, from: Option<&str>) -> Result<Opti
                     sha256,
                 },
                 files,
+                manifest,
+                staged,
             }))
         }
     }
@@ -730,15 +730,18 @@ fn is_installed_release(root: &Path, id: &str, release: &Release) -> bool {
     })
 }
 
-/// Copy `src` over `root/<id>` once what it declares checks out: a manifest that would be refused
-/// installed is refused here, before a byte moves, and so is another publisher's, and so is a
-/// package without its `setup` — the copy prunes nothing, so the installed one would run outside
-/// the record. The files copied, with their digests.
-fn install_from(root: &Path, id: &str, src: &Path) -> Result<Files> {
+/// Copy `src` into a staging directory once what it declares checks out: a manifest that would be
+/// refused installed is refused here, before a byte moves, and so is another publisher's than
+/// `root/<id>`'s, and so is a package without its `setup` — the install prunes nothing, so the
+/// installed one would run outside the record. What it declares, the files copied with their
+/// digests, and where.
+fn stage(root: &Path, id: &str, src: &Path) -> Result<(Manifest, Files, tempfile::TempDir)> {
     let incoming = read_manifest(&src.join("manifest.json"), id)?;
     require_executable(&src.join(SETUP))?;
     refuse_takeover(root, id, &incoming)?;
-    copy_into(src, &root.join(id))
+    let staged = tempfile::tempdir().context("creating a staging directory")?;
+    let files = copy_into(src, staged.path())?;
+    Ok((incoming, files, staged))
 }
 
 /// Refuse another publisher's files where `id`'s are installed. What funes recorded at install
@@ -996,7 +999,6 @@ mod tests {
         dir
     }
 
-    /// The whole `add` contract in one run: the argv, then the environment.
     #[test]
     fn a_setup_others_could_have_written_is_refused() {
         let root = tempfile::tempdir().unwrap();
@@ -1150,11 +1152,10 @@ mod tests {
                 & 0o777,
             0o644
         );
-        assert!(owned_by_me(&dst, &dst.join("setup"), 0o022).is_ok());
+        assert!(owned_by_me(&dst, &dst.join("setup")).is_ok());
     }
 
-    /// Ownership is judged against the user running funes, file by file up to the top, and by the
-    /// bits that matter there: group write is fine for a checkout, not for the registry.
+    /// Ownership is judged against the user running funes, file by file up to the top.
     #[test]
     fn ownership_is_the_running_users_up_to_the_top() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1163,15 +1164,11 @@ mod tests {
         let file = top.join("a/setup");
         std::fs::write(&file, "").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(
-            owned_by_me(&top, &file, 0o002).is_ok(),
-            "group write passes when world write alone is asked about"
-        );
-        let err = owned_by_me(&top, &file, 0o022).unwrap_err().to_string();
+        let err = owned_by_me(&top, &file).unwrap_err().to_string();
         assert!(err.contains("writable by other users"), "{err}");
         std::fs::set_permissions(top.join("a"), std::fs::Permissions::from_mode(0o777)).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = owned_by_me(&top, &file, 0o002).unwrap_err().to_string();
+        let err = owned_by_me(&top, &file).unwrap_err().to_string();
         assert!(err.contains("a is writable"), "a directory on the way counts: {err}");
     }
 
@@ -1280,8 +1277,8 @@ mod tests {
         assert!(err.contains("writable by other users"), "{err}");
     }
 
-    /// The memory noted beside an install is what a bare re-run binds: none until a setup ran
-    /// with one, gone when unbound, and refused — like the record — when others could write it.
+    /// A note an older funes kept beside an install reads back as its memory, goes when forgotten,
+    /// and is refused, like the record, when others could write it.
     #[test]
     fn the_binding_is_noted_beside_the_install() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1308,32 +1305,21 @@ mod tests {
         assert!(!root.join("pi.memory").exists());
     }
 
-    /// Integrations bound to one memory are listed under it; a recorded install with no binding is
-    /// local-only and listed nowhere; an install funes has no record of is named as unrecorded.
+    /// Integrations bound to one memory are listed under it; one with no binding is listed nowhere.
     #[test]
-    fn bindings_group_the_bound_and_name_the_unrecorded() {
+    fn bindings_group_the_bound_under_their_memory() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("agents");
-        for id in ["claude", "codex", "hermes", "pi"] {
+        for id in ["claude", "codex", "pi"] {
             integration(&root, id, &manifest(id, CONTRACT_VERSION), "true");
         }
         bind(&root, "claude", Some("acme/kb")).unwrap();
         bind(&root, "pi", Some("acme/kb")).unwrap();
-        let rec = Installed::new(
-            &open(&root, "hermes").unwrap().manifest,
-            Origin::Directory {
-                path: tmp.path().join("src"),
-            },
-            Files::new(),
-        );
-        record(&root, &rec).unwrap();
 
-        let (bound, unrecorded) = bindings(&root).unwrap();
         assert_eq!(
-            bound,
+            bindings(&root).unwrap(),
             vec![("acme/kb".to_string(), vec!["claude".to_string(), "pi".to_string()])]
         );
-        assert_eq!(unrecorded, vec!["codex".to_string()]);
     }
 
     /// A package without its executable would leave the installed one running outside the
@@ -1352,7 +1338,7 @@ mod tests {
             "echo bare",
         );
         std::fs::remove_file(bare.join(SETUP)).unwrap();
-        let err = format!("{:#}", install_from(&root, "pi", &bare).unwrap_err());
+        let err = format!("{:#}", stage(&root, "pi", &bare).unwrap_err());
         assert!(err.contains(&format!("no {SETUP} at")), "{err}");
         assert_eq!(installed_setup(), "#!/bin/sh\ntrue\n", "nothing copied");
 
@@ -1363,7 +1349,7 @@ mod tests {
             "echo inert",
         );
         std::fs::set_permissions(inert.join(SETUP), std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = install_from(&root, "pi", &inert).unwrap_err().to_string();
+        let err = stage(&root, "pi", &inert).unwrap_err().to_string();
         assert!(err.contains("not executable"), "{err}");
         assert_eq!(installed_setup(), "#!/bin/sh\ntrue\n", "nothing copied");
     }
@@ -1383,7 +1369,7 @@ mod tests {
             r#"{"contract_version": 1, "id": "pi", "label": "pi", "repo": "other/pi"}"#,
             "echo theirs",
         );
-        let err = install_from(&root, "pi", &theirs).unwrap_err();
+        let err = stage(&root, "pi", &theirs).unwrap_err();
         assert!(err.downcast_ref::<Takeover>().is_some(), "{err}");
         assert!(err.to_string().contains("`funes remove pi` first"), "{err}");
         assert_eq!(setup(), "#!/bin/sh\ntrue\n", "nothing copied");
@@ -1398,21 +1384,34 @@ mod tests {
             Files::new(),
         );
         record(&root, &rec).unwrap();
-        let err = install_from(&root, "pi", &theirs).unwrap_err().to_string();
+        let err = stage(&root, "pi", &theirs).unwrap_err().to_string();
         assert!(
             err.contains("acme's, from hf://buckets/huggingface/funes-integrations/pi/1.0.0/pi.tar.gz"),
             "{err}"
         );
 
-        // The same publisher's files replace it.
+        // The same publisher's files replace it, once installed.
         let mine = integration(
             &tmp.path().join("mine"),
             "pi",
             &manifest("pi", CONTRACT_VERSION),
             "echo mine",
         );
-        install_from(&root, "pi", &mine).unwrap();
+        let (declared, files, staged) = stage(&root, "pi", &mine).unwrap();
+        assert_eq!(setup(), "#!/bin/sh\ntrue\n", "staged, not installed");
+        let provisioned = Provisioned {
+            provenance: Provenance::Vouched,
+            origin: Origin::Directory { path: mine },
+            files,
+            manifest: declared,
+            staged,
+        };
+        provisioned.install(&root).unwrap();
         assert!(setup().contains("echo mine"));
+        assert!(matches!(
+            installed(&root, "pi").unwrap().origin,
+            Origin::Directory { .. }
+        ));
 
         // A manifest that would be refused installed is refused before the copy too.
         let bad = integration(
@@ -1421,7 +1420,7 @@ mod tests {
             &manifest("pi", CONTRACT_VERSION + 1),
             "echo bad",
         );
-        let err = install_from(&root, "pi", &bad).unwrap_err().to_string();
+        let err = stage(&root, "pi", &bad).unwrap_err().to_string();
         assert!(err.contains("contract version"), "{err}");
         assert!(setup().contains("echo mine"), "untouched");
     }
@@ -1549,23 +1548,6 @@ mod tests {
         assert!(!speaks_another_contract(&root, "pi"), "unreadable is open's to refuse");
     }
 
-    /// The registry's manifest says what `setup` last installed: a refresh whose `setup add` never
-    /// ran puts the previous one back.
-    #[test]
-    fn a_manifest_is_restored_as_it_was() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("agents");
-        assert!(installed_manifest(&root, "pi").is_none(), "nothing installed");
-        restore_manifest(&root, "pi", b"{}").unwrap();
-        assert!(!root.join("pi").exists(), "nothing to restore into");
-
-        integration(&root, "pi", &manifest("pi", 1), "true");
-        let before = installed_manifest(&root, "pi").unwrap();
-        std::fs::write(root.join("pi/manifest.json"), manifest("pi", 2)).unwrap();
-        restore_manifest(&root, "pi", &before).unwrap();
-        assert_eq!(installed_manifest(&root, "pi").unwrap(), before);
-    }
-
     /// A directory in the registry that is not an id is `open`'s to refuse, and never a note's
     /// to name.
     #[test]
@@ -1575,58 +1557,6 @@ mod tests {
         integration(&root, "pi (old)", &manifest("pi", 99), "true");
         integration(&root, "clyde", &manifest("clyde", 99), "true");
         assert_eq!(mismatched(&root), vec![("clyde".to_string(), 99)]);
-    }
-
-    #[test]
-    fn add_hands_setup_the_memory_and_the_contract_environment() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = integration(
-            root.path(),
-            "pi",
-            &manifest("pi", CONTRACT_VERSION),
-            r#"printf '%s\n' "$1" "$2" "$FUNES_AGENT_ID" "$FUNES_HOME" "$FUNES_BIN" > "$(dirname "$0")/ran""#,
-        );
-
-        open(root.path(), "pi").unwrap().add(Some("acme/kb")).unwrap();
-
-        let ran = std::fs::read_to_string(dir.join("ran")).unwrap();
-        let lines: Vec<&str> = ran.lines().collect();
-        assert_eq!(&lines[..3], &["add", "acme/kb", "pi"]);
-        assert_eq!(lines[3], dataset::funes_dir().to_string_lossy());
-        assert_eq!(lines[4], "funes", "the command an integration records");
-    }
-
-    #[test]
-    fn a_local_add_and_a_remove_pass_the_verb_alone() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = integration(
-            root.path(),
-            "pi",
-            &manifest("pi", CONTRACT_VERSION),
-            r#"printf '%s|%s\n' "$1" "$2" >> "$(dirname "$0")/ran""#,
-        );
-
-        let b = open(root.path(), "pi").unwrap();
-        b.add(None).unwrap();
-        b.remove().unwrap();
-
-        assert_eq!(std::fs::read_to_string(dir.join("ran")).unwrap(), "add|\nremove|\n");
-    }
-
-    #[test]
-    fn a_contract_mismatch_is_refused_before_setup_runs() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = integration(
-            root.path(),
-            "pi",
-            &manifest("pi", CONTRACT_VERSION + 1),
-            r#"touch "$(dirname "$0")/ran""#,
-        );
-
-        let err = open(root.path(), "pi").unwrap_err().to_string();
-        assert!(err.contains(&(CONTRACT_VERSION + 1).to_string()), "{err}");
-        assert!(err.contains(&CONTRACT_VERSION.to_string()), "{err}");
-        assert!(!dir.join("ran").exists(), "setup must not run");
     }
 
     /// The id is a path segment funes writes under the registry, so a bad one is refused before a
@@ -1760,14 +1690,6 @@ mod tests {
         std::fs::remove_file(&setup).unwrap();
         let err = format!("{:#}", open(root.path(), "pi").unwrap_err());
         assert!(err.contains(SETUP), "{err}");
-    }
-
-    #[test]
-    fn a_failing_setup_fails_the_command() {
-        let root = tempfile::tempdir().unwrap();
-        integration(root.path(), "pi", &manifest("pi", CONTRACT_VERSION), "exit 3");
-        let err = open(root.path(), "pi").unwrap().add(None).unwrap_err().to_string();
-        assert!(err.contains('3'), "{err}");
     }
 
     /// Only an install named with `--from` runs as installed: the catalog's release, and a copy

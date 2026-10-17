@@ -107,6 +107,25 @@ fn metadata_has_identical_identity_membership_and_bytes_but_no_content() {
 }
 
 #[test]
+fn omp_seance_fork_header_and_wrapped_session_init_are_tolerated() {
+    // OMP 18.11.3 seance forks add `seanceSource` to the header and rewrite inherited
+    // `session_init` entries as `custom`/`source_session_init` wrappers.
+    let mut rows = conversation("omp");
+    rows[0]["seanceSource"] = json!("/synthetic/source.jsonl");
+    rows.insert(
+        1,
+        json!({"type":"custom","id":"init","parentId":null,"customType":"source_session_init","data":{"type":"session_init","id":"orig","parentId":null,"systemPrompt":"EXCLUDED","task":"EXCLUDED","tools":[]}}),
+    );
+    rows[2]["parentId"] = json!("init");
+    let full = parse(&rows, "omp", 10.0, true);
+    assert_eq!(full["status"], "complete", "{full}");
+    assert_eq!(full["turns"][0]["invalid"], false);
+    assert_eq!(full["turns"][0]["items"][0]["text"], "Question");
+    assert_eq!(full["turns"][0]["items"][1]["text"], "Answer");
+    assert!(!full.to_string().contains("EXCLUDED"));
+}
+
+#[test]
 fn codex_fallback_identity_uses_exact_raw_newline_and_post_parse_context() {
     let rows = conversation("codex");
     let mut raw = encoded(&rows[..3]);
