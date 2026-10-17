@@ -572,3 +572,52 @@ suites, including the 28 `add_fifth_integration` tests against the
 credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### October 16, 2026 OMP 18.11.3 stable consumer refresh
+
+The isolated `update-stable18113` branch starts from custom revision
+`3525066248b028b25339a67f1f178a88fc5d835f` (fork `main`). It merges upstream
+`huggingface/funes` main `90c43de9bdbffbc867af6dfd51951bce73f50439` (version
+`1.9.0+dev`): `src/main.rs` reduced to the CLI's definitions and dispatch with
+the index, add, bind, remove and update flows moved under `src/commands`,
+`src/home.rs` owning every path under `~/.funes`, every Lance call behind
+`memory/dataset`, the sketch selector under `commands/sketch`, `funes update`
+also bringing installed integrations forward, recall ending a missed query
+with what to try, add/bind fixes, a streamed sessions fold, and removal of
+uncalled code and overlapping tests. Chunk ids are unchanged, so no reindex is
+needed; the install id and `DO_NOT_TRACK` handling are unchanged.
+
+Conflicts: upstream moved `funes index` dispatch into `commands::index::run`,
+so the fork's `--harness omp` explicit-path check, `--omp-max-chunks`, OMP
+`--check` and `run_index_omp` dispatch now live there (`IndexArgs` carries
+`omp_max_chunks`); the fork's exit-code `main` (local `funes source`
+dispatch, exit 75 for a busy writer, redacted OMP index errors) is unchanged.
+`src/commands/index.rs` opens the local dataset through upstream's
+`Memory::local().dataset()`, which already reopens an empty local dataset, and
+keeps the OMP scanner-state, shared append and source chunk count on
+upstream's `dataset` helpers; OMP coverage receipts and provenance sidecars
+are named by `home::omp_coverage_file()` and `home::omp_provenance_dir()` at
+their previous paths. `get`'s OMP provenance note reads through
+`dataset::has_column`/`eq`/`strs`. `src/commands/update.rs` keeps upstream's
+integration update and the fork's GitHub Releases download. `Cargo.lock`
+merged cleanly. `cargo update` changed `combine` 4.6.9,
+`defmt`/`defmt-macros` 1.2.0, `defmt-parser` 1.1.0, `frostem`
+1.20260821.8, `libc` 0.2.191, `schannel` 0.1.30, `unicode-normalization`
+0.1.26 and `zstd-sys` 2.1.2+zstd.1.5.7.
+
+OMP 18.11.3 seance forks add an optional `seanceSource` session header field
+and rewrite inherited `session_init` entries as
+`{"type":"custom","customType":"source_session_init","data":…}`. Neither the
+indexer nor the source normalizer rejects unknown header fields, and both
+accept `custom` entries without reading their payload; regression tests in
+`src/traces/omp.rs` and `tests/local_source_normalize.rs` pin that.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 411 tests across 43
+suites, including the 31 `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4 on `PATH` and `LD_LIBRARY_PATH`.
+`scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty, so
+credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
