@@ -621,3 +621,24 @@ suites, including the 31 `add_fifth_integration` tests against the
 credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### October 18, 2026 OMP 18.12.2 stable consumer refresh
+
+The isolated `update-stable18122` branch starts from custom revision
+`0c8ec64` (fork `origin/main`, the macOS 15 CI runner move). Upstream
+`huggingface/funes` main is unchanged at
+`90c43de9bdbffbc867af6dfd51951bce73f50439` and already merged, so no upstream
+merge is part of this refresh. OMP 18.12.2 does not change the session entry
+format; sessions staged under `--session-dir` may be symlinks whose writes go
+through the link, which needs no Funes change. `cargo update` changed
+`arc-swap` 1.9.3, `async-compression` 0.4.51, `compression-codecs` 0.4.46,
+`compression-core` 0.4.34 and `ureq-proto` 0.6.5.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld) passes all
+411 tests across 43 suites, including the 31 `add_fifth_integration` tests
+against the `/tmp`-extracted Arch Expect 5.45.4 on `PATH` and
+`LD_LIBRARY_PATH`. `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN`
+stays empty, so credential-gated Hub tests return early. No `funes update`,
+`funes push`, release tag/artifact, Hugging Face upload, or memory publication
+is part of this refresh. AI-assisted by Claude.
