@@ -642,3 +642,44 @@ against the `/tmp`-extracted Arch Expect 5.45.4 on `PATH` and
 stays empty, so credential-gated Hub tests return early. No `funes update`,
 `funes push`, release tag/artifact, Hugging Face upload, or memory publication
 is part of this refresh. AI-assisted by Claude.
+
+### October 20, 2026 OMP 18.12.3 stable consumer refresh
+
+The isolated `update-stable18123` branch starts from custom revision
+`c766de9d63c5dce94fc3b0db9aa24277e63165cf` (fork `main`). It merges upstream
+`huggingface/funes` main `2c289f17bdd4f27241102072a3599bcdff2a8b4e`: `funes
+index` no longer reads parquet files or Hub trace datasets (the `parquet`
+crate, `src/traces/parquet.rs`, the `<org>/<repo>` index target and
+`tests/remote_repo_source.rs` are removed, and a path holding no turns files
+is refused), and recall gains a repo filter, `funes recall --repo OWNER/NAME`
+and the MCP recall tool's `repo` argument, which matches any remote of the
+turn's resolved checkout and refuses a memory that predates the `repo` column.
+Remote memories (`--memory`, `funes mcp <memory>`) are unaffected.
+
+Conflicts: `src/traces.rs` keeps the fork's `omp` module without `parquet`.
+`src/traces/source.rs` keeps the fork's OMP trait hooks (`read_for_check`,
+`is_omp`, `omp_coverage`, `dependencies_current`) and `OmpTree` on upstream's
+parquet-free source. `src/commands/index.rs` keeps the `--harness omp`
+dispatch and `run_index_omp` and drops `run_index_remote`. `docs/index.md`
+keeps the native OMP section and drops the fork's Parquet trace format section
+with the reader it described. `Cargo.lock` is the fork's lock re-resolved by
+Cargo against the merged `Cargo.toml`, which drops `parquet`, `thrift`,
+`brotli`, `snap`, `integer-encoding`, `ordered-float` 2 and the `alloc-*`
+crates. No consumer reads parquet or Hub trace datasets: Actomasto calls only
+`funes source`, and the bridge calls `funes index <path> --harness omp --yes
+--omp-max-chunks`, `funes mcp <memory>` and `funes source`; recall's new
+`repo` argument is optional. `cargo update` changed `cc` 1.9.0,
+`find-msvc-tools` 0.1.15, `multiversion`/`multiversion-macros` 0.8.1,
+`rmcp`/`rmcp-macros` 3.6.0, `rustls-webpki` 0.103.16, `tokio` 1.54.0 and
+`webpki-root-certs`/`webpki-roots` 1.0.10.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 403 tests across 42
+suites, including the 31 `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4 on `PATH` and `LD_LIBRARY_PATH`; the eight
+fewer tests and one fewer suite are upstream's removed parquet and Hub trace
+tests, net of two new recall tests. `scripts/test-install.sh` passes.
+`HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
+No `funes update`, `funes push`, release tag/artifact, Hugging Face upload, or
+memory publication is part of this refresh. AI-assisted by Claude.
