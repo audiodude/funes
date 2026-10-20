@@ -2,8 +2,8 @@
 //!
 //! The CLI: its definitions, and the dispatch that parses a command line, calls one command and
 //! prints what comes back. `recall` reads the index (hybrid search, reranked for a deep pool);
-//! `index` builds/updates it from the integrations' spools, a turns file, a parquet file or a Hub
-//! trace repo. funes's home is `$FUNES_HOME` or `~/.funes`.
+//! `index` builds/updates it from the integrations' spools or a turns file. funes's home is
+//! `$FUNES_HOME` or `~/.funes`.
 
 use funes::agents;
 use funes::commands::target::Target;
@@ -54,6 +54,9 @@ enum Cmd {
         /// `claude_code`).
         #[arg(long)]
         harness: Option<String>,
+        /// Restrict to turns whose checkout resolved to this repo (`owner/name`).
+        #[arg(long, value_name = "OWNER/NAME")]
+        repo: Option<String>,
         /// Restrict to turns on or after this date (`YYYY-MM-DD`).
         #[arg(long, value_name = "DATE")]
         since: Option<String>,
@@ -91,10 +94,9 @@ enum Cmd {
     },
     /// Build or update your local memory from session transcripts, then compact it.
     Index {
-        /// A `.funes.jsonl` turns file (or a directory of them), a `.parquet` file, or a Hub
-        /// trace repo `<org>/<repo>`. Omit — in a terminal — to index every integration's spool
-        /// (~/.funes/spool/<id>); `--harness <id>` alone targets one. An automated (non-terminal)
-        /// run must name a target.
+        /// A `.funes.jsonl` turns file, or a directory of them. Omit — in a terminal — to index
+        /// every integration's spool (~/.funes/spool/<id>); `--harness <id>` alone targets one. An
+        /// automated (non-terminal) run must name a target.
         path: Option<String>,
         /// Index one integration's spool, or native OMP transcripts with an explicit local PATH
         /// and `--harness omp`. Other PATHs name their own harness.
@@ -378,6 +380,7 @@ async fn run(cli: Cli) -> Result<()> {
             block_type,
             role,
             harness,
+            repo,
             since,
             until,
             memory,
@@ -395,6 +398,7 @@ async fn run(cli: Cli) -> Result<()> {
                     block_type,
                     role,
                     harness,
+                    repo,
                     since,
                     until,
                 },
