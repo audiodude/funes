@@ -683,3 +683,27 @@ tests, net of two new recall tests. `scripts/test-install.sh` passes.
 `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
 No `funes update`, `funes push`, release tag/artifact, Hugging Face upload, or
 memory publication is part of this refresh. AI-assisted by Claude.
+
+### October 21, 2026 OMP 18.12.5 stable consumer refresh
+
+The isolated `update-stable18125` branch starts from custom revision
+`5172184da086fcafb8b06c53521f998ac372fc45` (fork `main`). It merges upstream
+`huggingface/funes` main `46056c695dc7cb52bdb0ef3be9e35b94ad0ca432`, whose only
+change since `2c289f1` bumps the crate version to `1.9.1+dev`; the merge has no
+conflicts and no consumer-visible behavior change. Actomasto still calls only
+`funes source`, and the bridge still calls `funes index <path> --harness omp
+--yes --omp-max-chunks`, `funes mcp <memory>` and `funes source`. OMP 18.12.5
+generalizes the session entry `activeLeafId` field from late `model_usage`
+markers to any off-branch entry; Funes archives every branch and never read
+that field, so the OMP reader is unchanged. `cargo update` changed `crc32fast`
+1.5.3 and `ureq` 3.4.3.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 403 tests across 42
+suites, including the `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4 on `PATH` and `LD_LIBRARY_PATH`.
+`scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty, so
+credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
