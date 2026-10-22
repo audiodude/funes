@@ -707,3 +707,23 @@ suites, including the `add_fifth_integration` tests against the
 credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### October 21, 2026 OMP 18.12.6 stable consumer refresh
+
+The isolated `update-stable18126` branch starts from custom revision
+`5ef3a33bf7d0927bec4e0289bd91edbafb76eddc` (`update-stable18125`). Upstream
+`huggingface/funes` main is still `46056c695dc7cb52bdb0ef3be9e35b94ad0ca432`,
+so there is nothing new to merge. `cargo update` changed `tokio` 1.54.1 and
+`ureq` 3.5.0 and dropped the unused `socks` 0.3.4. OMP 18.12.6 adds a
+`fallback` role to temporary `model_change` entries and defers loading
+startup-safe extensions until the interactive composer accepts input; Funes
+skips `model_change` entries entirely, so the OMP reader is unchanged.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 403 tests across 42
+suites, including the `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4. `scripts/test-install.sh` passes.
+`HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
+No `funes update`, `funes push`, release tag/artifact, Hugging Face upload, or
+memory publication is part of this refresh. AI-assisted by Claude.
