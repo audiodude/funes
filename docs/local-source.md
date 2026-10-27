@@ -727,3 +727,31 @@ suites, including the `add_fifth_integration` tests against the
 `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
 No `funes update`, `funes push`, release tag/artifact, Hugging Face upload, or
 memory publication is part of this refresh. AI-assisted by Claude.
+
+### October 26, 2026 OMP 18.13.0 stable consumer refresh
+
+The isolated `update-stable18130` branch starts from custom revision
+`e353255` (fork `main`, the 18.12.6 refresh). It merges upstream
+`huggingface/funes` main `37fd7b46170a6047d1cb2f80bfad37b4222b717c` (20
+commits): recall now reranks with `Alibaba-NLP/gte-reranker-modernbert-base`
+by default (a new ModernBERT forward on the CPU/BLAS backend, downloaded into
+the Hugging Face cache on first recall), and the BERT encoders move into their
+own modules. The only conflict was the `hf-hub` line in `Cargo.toml`; the fork
+keeps its `1.0.0` release with upstream's comment. Clippy's
+`chunks_exact_to_as_chunks` lint rejected three upstream `chunks_exact` calls
+in `src/inference/blas/modernbert.rs`; they use `as_chunks`, which drops the
+same remainder. `cargo update` moved 41 compatible packages (arrow 58.4.1, rmcp
+3.8.0, uuid 1.29.0, icu 2.4.0 and patch releases). OMP 18.13.0 adds a
+`rewind-report` custom message type and a `reason` on `before_agent_start`;
+the session JSONL entry shapes Funes reads are unchanged, so the OMP reader is
+unchanged and existing memory needs no reindex.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 406 tests across 42
+suites, including the `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4 (its package hash matches pacman's sync
+database). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty,
+so credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
