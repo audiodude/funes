@@ -3,15 +3,17 @@
 //! stack, so an alternative backend slots in behind the same interface. The backend is chosen at
 //! build time in one place — the `Default*` aliases below: default build → BLAS (a from-scratch
 //! forward on Accelerate/faer); `--no-default-features --features onnx` → fastembed/ort. On macOS
-//! the default build also carries `metal`, the same encoder on the GPU, which [`embedder`] hands
-//! the bulk calls to (see [`metal::Hybrid`]).
+//! the default build also carries `metal`, the same encoders on the GPU, which [`embedder`] and
+//! [`reranker`] hand their bulk calls to (see [`metal::Hybrid`] and [`metal::HybridReranker`]).
 
 #[cfg(feature = "blas")]
 pub mod blas;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
 
 // The single backend-selection point. One of these alias pairs is compiled; the factories below
 // box whichever it names. When both backends are compiled in (the backend benchmark builds that
@@ -19,12 +21,16 @@ use anyhow::{Context, Result};
 #[cfg(all(feature = "onnx", not(feature = "blas")))]
 use self::{OnnxEmbedder as DefaultEmbedder, OnnxReranker as DefaultReranker};
 #[cfg(feature = "blas")]
-use blas::{BlasEmbedder as DefaultEmbedder, BlasReranker as DefaultReranker};
+use blas::{BlasEmbedder as DefaultEmbedder, GteReranker as DefaultReranker};
 #[cfg(not(any(feature = "blas", feature = "onnx")))]
 compile_error!("funes needs an inference backend: feature `blas` (default) or `onnx`");
 
 /// How many texts one `embed` call takes.
 const EMBED_BATCH: usize = 256;
+
+/// The most tokens an encoder reads: a longer text, or query and passage pair, is cut to it. The
+/// BERT models' learned positions stop there.
+const MAX_LEN: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EmbeddingModel {
@@ -117,7 +123,64 @@ pub fn embedder(model: EmbeddingModel) -> Result<Box<dyn Embedder>> {
 
 /// Build the reranker for the compiled-in backend. See [`embedder`].
 pub fn reranker() -> Result<Box<dyn Reranker>> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    return Ok(Box::new(metal::HybridReranker::new()?));
+    #[allow(unreachable_code)]
     Ok(Box::new(DefaultReranker::new()?))
+}
+
+/// Resolve a snapshot dir for `repo` (e.g. "BAAI/bge-small-en-v1.5") in the standard HF cache,
+/// downloading `files`, paths within the repo, on first use.
+fn snapshot(repo: &str, files: &[&str]) -> Result<PathBuf> {
+    if let Some(dir) = local_snapshot(repo, files) {
+        return Ok(dir);
+    }
+    eprintln!("downloading {repo} (first use)…");
+    // A dedicated thread: the blocking hf-hub client drives its own runtime with block_on,
+    // which would panic if called from a thread already inside a tokio runtime (the MCP server).
+    let owned = repo.to_string();
+    let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+    std::thread::spawn(move || -> Result<PathBuf> {
+        let (owner, name) = owned
+            .split_once('/')
+            .ok_or_else(|| anyhow!("model repo {owned} is not owner/name"))?;
+        let client = hf_hub::HFClientSync::new().map_err(|e| anyhow!("hf-hub client: {e}"))?;
+        let r = client.model(owner, name);
+        let mut dir = PathBuf::new();
+        for file in &files {
+            let path = r
+                .download_file()
+                .filename(file)
+                .send()
+                .with_context(|| format!("downloading {owned}/{file}"))?;
+            // The snapshot holds the file as deep as its path in the repo goes: onnx/model.onnx
+            // is two levels down.
+            dir = path
+                .ancestors()
+                .nth(Path::new(file).components().count())
+                .ok_or_else(|| anyhow!("{} is not in a snapshot dir", path.display()))?
+                .to_path_buf();
+        }
+        Ok(dir)
+    })
+    .join()
+    .map_err(|_| anyhow!("model download thread panicked"))?
+}
+
+/// A cached snapshot of `repo` holding each of `files`, if any, in the cache hf-hub downloads into.
+/// With several snapshots cached the pick is arbitrary, which is fine here: any complete copy of
+/// these frozen model repos is interchangeable.
+fn local_snapshot(repo: &str, files: &[&str]) -> Option<PathBuf> {
+    let snaps = hf_hub::resolve_cache_dir()
+        .join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots");
+    for e in std::fs::read_dir(&snaps).ok()?.flatten() {
+        let p = e.path();
+        if files.iter().all(|f| p.join(f).exists()) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// fastembed/ort embedder on the ONNX Runtime CPU EP.
@@ -137,7 +200,7 @@ impl OnnxEmbedder {
         };
         Ok(Self {
             model,
-            inner: TextEmbedding::try_new(InitOptions::new(fastembed_model))?,
+            inner: TextEmbedding::try_new(InitOptions::new(fastembed_model).with_max_length(MAX_LEN))?,
         })
     }
 }
@@ -153,17 +216,38 @@ impl Embedder for OnnxEmbedder {
     }
 }
 
-/// fastembed/ort reranker: BAAI/bge-reranker-base cross-encoder on the ONNX Runtime CPU EP.
+/// fastembed/ort reranker: the gte-reranker-modernbert-base cross-encoder, from the ONNX export its
+/// repo ships, on the ONNX Runtime CPU EP.
 #[cfg(feature = "onnx")]
 pub struct OnnxReranker(fastembed::TextRerank);
 
 #[cfg(feature = "onnx")]
 impl OnnxReranker {
     pub fn new() -> Result<Self> {
-        use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
-        Ok(Self(TextRerank::try_new(RerankInitOptions::new(
-            RerankerModel::BGERerankerBase,
-        ))?))
+        use fastembed::{RerankInitOptionsUserDefined, TextRerank, TokenizerFiles, UserDefinedRerankingModel};
+        // fastembed does not list gte: funes fetches the export, and the four files fastembed
+        // builds its tokenizer from.
+        let dir = snapshot(
+            "Alibaba-NLP/gte-reranker-modernbert-base",
+            &[
+                "onnx/model.onnx",
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ],
+        )?;
+        let read =
+            |file: &str| std::fs::read(dir.join(file)).with_context(|| format!("reading {file} of {}", dir.display()));
+        let tokenizer = TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+        let model = UserDefinedRerankingModel::new(dir.join("onnx/model.onnx"), tokenizer);
+        let options = RerankInitOptionsUserDefined::new().with_max_length(MAX_LEN);
+        Ok(Self(TextRerank::try_new_from_user_defined(model, options)?))
     }
 }
 
