@@ -755,3 +755,29 @@ database). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty,
 so credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### October 28, 2026 OMP 18.13.3 stable consumer refresh
+
+The isolated `update-stable18133` branch starts from `update-stable18130`
+(`5c41262`, the installed 18.13.0 refresh). It merges upstream
+`huggingface/funes` main `6fe09a3f347d685184f8d124d5c7ee74c22ee2f9` (9
+commits): indexing counts the languages a memory's sessions are written in,
+stamps the counts in dataset metadata, and `funes status`, `push` and recall
+miss lines report them. Memories without counts are scanned once on the next
+index; chunk rows are unchanged, so no reindex. The only conflict was in
+`src/commands/index.rs`: the fork routes both unembedded and embedded writes
+through its `append` helper, so the language count lives there and covers
+both write paths. `cargo update` moved 9 compatible packages (aws-lc-rs
+1.19.0, hf-xet/xet 1.7.1, globset 0.4.21, rustix 1.1.6). OMP 18.13.3 adds an
+optional `continuationOf` session header field and a `prewalk` model-change
+role; the OMP reader reads header fields by name, so it is unchanged.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 417 tests across 43
+suites, including `add_fifth_integration` against the `/tmp`-extracted Arch
+Expect 5.45.4 (package hash matches pacman's sync database).
+`scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty, so
+credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
