@@ -388,7 +388,7 @@ async fn run(cli: Cli) -> Result<()> {
             let memory = memory.resolve()?;
             let query = query.join(" ");
             let spinner = Banner::spinner("recalling…");
-            let (note, hits) = recall::recall_hits(
+            let reply = recall::recall_with_progress(
                 memory,
                 query,
                 k,
@@ -406,7 +406,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             drop(spinner);
-            print!("{}", recall::rendered(&note, &hits));
+            print!("{reply}");
             Ok(())
         }
         Cmd::Scan {

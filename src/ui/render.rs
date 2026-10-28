@@ -64,16 +64,31 @@ pub fn recall_agent(note: &str, hits: &[(Hit, f64)]) -> String {
     out
 }
 
-/// What a `recall` reply closes with: the follow-ups that find a missed answer for the fewest tokens.
-const RECALL_MISS: &str = "if these miss: rephrase in the words the hits use, then raise --k; \
-                           a get line only reads around its own hit";
-
-/// A `recall` reply: the agent format closed by [`RECALL_MISS`], or `no results` and a hint. Byte-stable.
-pub fn recall_reply(note: &str, hits: &[(Hit, f64)]) -> String {
-    if hits.is_empty() {
-        return format!("{note}no results\nrephrase in other words");
+/// `rephrase`, naming the searched memories' `languages` when there are some to name.
+fn rephrase_in(rephrase: &str, languages: Option<&str>) -> String {
+    match languages {
+        Some(languages) => format!("{rephrase} or in a language detected in the searched memories ({languages})"),
+        None => rephrase.to_string(),
     }
-    format!("{}{RECALL_MISS}\n", recall_agent(note, hits))
+}
+
+/// What a `recall` reply closes with: the follow-ups that find a missed answer for the fewest tokens.
+fn recall_miss(languages: Option<&str>) -> String {
+    format!(
+        "if these miss: {}, then raise --k; a get line only reads around its own hit",
+        rephrase_in("rephrase in the words the hits use", languages)
+    )
+}
+
+/// A `recall` reply: the agent format closed by [`recall_miss`], or `no results` and a hint. Byte-stable.
+pub fn recall_reply(note: &str, hits: &[(Hit, f64)], languages: Option<&str>) -> String {
+    if hits.is_empty() {
+        return format!(
+            "{note}no results\n{}",
+            rephrase_in("rephrase in other words", languages)
+        );
+    }
+    format!("{}{}\n", recall_agent(note, hits), recall_miss(languages))
 }
 
 /// The agent `scan` format: a header naming the needle, the session and the window, then one line
@@ -362,7 +377,7 @@ mod tests {
     fn a_recall_reply_closes_with_what_to_try_on_a_miss() {
         let h = || hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
         assert_eq!(
-            recall_reply("", &[(h(), 0.5781)]),
+            recall_reply("", &[(h(), 0.5781)], None),
             format!(
                 "{}if these miss: rephrase in the words the hits use, then raise --k; \
                  a get line only reads around its own hit\n",
@@ -370,8 +385,20 @@ mod tests {
             )
         );
         assert_eq!(
-            recall_reply("remote down\n", &[]),
+            recall_reply("", &[(h(), 0.5781)], Some("eng, por")),
+            format!(
+                "{}if these miss: rephrase in the words the hits use or in a language detected in the searched memories \
+                 (eng, por), then raise --k; a get line only reads around its own hit\n",
+                recall_agent("", &[(h(), 0.5781)])
+            )
+        );
+        assert_eq!(
+            recall_reply("remote down\n", &[], None),
             "remote down\nno results\nrephrase in other words"
+        );
+        assert_eq!(
+            recall_reply("", &[], Some("eng, por")),
+            "no results\nrephrase in other words or in a language detected in the searched memories (eng, por)"
         );
     }
 

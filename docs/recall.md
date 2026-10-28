@@ -14,6 +14,9 @@ expansion, with a cross-encoder rerank of the pool before the cut when the pool 
 the hits asked for. What comes back is the **actual passage from the actual turn**, not a summary
 written about it.
 
+A query matches best in the language of the sessions it looks for. `funes status` lists the
+languages a memory's sessions are written in.
+
 Passages are searchable by their words as soon as their text is indexed, even while embeddings
 are pending. If text search fails, recall reports an error.
 
@@ -37,14 +40,15 @@ Each hit carries its provenance and a ready-to-run drill-down line:
 ```
 
 After the last hit, one line says what to try when the hits miss: rephrase in the words the hits
-use, then raise `--k`. A `→ get` line reads the turns around its own hit, so it helps once a hit
-answers, not to look for an answer the hits missed.
+use, or in a language detected in the searched memories when they hold more than English, then
+raise `--k`. A `→ get` line reads the turns around its own hit, so it helps once a hit answers,
+not to look for an answer the hits missed.
 
 The `→ get` line carries exactly the arguments `get` wants, `--memory` included when the call
 named one, as it named it, so the drill-down reads what the search read; a call naming none gets
 a bare line, and following it reads the same way. `no results` prints when nothing matched,
-followed by the advice to rephrase. The exact shape is
-stable — a contract, not a presentation; don't parse it loosely.
+followed by the advice to rephrase in the searched memories' languages when they hold more than
+English. The exact shape is stable — a contract, not a presentation; don't parse it loosely.
 The score is the cross-encoder's probability when the pool was reranked, the fused rank score
 otherwise (see `--candidates` below).
 

@@ -34,6 +34,7 @@ serde = { version = "1", features = ["derive"] }               # MCP request str
 serde_json = { version = "1", features = ["preserve_order"] }  # parse JSONL; preserve tool_use key order
 sha1 = "0.10"                    # chunk id = sha1(...)[:16]
 sha2 = "0.10"                    # verify release binaries before the installer/updater executes them
+whatlang = "0.18"                # the language of a text block
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }  # the anonymous install id in the User-Agent
 walkdir = "2"                    # recursive *.jsonl walk
@@ -112,6 +113,13 @@ path = "scripts/backfill_remote_repo.rs"
 [[example]]
 name = "migrate_schema"
 path = "scripts/migrate_schema.rs"
+
+# One-off backfill of the language counts of a memory indexed before funes counted them (local: a
+# commit; remote: a guarded commit). Delete it, and `memory::remote::count_languages`, once every
+# memory records its languages.
+[[example]]
+name = "backfill_languages"
+path = "scripts/backfill_languages.rs"
 
 [profile.release]
 opt-level = 3

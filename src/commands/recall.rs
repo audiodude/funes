@@ -14,8 +14,9 @@ use crate::traces;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use lance::Dataset;
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use tokio::sync::{Mutex, OnceCell};
 
@@ -420,13 +421,24 @@ pub async fn recall(
     neighbors: i64,
     filter: RecallFilter,
 ) -> Result<String> {
-    let (note, hits) = recall_hits(target, query, k, candidates, neighbors, filter, &|_| ()).await?;
-    Ok(rendered(&note, &hits))
+    recall_with_progress(target, query, k, candidates, neighbors, filter, &|_| ()).await
 }
 
-/// Recall results in the agent format, or the note and `no results` when nothing matched.
-pub fn rendered(note: &str, hits: &[(Hit, f64)]) -> String {
-    crate::ui::render::recall_reply(note, hits)
+/// [`recall`], reporting each stage to `progress`.
+pub async fn recall_with_progress(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    neighbors: i64,
+    filter: RecallFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<String> {
+    let search = Search::new(query, candidates, filter)?;
+    let pools = target.into().candidates(&search, progress).await?;
+    let languages = rephrase_languages(pools.iter().map(|pool| &pool.ds));
+    let (note, hits) = search.rank(pools, k, neighbors, progress).await?;
+    Ok(crate::ui::render::recall_reply(&note, &hits, languages.as_deref()))
 }
 
 /// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's
@@ -1510,6 +1522,58 @@ fn index_coverage_line() -> Option<String> {
     })
 }
 
+/// Each language `languages` counts, with its share, highest first.
+fn language_shares(languages: &dataset::Languages) -> Vec<(String, u64)> {
+    let total: u64 = languages.counts.values().sum();
+    let mut shares: Vec<(String, u64)> = languages
+        .counts
+        .iter()
+        .map(|(code, n)| (code.clone(), (n * 100 + total / 2) / total))
+        .filter(|&(_, share)| share > 0)
+        .collect();
+    shares.sort_by_key(|&(_, share)| Reverse(share));
+    shares
+}
+
+/// `shares` as `eng 75%, por 25%`.
+fn shares_list(shares: &[(String, u64)]) -> String {
+    let shares: Vec<String> = shares.iter().map(|(code, share)| format!("{code} {share}%")).collect();
+    shares.join(", ")
+}
+
+/// The `languages:` status line of a memory holding `rows` chunks, empty when it records none.
+fn languages_line(ds: &Dataset, rows: usize) -> String {
+    let Some(languages) = dataset::languages(ds) else {
+        return String::new();
+    };
+    let shares = language_shares(&languages);
+    if shares.is_empty() {
+        return String::new();
+    }
+    let coverage = if languages.rows == rows as u64 {
+        String::new()
+    } else {
+        format!(" (counted over {} of {rows} chunks)", languages.rows)
+    };
+    format!("languages: {}{coverage}\n", shares_list(&shares))
+}
+
+/// Languages detected across the searched memories, `None` for English alone.
+fn rephrase_languages<'a>(memories: impl IntoIterator<Item = &'a Dataset>) -> Option<String> {
+    let languages: BTreeSet<_> = memories
+        .into_iter()
+        .filter_map(dataset::languages)
+        // A language whose share rounds to 0% is too rare to retry in.
+        .flat_map(|languages| language_shares(&languages))
+        .map(|(code, _)| code)
+        .collect();
+    match languages.len() {
+        0 => None,
+        1 if languages.contains("eng") => None,
+        _ => Some(languages.into_iter().collect::<Vec<_>>().join(", ")),
+    }
+}
+
 /// Local index progress and its last write time. A version with no recorded timestamp is omitted.
 async fn index_lines(ds: &Dataset, now: DateTime<Utc>) -> Result<String> {
     let mut out = String::new();
@@ -1589,7 +1653,11 @@ pub async fn status(target: impl Into<Target>) -> Result<String> {
         ReadOutcome::Ready(ds) => {
             let now = Utc::now();
             let rows = dataset::count_rows(&ds, None).await?;
-            let mut out = format!("memory: {}\nchunks: {rows}\n", memory.label());
+            let mut out = format!(
+                "memory: {}\nchunks: {rows}\n{}",
+                memory.label(),
+                languages_line(&ds, rows)
+            );
             match &memory {
                 Memory::Local { .. } => out.push_str(&index_lines(&ds, now).await?),
                 Memory::Remote { uri } => {
@@ -1654,7 +1722,9 @@ pub async fn host_status(bound: Option<&str>, note: Option<&str>) -> Result<Stri
             return Ok(out);
         }
     };
-    let _ = writeln!(out, "chunks: {}", dataset::count_rows(&ds, None).await?);
+    let rows = dataset::count_rows(&ds, None).await?;
+    let _ = writeln!(out, "chunks: {rows}");
+    out.push_str(&languages_line(&ds, rows));
     if let Memory::Remote { uri } = &memory {
         out.push_str(&remote_lines(&ds, Utc::now()).await);
         if let Some(local) = Memory::local().dataset().await? {
@@ -1750,6 +1820,78 @@ mod tests {
         let out = status(memory).await.unwrap();
         assert!(out.starts_with(&prefix), "{out}");
         assert!(!out.contains("awaiting embedding"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn status_lists_a_memorys_languages_highest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let turns = [text_turn("session", 0, "user", "A narwhal parses transcripts.")];
+        let batch =
+            dataset::build_batch(dataset::model::ENGLISH, &chunk::chunks_from_turns(&turns, true), None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, &dataset::table_uri(memory.label()), None)
+            .await
+            .unwrap();
+        let counts = BTreeMap::from([
+            ("eng".to_string(), 296),
+            ("lat".to_string(), 1),
+            ("por".to_string(), 100),
+        ]);
+        dataset::stamp_languages(&mut ds, &dataset::Languages { rows: 1, counts })
+            .await
+            .unwrap();
+        let prefix = format!("memory: {}\nchunks: 1\nlanguages: eng 75%, por 25%\n", memory.label());
+        let out = status(memory).await.unwrap();
+        assert!(out.starts_with(&prefix), "{out}");
+    }
+
+    #[tokio::test]
+    async fn status_says_when_language_counts_miss_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let turns = [
+            text_turn("session", 0, "user", "A narwhal parses transcripts."),
+            text_turn("session", 1, "assistant", "Each line becomes a typed turn."),
+        ];
+        let batch =
+            dataset::build_batch(dataset::model::ENGLISH, &chunk::chunks_from_turns(&turns, true), None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, &dataset::table_uri(memory.label()), None)
+            .await
+            .unwrap();
+        let counts = BTreeMap::from([("eng".to_string(), 1)]);
+        dataset::stamp_languages(&mut ds, &dataset::Languages { rows: 1, counts })
+            .await
+            .unwrap();
+        let out = status(memory).await.unwrap();
+        assert!(
+            out.contains("\nlanguages: eng 100% (counted over 1 of 2 chunks)\n"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_names_the_searched_languages_unless_english_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = [text_turn("session", 0, "user", "A narwhal parses transcripts.")];
+        let mut ds = memory_of(&turns, dir.path()).await;
+        assert_eq!(rephrase_languages([&ds]), None);
+        for (counts, named) in [
+            (BTreeMap::from([("eng".to_string(), 9)]), None),
+            (BTreeMap::from([("eng".to_string(), 999), ("ita".to_string(), 1)]), None),
+            (
+                BTreeMap::from([("eng".to_string(), 3), ("por".to_string(), 1)]),
+                Some("eng, por"),
+            ),
+        ] {
+            let previous = ds.clone();
+            dataset::stamp_languages(&mut ds, &dataset::Languages { rows: 1, counts })
+                .await
+                .unwrap();
+            assert_eq!(rephrase_languages([&ds]).as_deref(), named);
+            assert_eq!(rephrase_languages([&previous, &ds, &ds]).as_deref(), named);
+        }
     }
 
     fn text_turn(session: &str, seq: i64, role: &str, text: &str) -> Turn {

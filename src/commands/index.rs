@@ -657,6 +657,8 @@ struct Indexer {
     n_skipped: u64,
     n_chunks: u64,
     n_embedded: u64,
+    /// The language counts the memory records, with the rows this run wrote counted in.
+    languages: Option<dataset::Languages>,
     /// Units (by index) whose read failed this run — reported once. Signed units also keep their
     /// refusal in state until their content or this build changes.
     rejected: HashSet<usize>,
@@ -717,6 +719,7 @@ impl Indexer {
             None => HashSet::new(),
         };
         let first_index = existing.is_empty();
+        let languages = ds.as_ref().and_then(dataset::languages);
 
         // Incremental state: path -> {change stamp, level/refusal}; an unreadable or old-schema file →
         // empty. A first index (memory missing or empty) owes everything, whatever an old state.json
@@ -783,6 +786,7 @@ impl Indexer {
             n_skipped: 0,
             n_chunks: 0,
             n_embedded: 0,
+            languages,
             rejected: HashSet::new(),
         })
     }
@@ -1087,6 +1091,9 @@ impl Indexer {
     }
 
     async fn append(&mut self, batch: arrow_array::RecordBatch) -> Result<()> {
+        if let Some(languages) = &mut self.languages {
+            languages.add(&batch);
+        }
         match &mut self.ds {
             Some(d) => dataset::append(d, batch).await?,
             None => self.ds = Some(dataset::create(&self.uri, batch).await?),
@@ -1118,6 +1125,7 @@ impl Indexer {
     /// Consumes the indexer, releasing the memory lock.
     async fn finalize(mut self) -> Result<()> {
         if let Some(d) = &mut self.ds {
+            record_languages(d, self.languages.as_ref()).await?;
             // Retry incomplete FTS coverage, and compact a fragmented memory, even when no rows or
             // vectors were written.
             if self.n_chunks > 0
@@ -1186,6 +1194,19 @@ impl Indexer {
         }
         Ok(())
     }
+}
+
+/// Bring the memory's language counts up to date.
+async fn record_languages(ds: &mut Dataset, kept: Option<&dataset::Languages>) -> Result<()> {
+    let rows = dataset::count_rows(ds, None).await? as u64;
+    let counted = match kept {
+        Some(kept) if kept.rows == rows => kept.clone(),
+        _ => dataset::scan_languages(ds).await?,
+    };
+    if dataset::languages(ds).as_ref() != Some(&counted) {
+        dataset::stamp_languages(ds, &counted).await?;
+    }
+    Ok(())
 }
 
 /// The run summary line. An interactive rerun that added nothing — and left nothing owed or
@@ -1814,6 +1835,20 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn language_counts_that_miss_rows_are_recounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ds = unembedded_memory(dir.path(), &[("text", 3)]).await;
+        let stale = dataset::Languages {
+            rows: 2,
+            counts: BTreeMap::from([("eng".to_string(), 9)]),
+        };
+        record_languages(&mut ds, Some(&stale)).await.unwrap();
+        let recorded = dataset::languages(&ds).unwrap();
+        assert_eq!(recorded.rows, 3);
+        assert_eq!(recorded, dataset::scan_languages(&ds).await.unwrap());
     }
 
     #[tokio::test]
