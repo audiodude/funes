@@ -781,3 +781,30 @@ Expect 5.45.4 (package hash matches pacman's sync database).
 credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### October 29, 2026 OMP 18.14.0 stable consumer refresh
+
+The isolated `update-stable18140` branch starts from `update-stable18133`
+(`bffa28b`, the installed 18.13.3 refresh). It merges upstream
+`huggingface/funes` main `065d894c8dbadb535c6f2a38820ddfb7b8cbc6c7` (8
+commits): recall now reranks any fused pool larger than `-k` (previously only a
+pool at least four times `-k`), so default recalls (8 hits from 30 candidates)
+load the cross-encoder, and `benchmark/sweep_rerank.rs` sweeps pool sizes. The
+only conflict was the `Cmd` enum in `src/main.rs`; the fork keeps its `Source`
+subcommand with upstream's recall help text. `cargo update` moved 6 compatible
+packages (hf-xet/xet 1.8.0, adding crc-fast 1.10.0, spin 0.10.1 and utf_types
+1.0.0; utf8_iter 1.1.0). OMP 18.14.0 adds no session entry type or header
+field: subagent collection can optionally include advisor and gc-compressed
+transcripts, the streaming loader recovers from malformed records with a
+bounded parse window, and the `.`/`c` continue shortcuts resume an unanswered
+prompt. The OMP reader is unchanged and existing memory needs no reindex.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 417 tests across 43
+suites, including the 31 `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4-5 (package hash matches pacman's sync
+database). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty,
+so credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
