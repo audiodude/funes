@@ -1,10 +1,12 @@
 # Benchmarks
 
-Three runnable examples, each `cargo run --release --example <name>`:
+Four runnable examples, each `cargo run --release --example <name>`:
 
 - **`bench_recall`** — `recall()` latency, local vs remote, cold vs warm.
 - **`bench_backends`** — latency and output agreement between the inference backends.
 - **`score_recall`** — `funes recall` scored against a labeled set of questions.
+- **`sweep_rerank`** — how much reranking helps at each pool size, on a `dacorvo/funes-recall-benchmark`
+  set.
 
 ## `bench_recall` — recall latency
 
@@ -21,8 +23,8 @@ Every timed call runs the recall pipeline:
 embed query → vector ANN + BM25 FTS (fused by RRF) → [cross-encoder rerank] → neighbors → format
 ```
 
-The rerank runs when `--candidates` is at least four times `--k`, which the defaults (8 of 30) are
-not: a default timed call has no rerank, `--candidates 32` or more times one.
+The rerank runs whenever the pool holds more rows than `--k`, so a default timed call (8 of 30)
+reranks 30 pairs. `--candidates 8` times a call without one.
 
 The CPU stages (query embed, and the rerank when it runs) are identical whatever the memory, so the
 local↔remote gap is entirely the I/O path: opening the dataset, the ANN/FTS scans, and the neighbor
@@ -123,7 +125,8 @@ that there is nothing to compare.
 `score_recall.rs` asks each question of a labeled set with `funes recall`'s defaults and prints the
 receipt: the funes version, the memory's revision and the file's hash, then hit@1, hit@5, found@8,
 the mean reciprocal rank and the median latency, overall and by kind, then each question's rank.
-`--candidates` asks from a deeper pool, which recall reranks from four times the hits.
+`--candidates` asks from a deeper pool. `--candidates 8` scores the fused order alone, since a pool
+of the hits is not reranked.
 A question is one JSON line with an `id`, the `question`, `gold` (the spans its answer is in, each a
 `session_id` with optional `from` and `to` turns) and an optional `kind`. Its rank is the position of
 its first hit in a gold span. The labeled sets and their receipts live in the
@@ -138,3 +141,25 @@ The hits come from the call `funes recall` makes, not from its printed text: a h
 an earlier recall, `→ get` lines included, and nothing in the text tells a quoted hit from a real one.
 A run stops on a degraded read (the Hub unreachable, recall answering from the local memory), since
 those hits were drawn from another memory.
+
+## `sweep_rerank` — how much reranking helps, per pool size
+
+`sweep_rerank.rs` measures how much a rerank helps for different pool sizes, on a set of the
+[`dacorvo/funes-recall-benchmark`](https://huggingface.co/datasets/dacorvo/funes-recall-benchmark)
+dataset's questions: for every question it dumps the fused order of each pool and the reranker's
+score of each candidate, and the dataset's scorers compare the fused order with the reranked order
+at any cut.
+
+```sh
+cargo run --release --example sweep_rerank -- questions.jsonl --memory mem/funes-memory --out sweep.jsonl
+```
+
+For each question and each `--pools` size N (10, 12, 16, 20, 24, 30, 32, 50 and 100 by default) it
+asks `recall_hits` for N hits from N candidates, the fused order of the pool recall would cut, and
+scores every candidate with funes's own reranker. One JSON line per question and pool: the
+candidates in fused order, each with its fused score and its reranker score, and the retrieval and
+rerank times. By default a question's union of pools is scored in one reranker call and a chunk's
+score looked up by its id (on the GPU, a pair scored the same in every batch that held it, on the
+120 pairs checked). `--per-pool` scores each pool as its own call, as recall does, twice, timing
+the second so no GPU graph is built inside the timing, and `--cpu` also times the CPU reranker. The output is appended to, and a (question, pool) already
+in it is skipped, so an interrupted run resumes. The scorers and the receipts live in the dataset.

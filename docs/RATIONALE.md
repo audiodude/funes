@@ -157,11 +157,10 @@ candidate pools, and a per-chunk *kind* facet, some at query time and
 some computed at index time — was A/B'd against a labeled retrieval anchor; none moved
 recall. The cross-encoder is the exception. On the 244 labeled questions of
 [`dacorvo/funes-recall-benchmark`](https://huggingface.co/datasets/dacorvo/funes-recall-benchmark),
-the fused order puts the answer in the default 8 hits from 30 candidates for 128 of them.
-bge-reranker-base, the first cross-encoder funes shipped, lifts that to 140 (p = 0.046), and
-gte-reranker-modernbert-base, which replaced it, to 158 (p < 0.0001). A rerank still costs seconds
-per call, so recall returns the fused order and leaves the judging to the reader, reranking only a
-pool several times the hits.
+the fused order puts the answer in the default 8 hits from 30 candidates for 95 of them,
+bge-reranker-base for 104 (p = 0.0023) and gte-reranker-modernbert-base, the reranker funes runs,
+for 128 (p < 0.0001), first for 62 against 31. So recall reranks any pool larger than the hits, at
+an extra latency of typically seconds.
 
 ## Where this leaves funes
 
