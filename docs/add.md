@@ -84,7 +84,11 @@ funes bind local                           # back to the local memory, every age
 - The first push to a freshly-bound memory is `bind`'s, or `add`'s, to do, at a terminal: the
   hooks refuse it off one (the wrong-memory guard, in [automation.md](automation.md)). On a new
   host, binding it or re-running `funes add` once clears the guard for that machine, as soon as it
-  has an index of its own to push. A memory at a local path is not pushed to.
+  has an index of its own to push. A memory this host already pushed to needs none: the pending
+  turns go up with the next push, from the hooks or from `funes push`. If that memory was emptied
+  on the Hub in the meantime, it gets a first push again. If its content was replaced, it holds
+  none of this host's chunks and the hooks refuse to push to it, so run `funes push <memory>` at a
+  terminal once. A memory at a local path is not pushed to.
 
 ## Getting the newest integration
 
@@ -242,7 +246,8 @@ sessions are never mixed into a memory this host only reads.
    to recall; [unfinished work continues on later turns](index.md#progress-and-resuming).
 5. **Does the first push** to a freshly-bound memory — the publish the hook refuses to do off a
    terminal (the wrong-memory guard; see [automation.md](automation.md)). With nothing indexed yet,
-   it still gives a memory with no dataset your local memory's model. A memory at a local path is
+   it still gives a memory with no dataset your local memory's model. A memory this host already
+   pushed to is skipped: the pending turns go up with the next push. A memory at a local path is
    not pushed to.
 
 ### The spool
@@ -282,8 +287,9 @@ funes vouches for files it published — a release the catalog names, whose dige
 them without asking. Anything else — what `--from` names, a `$FUNES_INTEGRATIONS` directory, files
 it has no record of installing — is confirmed at the terminal before `setup` runs, naming the
 package by publisher and version and where it came from; off a terminal, funes refuses rather than
-assumes. A refused refresh leaves the installed copy as it was. An archive's checksum proves it arrived intact, not who published it, so an archive
-`--from` names is confirmed like a directory.
+assumes, and no flag answers for you. A refused refresh leaves the installed copy as it was. An
+archive's checksum proves it arrived intact, not who published it, so an archive `--from` names is
+confirmed like a directory.
 
 What `funes add` installed is recorded beside the directory, in `~/.funes/agents/<id>.json`: the
 package as its manifest declared it — publisher, id, version, contract — where the files came from

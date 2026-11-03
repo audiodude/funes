@@ -258,9 +258,8 @@ fn run_with(
         .env("FUNES_HOME", funes_home)
         .env("FUNES_TEST_SETUP_LOG", log)
         .env("HF_HOME", support::hf_home())
-        .env_remove("HF_TOKEN")
-        .env_remove("HUGGING_FACE_HUB_TOKEN")
-        .env_remove("HUGGINGFACE_TOKEN")
+        // The Hub is anonymous here: neither funes nor hf-hub may pick up a token of the developer's.
+        .env("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
         .env_remove("FUNES_BIN")
         .env("LANG", "en_US.UTF-8")
         .env_remove("LC_ALL")
@@ -601,6 +600,42 @@ fn a_failed_first_push_still_records_the_install() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(fs::read_to_string(&log).unwrap().starts_with("v1\nremove\n"));
     assert!(!record.exists());
+}
+
+/// `bind` skips the first push to a memory this host already pushed to. A receipt with a chunk id
+/// marks such a memory. An empty receipt (left by an aborted prompt) does not.
+#[test]
+fn bind_leaves_a_memory_this_host_published_to_before_to_the_next_push() {
+    for (receipt, known) in [("chunk-1\n", true), ("", false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let funes_home = tmp.path().join("funes");
+        let log = tmp.path().join("setup.log");
+        fs::create_dir_all(&home).unwrap();
+        support::assert_success(&funes_at_a_terminal(
+            &home,
+            &funes_home,
+            &log,
+            &["index", "--multilingual"],
+        ));
+        let path = funes_home.join("pushed/hf___datasets_acme_memory");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, receipt).unwrap();
+
+        // Offline, binding succeeds and any push fails, which tells whether one was attempted.
+        let out = funes_offline_at_a_terminal(&home, &funes_home, &log, &["bind", "acme/memory"]);
+        let transcript = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.success(), known, "{transcript}");
+        assert_eq!(
+            transcript.contains("the first push there did not go through"),
+            !known,
+            "{transcript}"
+        );
+        assert_eq!(
+            fs::read_to_string(funes_home.join("bound")).unwrap().trim(),
+            "acme/memory"
+        );
+    }
 }
 
 /// Installed, an integration runs as installed: nothing is fetched to rebind or remove it, and a

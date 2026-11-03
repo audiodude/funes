@@ -10,7 +10,7 @@ use crate::agents::registry;
 use crate::hub;
 use crate::inference::EmbeddingModel;
 use crate::memory::dataset;
-use crate::memory::{self, Memory, MemoryState, Reachability};
+use crate::memory::{self, receipt, Memory, MemoryState, Reachability};
 use crate::traces::spool;
 use crate::ui::prompt::confirm;
 use anyhow::{bail, Context, Result};
@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::Path;
 
-/// A resolved memory binding: the memory spec, and whether funes just created the repo this run — the
-/// signal the first push uses to skip the wrong-memory guard (an empty repo funes made for the user
-/// is plainly not "the wrong memory").
+/// A resolved memory binding: the memory spec, and whether funes just created the repo this run
+/// (its first push then skips the wrong-memory guard: an empty repo the user just asked for is not
+/// the wrong memory).
 #[derive(Clone)]
 pub(crate) struct Resolved {
     pub(crate) memory: String,
@@ -40,14 +40,14 @@ pub(crate) async fn resolve_named(spec: &str) -> Result<Option<Resolved>> {
 }
 
 /// `funes bind`: bind this host to `spec`, `local` to unbind, every installed agent following, then
-/// the first push when this host has a local memory and the memory is on the Hub.
+/// the first push when this host has a local memory and owes one.
 pub async fn run(spec: &str) -> Result<()> {
     let resolved = resolve_named(spec).await?;
     bind_host(resolved.clone(), None).await?;
     let Some(Resolved { memory, created }) = resolved else {
         return Ok(());
     };
-    if matches!(Memory::parse(&memory), Memory::Remote { .. }) && index::local_memory_model().await?.is_some() {
+    if owes_first_push(&memory, created).await? && index::local_memory_model().await?.is_some() {
         first_push(&memory, created).await.with_context(|| {
             format!(
                 "this host is bound to {memory}, but the first push there did not go through — run \
@@ -273,12 +273,26 @@ pub(crate) async fn bound_model(memory: &str, takes: bool) -> Result<Option<Embe
     .with_context(|| format!("can't read {memory}"))
 }
 
-/// The one-time first publish `add` and `bind` perform when a memory is bound (the push hook
-/// can't, off a terminal — the overlap guard fails closed there). The guard prompts before
-/// publishing to a memory that holds none of this host's chunks — unless funes just `created` the
-/// memory this run, which is plainly the user's own empty repo, so the push proceeds without
-/// re-asking. Errors that aren't fatal to the install (a read-only token, held-back secrets) are
-/// reported without failing the command.
+/// Whether `bind` and `add` owe `remote` a first push. The push hook can't make one: the
+/// wrong-memory guard refuses a first publish off a terminal. One is owed when funes just `created`
+/// the repo, when this host never pushed there (no receipt), or when the repo holds no dataset
+/// (emptied since the last push). Otherwise the next push takes the pending turns. A memory at a
+/// local path is never pushed to.
+pub async fn owes_first_push(remote: &str, created: bool) -> Result<bool> {
+    let target = Memory::parse(remote);
+    let Memory::Remote { uri } = &target else {
+        return Ok(false);
+    };
+    if created || !receipt::held_before(uri) {
+        return Ok(true);
+    }
+    Ok(matches!(target.state().await?, MemoryState::Empty))
+}
+
+/// The first push to `remote`, at a terminal. The wrong-memory guard asks before publishing to a
+/// memory holding none of this host's chunks, except a repo funes just `created`. Errors that
+/// aren't fatal to the install (a read-only token, held-back secrets) are reported without failing
+/// the command.
 pub(crate) async fn first_push(remote: &str, created: bool) -> Result<()> {
     let confirm = if created {
         push::Confirm::Yes

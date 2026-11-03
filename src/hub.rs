@@ -182,16 +182,22 @@ pub fn has_token() -> bool {
 
 /// HF token from the standard env var, else the `huggingface_hub` cached token file.
 pub fn hf_token() -> Option<String> {
-    let token_file = std::env::var("HOME")
+    let token_file = std::env::var("HF_TOKEN_PATH")
         .ok()
-        .map(|h| PathBuf::from(h).join(".cache/huggingface/token"));
-    token_from(|k| std::env::var(k).ok(), token_file.as_deref())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| hf_hub::hf_home().join("token"));
+    token_from(|k| std::env::var(k).ok(), Some(token_file.as_path()))
 }
 
 /// Pure core of [`hf_token`]: env vars (in precedence order) win over the token file; blank
-/// values are ignored and surrounding whitespace trimmed. Split out so it's testable without
-/// mutating process env.
+/// values are ignored and surrounding whitespace trimmed. `HF_HUB_DISABLE_IMPLICIT_TOKEN` set
+/// means no token at all, as it does for hf-hub. Split out so it's testable without mutating
+/// process env.
 fn token_from(env: impl Fn(&str) -> Option<String>, token_file: Option<&Path>) -> Option<String> {
+    if env("HF_HUB_DISABLE_IMPLICIT_TOKEN").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
     for var in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"] {
         if let Some(t) = env(var) {
             let t = t.trim();
@@ -466,5 +472,26 @@ mod tests {
     fn token_blank_env_is_skipped_none_when_no_file() {
         let env: HashMap<&str, &str> = [("HF_TOKEN", "   ")].into_iter().collect();
         assert_eq!(token_from(|k| env.get(k).map(|s| s.to_string()), None), None);
+    }
+
+    #[test]
+    fn disabling_implicit_tokens_ignores_env_and_file_alike() {
+        let env: HashMap<&str, &str> = [("HF_TOKEN", "hf_envtok"), ("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")]
+            .into_iter()
+            .collect();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "hf_filetok").unwrap();
+        assert_eq!(
+            token_from(|k| env.get(k).map(|s| s.to_string()), Some(file.path())),
+            None
+        );
+        // Set to anything, blank included, as hf-hub reads it.
+        let blank: HashMap<&str, &str> = [("HF_TOKEN", "hf_envtok"), ("HF_HUB_DISABLE_IMPLICIT_TOKEN", " ")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            token_from(|k| blank.get(k).map(|s| s.to_string()), Some(file.path())),
+            None
+        );
     }
 }
