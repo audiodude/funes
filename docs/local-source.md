@@ -808,3 +808,46 @@ database). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty,
 so credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### November 2, 2026 OMP 18.16.0 stable consumer refresh
+
+The isolated `update-stable18160` branch starts from `update-stable18140`
+(`73a712d`, the installed 18.14.0 refresh). It merges upstream
+`huggingface/funes` main `97f54e677edc6fd5208419e295b207ec30d3719f` (14
+commits, version 1.10.0+dev): Hub tokens resolve by hf-hub's rules (token file,
+blank disable value) and Lance no longer resolves a token of its own, `funes
+bind` skips the first push to a memory this host already published to, and
+`funes status` counts a remote's unindexed rows off the manifest, reads a
+memory at a path as it stands, and prints the pending-source line for the host
+index alone. The merge had no conflicts. `cargo update` moved 23 compatible
+packages (async-lock 3.5.0, cc 1.11.0, encoding_rs 0.8.44, openssl 0.10.82,
+ureq 3.5.1/ureq-proto 0.7.1, wasm-bindgen 0.2.130, zstd 0.13.4 and patch
+releases).
+
+The OMP local-source normalizer rejected every OMP session written since
+mid-October: OMP stamps a `runtime` object (writing build `version`, optional
+`commit`, `branch`, `diff`, `label`) on each entry it authors, and child
+`session_init` entries keep the system prompt as an array of blocks. Against
+the live enrollment's OMP inventory (1039 sources), the 18.14.0 build reported
+313 `unknown_content_schema`. OMP 18.16.0 also adds `mountedTools`,
+`perCallModel`, `perCallModelIdentity` and `perCallThinkingLevel` to
+`session_init`. The normalizer now accepts a string-valued `runtime` object
+with a `version` on OMP rows, and the 18.16.0 `session_init` fields with string
+or string-array system prompts; `session_init` stays a reset barrier whose
+contents are never exposed, and unknown keys or malformed values still fail
+closed. On the same inventory snapshot the new build reports 17
+`unknown_content_schema` OMP sources; those carry assistant `serviceTier`,
+`custom`-role or `synthetic` message fields this refresh leaves rejected. No
+other 18.16.0 session change touches the shapes Funes reads (title-drift
+classification, picker listing and session-lease changes are runtime-only), and
+existing memory needs no reindex.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 423 tests across 45
+suites, including the 32 `add_fifth_integration` tests against the
+`/tmp`-extracted Arch Expect 5.45.4-5 (package hash matches pacman's sync
+database). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty,
+so credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
