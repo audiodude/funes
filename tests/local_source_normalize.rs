@@ -716,6 +716,59 @@ fn omp_child_initialization_and_agent_string_prompts_never_become_human_turns() 
 }
 
 #[test]
+fn omp_runtime_identity_and_current_child_initialization_are_tolerated() {
+    // OMP stamps `runtime` on every entry it writes; 18.16.0 child initialization keeps prompt
+    // blocks as an array and records mounted tools and per-call model revival fields.
+    let runtime =
+        json!({"version":"18.16.0","commit":"0000000","branch":"synthetic","diff":"unknown","label":"synthetic"});
+    let mut rows = conversation("omp");
+    rows.insert(
+        1,
+        json!({"type":"session_init","id":"init","parentId":null,"timestamp":0,"runtime":runtime,
+            "systemPrompt":["PRIVATE SYSTEM","PRIVATE BLOCK"],"task":"PRIVATE TASK","tools":["read","xd"],
+            "mountedTools":["xd"],"agent":"worker","modelRole":"default","resolvedModel":"test/model",
+            "perCallModel":true,"perCallModelIdentity":"test/model","perCallThinkingLevel":null,
+            "retryFallback":"subagent:worker","restrictToolNames":true,"advisor":"on",
+            "compactionThreshold":{"thresholdPercent":80,"thresholdTokens":1000},"isolated":false,
+            "workPoolYieldItems":[],"readOnly":true,"readSummarize":false,"spawns":""}),
+    );
+    rows.insert(
+        2,
+        json!({"type":"mode_change","id":"mode","parentId":"init","timestamp":0,"runtime":runtime,"mode":"none"}),
+    );
+    rows[3]["parentId"] = json!("mode");
+    for row in &mut rows[3..] {
+        row["runtime"] = runtime.clone();
+    }
+    let result = parse(&rows, "omp", 10.0, true);
+    assert_eq!(result["status"], "complete", "{result}");
+    assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+    assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+    assert!(!result.to_string().contains("PRIVATE"));
+    assert!(!result.to_string().contains("0000000"));
+
+    for bad in [
+        json!({"version":"18.16.0","extra":"x"}),
+        json!({"commit":"0000000"}),
+        json!({"version":18}),
+        json!("18.16.0"),
+    ] {
+        let mut broken = rows.clone();
+        broken[3]["runtime"] = bad;
+        assert_eq!(parse(&broken, "omp", 10.0, true)["status"], "unknown_content_schema");
+    }
+    let mut broken = rows.clone();
+    broken[1]["unexpected"] = json!(true);
+    assert_eq!(parse(&broken, "omp", 10.0, true)["status"], "unknown_content_schema");
+    let mut broken = rows.clone();
+    broken[1]["mountedTools"] = json!([1]);
+    assert_eq!(parse(&broken, "omp", 10.0, true)["status"], "unknown_content_schema");
+    let mut broken = rows;
+    broken[1]["systemPrompt"] = json!([{"text":"PRIVATE"}]);
+    assert_eq!(parse(&broken, "omp", 10.0, true)["status"], "unknown_content_schema");
+}
+
+#[test]
 fn omp_auxiliary_messages_preserve_lineage_and_boundaries_without_private_payloads() {
     let mut rows = conversation("omp");
     rows.splice(

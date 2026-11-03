@@ -703,6 +703,15 @@ fn codex(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
 fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let mut event = Event::new(row, context);
     let kind = &row["type"];
+    // OMP stamps the writing build on every entry it authors: provenance metadata, never evidence.
+    if let Some(runtime) = row.get("runtime") {
+        if !allowed_keys(runtime, "version commit branch diff label")
+            || !runtime["version"].is_string()
+            || !runtime.as_object().unwrap().values().all(Value::is_string)
+        {
+            return Err(SCHEMA);
+        }
+    }
     if kind == "title" {
         return Ok(event);
     }
@@ -721,13 +730,17 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         if !truth(&context.session) {
             return Err("missing_session_header");
         }
-        if !allowed_keys(row, "type id parentId timestamp agent modelRole outputSchema outputSchemaMode readOnly readSummarize resolvedModel spawns systemPrompt task tools")
+        if !allowed_keys(row, "type id parentId timestamp runtime advisor agent compactionThreshold isolated modelRole mountedTools outputSchema outputSchemaMode perCallModel perCallModelIdentity perCallThinkingLevel readOnly readSummarize resolvedModel restrictToolNames retryFallback spawns systemPrompt task tools workPoolYieldItems")
             || !row["id"].is_string()
             || row.get("parentId").is_none()
             || !(row["parentId"].is_null() || row["parentId"].is_string())
-            || !row["systemPrompt"].is_string()
+            || !(row["systemPrompt"].is_string()
+                || row["systemPrompt"].as_array().is_some_and(|blocks| blocks.iter().all(Value::is_string)))
             || !row["task"].is_string()
             || !row["tools"].as_array().is_some_and(|tools| tools.iter().all(Value::is_string))
+            || row
+                .get("mountedTools")
+                .is_some_and(|tools| !tools.as_array().is_some_and(|tools| tools.iter().all(Value::is_string)))
         {
             return Err(SCHEMA);
         }
@@ -739,7 +752,7 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         return Err("missing_session_header");
     }
     if kind == "mode_change" {
-        if !allowed_keys(row, "type id parentId timestamp mode data")
+        if !allowed_keys(row, "type id parentId timestamp runtime mode data")
             || !row["id"].is_string()
             || row.get("parentId").is_none()
             || !(row["parentId"].is_null() || row["parentId"].is_string())
@@ -772,7 +785,7 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     if message.get("cwd").is_some() || row.get("cwd").is_some() {
         return Err("unknown_project_schema");
     }
-    if !allowed_keys(row, "type id parentId timestamp message") {
+    if !allowed_keys(row, "type id parentId timestamp runtime message") {
         return Err(SCHEMA);
     }
     let allowed = match message["role"].as_str() {
