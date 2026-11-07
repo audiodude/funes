@@ -851,3 +851,42 @@ database). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty,
 so credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### November 6, 2026 OMP 18.18.0 stable consumer refresh
+
+The isolated `update-stable18180` branch starts from `update-stable18160`
+(`5caf4db`, the installed 18.16.0 refresh). It merges upstream
+`huggingface/funes` main `31c2a0e27f495317401955c57be3a7d5330e6d5f` (15
+commits, version 1.11.0+dev): the vector index refines its shortlist on the
+stored vectors, an index whose refresh leaves rows out is rebuilt whole, the
+shuffle-dir sweep and model download thread are dropped, Rust is pinned to
+1.99.1 in `rust-toolchain.toml`, and lance 13.0.0, hf-hub 1.0.0, rmcp 3.8.0
+and async-trait 0.1.92 are bumped. The only conflict was `Cargo.lock`; the
+fork's lock was kept and re-resolved against the merged manifests (lance/lance-*
+11.0.0 -> 13.0.0, opendal 0.58 -> 0.59.5, object_store 0.14.2, asyncband
+0.7.4, quick-xml 0.42.0). `cargo update` then moved 14 compatible packages (cc
+1.11.1, flate2 1.1.11, generator 0.8.12, mime 0.3.18, rmcp/rmcp-macros 3.9.0,
+smallvec 1.16.5, uuid 1.29.1, and six windows-* 0.100.0 additions).
+
+OMP 18.18.0 adds one session field: an optional `cacheRefresh: {sentAt, hit}`
+on `model_usage` entries (cache-warm refresh records, plus off-branch
+`model_usage` entries re-journaled for discarded assistant turns). The reader
+keeps `model_usage` as metadata without inspecting its fields, so the OMP reader
+is unchanged and existing memory needs no reindex. The new
+`geminiNativeContent` provider payload sits inside `providerPayload`, which is
+likewise not inspected. On one inventory snapshot (1063 OMP sources, none yet
+written by 18.18.0) the 18.16.0 build and this build both report 18
+`unknown_content_schema` OMP sources: 12 carry assistant `serviceTier`, 5
+`custom`-role messages and 1 a `synthetic` developer message, all left
+rejected as before.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 422 tests across 44
+suites (upstream removed the `shuffle_leftovers` suite), including the 32
+`add_fifth_integration` tests against the `/tmp`-extracted Arch Expect
+5.45.4-5 (package hash matches pacman's sync database).
+`scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN` stays empty, so
+credential-gated Hub tests return early. No `funes update`, `funes push`,
+release tag/artifact, Hugging Face upload, or memory publication is part of
+this refresh. AI-assisted by Claude.
