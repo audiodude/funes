@@ -890,3 +890,33 @@ suites (upstream removed the `shuffle_leftovers` suite), including the 32
 credential-gated Hub tests return early. No `funes update`, `funes push`,
 release tag/artifact, Hugging Face upload, or memory publication is part of
 this refresh. AI-assisted by Claude.
+
+### November 9, 2026 OMP 18.18.6 stable consumer refresh
+
+The isolated `update-stable18186` branch starts from `update-stable18180`
+(`4d2a8c2`, the 18.18.0 refresh). It merges upstream `huggingface/funes` main
+`3cb43ed` (4 commits): `funes recall --neighbors` is retired in favour of
+`--oneline`, each recall hit carries its exchange frame (`↳` lines), the cut is
+returned as a ranked value, and the bench scores the answering turn. The
+fork's OMP citation caveats are kept. `cargo update` then moved 12 compatible
+packages (arc-swap 1.9.5, crc32fast 1.5.5, exr 1.74.3, fixedbitset 0.5.9,
+io-uring 0.7.16, itoa 1.0.19, jiff/jiff-static 0.2.42, jiff-core 0.1.4, loom
+0.7.3, syn 3.0.10, uuid 1.29.2) and dropped duplicate versions.
+`funes recall --candidates` is still present.
+
+OMP 18.18.6 marks parent IRC steers delivered to subagents as user messages
+carrying `parentIrc: {from, body}`. The OMP reader now allowlists that field on
+agent-attributed user messages (regression tests in
+`tests/local_source_normalize.rs`). On one inventory snapshot (1077 OMP
+sources) the 18.18.0 build (`cb23e953`) and this build report identical
+outcomes: 980 complete, 79 `incomplete_turn`, 18 `unknown_content_schema`, no
+rejected sources.
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`) pass, and `cargo test --profile ci --no-fail-fast` (lld,
+`RUST_MIN_STACK=16777216`, one test thread) passes all 429 tests across 44
+suites plus doc-tests, including the 32 `add_fifth_integration` tests against
+the `/tmp`-extracted Arch Expect 5.45.4. `scripts/test-install.sh` passes.
+`HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
+No `funes update`, `funes push`, release tag/artifact, Hugging Face upload, or
+memory publication is part of this refresh. AI-assisted by Claude.
