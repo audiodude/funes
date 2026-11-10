@@ -1,6 +1,6 @@
 //! The read surface: `recall`, `get`, `status` over the existing index.
-//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → neighbor expansion, with a
-//! cross-encoder rerank of the pool before the cut when it holds more rows than the hits ([`reranks`]).
+//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank), with a cross-encoder rerank of
+//! the pool before the cut when it holds more rows than the hits ([`reranks`]).
 //! `recall`/`get` return results rendered in the agent format;
 //! `recall_hits`/`get_turns` return the structured results for other renderings (see `render`).
 
@@ -33,17 +33,13 @@ const HIT_COLS: &[&str] = &[
     "harness",
 ];
 
-/// Scanned row for neighbor expansion: (session_id, seq, turn_uuid, block_idx, split_idx, role, block_type, text).
-type NeighborRow = (String, i64, String, i64, i64, String, String, String);
-
 /// Scanned row for `get`: (seq, turn_uuid, ts, role, block_idx, split_idx, text).
 type TurnRow = (i64, String, String, String, i64, i64, String);
 
-/// One adjacent chunk pulled in to give a hit some surrounding context.
-pub struct Neighbor {
+/// One prose turn of the exchange framing a hit, attached in full.
+pub struct ExchangeTurn {
     pub seq: i64,
     pub role: String,
-    pub block_type: String,
     pub text: String,
 }
 
@@ -58,7 +54,9 @@ pub struct Hit {
     pub ts: String,
     pub block_type: String,
     pub harness: String,
-    pub neighbors: Vec<Neighbor>,
+    /// The prose turns framing the hit's exchange, attached in full: the prompt that opened it, its
+    /// final summary and the next prompt.
+    pub exchange: Vec<ExchangeTurn>,
     /// The `--memory` the hit's drill-down repeats, as the call named it; empty for a call naming
     /// none.
     pub memory: String,
@@ -399,7 +397,6 @@ async fn models() -> &'static Mutex<Models> {
 /// A recall's defaults, owned here so the CLI and the MCP server search the same way.
 pub const DEFAULT_K: usize = 8;
 pub const DEFAULT_CANDIDATES: usize = 30;
-pub const DEFAULT_NEIGHBORS: i64 = 1;
 
 /// Whether a recall of `k` hits from a pool of `pool` rows reranks it: whenever the pool holds more
 /// than the hits, so the cut has something to choose. On the labeled sets, reranking the default
@@ -413,16 +410,16 @@ pub fn reranks(k: usize, pool: usize) -> bool {
 }
 
 /// Run the recall pipeline over what `target` reads and return the results rendered in the agent
-/// format.
+/// format: each hit's passage, or one row per hit with `oneline`.
 pub async fn recall(
     target: impl Into<Target>,
     query: String,
     k: usize,
     candidates: usize,
-    neighbors: i64,
     filter: RecallFilter,
+    oneline: bool,
 ) -> Result<String> {
-    recall_with_progress(target, query, k, candidates, neighbors, filter, &|_| ()).await
+    recall_with_progress(target, query, k, candidates, filter, oneline, &|_| ()).await
 }
 
 /// [`recall`], reporting each stage to `progress`.
@@ -431,35 +428,68 @@ pub async fn recall_with_progress(
     query: String,
     k: usize,
     candidates: usize,
-    neighbors: i64,
     filter: RecallFilter,
+    oneline: bool,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<String> {
+    let target = target.into();
     let search = Search::new(query, candidates, filter)?;
-    let pools = target.into().candidates(&search, progress).await?;
+    let pools = target.candidates(&search, progress).await?;
     let languages = rephrase_languages(pools.iter().map(|pool| &pool.ds));
-    let (note, hits) = search.rank(pools, k, neighbors, progress).await?;
-    Ok(crate::ui::render::recall_reply(&note, &hits, languages.as_deref()))
+    let mut ranked = search.rank(pools, k, progress).await?;
+    // A one-line listing shows no frame, so it reads none.
+    if !oneline {
+        ranked.frame(&target, progress).await?;
+    }
+    let Ranked { note, hits, .. } = ranked;
+    Ok(if oneline {
+        crate::ui::render::recall_oneline_reply(&note, &hits, languages.as_deref())
+    } else {
+        crate::ui::render::recall_reply(&note, &hits, languages.as_deref())
+    })
 }
 
-/// Run the recall pipeline over what `target` reads: hybrid retrieval, pooled with this host's
-/// unpushed turns for the bound memory → rank, reranked when the pool holds more rows than `k` →
-/// neighbor expansion.
-/// Returns the degradation note (empty when the memory opened normally) and the scored hits, best
-/// first — rendering is the caller's choice. `progress` hears a short label as each slow phase
-/// starts (model load, search, rerank); pass a no-op to run silently.
+/// The hits of a recall before their exchange frame, for tooling that studies the pool rather than
+/// the reply. `progress` hears a short label as each slow phase starts.
+pub async fn ranked_hits(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    filter: RecallFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<Ranked> {
+    rank_target(&target.into(), query, k, candidates, filter, progress).await
+}
+
+/// [`ranked_hits`] over a resolved target.
+async fn rank_target(
+    target: &Target,
+    query: String,
+    k: usize,
+    candidates: usize,
+    filter: RecallFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<Ranked> {
+    let search = Search::new(query, candidates, filter)?;
+    let pools = target.candidates(&search, progress).await?;
+    search.rank(pools, k, progress).await
+}
+
+/// The hits of a recall over what `target` reads, each framed by its exchange: the degradation note
+/// (empty when the memory opened normally) and the scored hits, best first.
 pub async fn recall_hits(
     target: impl Into<Target>,
     query: String,
     k: usize,
     candidates: usize,
-    neighbors: i64,
     filter: RecallFilter,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<(String, Vec<(Hit, f64)>)> {
-    let search = Search::new(query, candidates, filter)?;
-    let pools = target.into().candidates(&search, progress).await?;
-    search.rank(pools, k, neighbors, progress).await
+    let target = target.into();
+    let mut ranked = rank_target(&target, query, k, candidates, filter, progress).await?;
+    ranked.frame(&target, progress).await?;
+    Ok((ranked.note, ranked.hits))
 }
 
 /// What narrows a search.
@@ -589,15 +619,9 @@ impl Search {
 
     /// Rank the pooled candidates, a row several memories hold counted once: the best `candidates`
     /// by fused score, reranked by the cross-encoder when the pool holds more rows than `k`
-    /// ([`reranks`]), cut to `k`, with `neighbors` attached from the memory each hit came from.
-    /// Returns the pools' degradation notes and the hits, best first.
-    pub async fn rank(
-        &self,
-        pools: Vec<Candidates>,
-        k: usize,
-        neighbors: i64,
-        progress: &(dyn Fn(&str) + Sync),
-    ) -> Result<(String, Vec<(Hit, f64)>)> {
+    /// ([`reranks`]), cut to `k`. Returns the pools' degradation notes — with the provenance note of
+    /// each OMP session a hit came from — and the hits, best first.
+    pub async fn rank(&self, pools: Vec<Candidates>, k: usize, progress: &(dyn Fn(&str) + Sync)) -> Result<Ranked> {
         let mut note: String = pools.iter().map(|p| p.note.as_str()).collect();
         let mut seen = HashSet::new();
         let mut hits: Vec<(usize, Hit)> = Vec::new();
@@ -615,7 +639,12 @@ impl Search {
         hits.sort_by(|(_, a), (_, b)| b.fused.partial_cmp(&a.fused).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(self.candidates);
         if hits.is_empty() {
-            return Ok((note, Vec::new()));
+            return Ok(Ranked {
+                note,
+                hits: Vec::new(),
+                origins: Vec::new(),
+                sources,
+            });
         }
 
         let mut scored: Vec<(usize, f64)> = if reranks(k, hits.len()) {
@@ -638,22 +667,13 @@ impl Search {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(k);
 
-        // Keep only the top-k hits, in scored order, carrying their score and source along.
-        let mut top: Vec<(usize, Hit, f64)> = Vec::with_capacity(scored.len());
+        // Keep only the top-k hits, in scored order, each with its score and the memory it came from.
         let mut taken: Vec<Option<(usize, Hit)>> = hits.into_iter().map(Some).collect();
-        for (idx, score) in &scored {
-            if let Some((source, h)) = taken[*idx].take() {
-                top.push((source, h, *score));
-            }
-        }
+        let top: Vec<(usize, Hit, f64)> = scored
+            .iter()
+            .filter_map(|(idx, score)| taken[*idx].take().map(|(source, h)| (source, h, *score)))
+            .collect();
 
-        if neighbors > 0 {
-            progress("expanding neighbors…");
-            for (i, ds) in sources.iter().enumerate() {
-                let mut refs: Vec<&mut Hit> = top.iter_mut().filter(|t| t.0 == i).map(|t| &mut t.1).collect();
-                attach_neighbors(ds, &mut refs, neighbors).await?;
-            }
-        }
         let mut omp_sessions: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (_, hit, _) in &top {
             if hit.harness == "omp" {
@@ -664,8 +684,242 @@ impl Search {
             note.push_str(&crate::traces::omp::provenance_note(session_id, &turn_ids));
         }
 
-        Ok((note, top.into_iter().map(|(_, h, score)| (h, score)).collect()))
+        let (origins, hits) = top.into_iter().map(|(source, h, score)| (source, (h, score))).unzip();
+        Ok(Ranked {
+            note,
+            hits,
+            origins,
+            sources,
+        })
     }
+}
+
+/// A search's hits after the cut, best first, before their exchange frame ([`Ranked::frame`]).
+pub struct Ranked {
+    /// The pools' degradation notes, empty when every memory opened normally.
+    pub note: String,
+    /// The hits, best first, each with its score.
+    pub hits: Vec<(Hit, f64)>,
+    /// For each hit, the index in `sources` of the memory it came from.
+    origins: Vec<usize>,
+    sources: Vec<Dataset>,
+}
+
+impl Ranked {
+    /// Attach to each hit the turns framing its exchange. A session this host still owes the bound
+    /// memory rows of is read from the local memory, which holds it whole, as `get` reads it.
+    pub async fn frame(&mut self, target: &Target, progress: &(dyn Fn(&str) + Sync)) -> Result<()> {
+        progress("attaching exchanges…");
+        let mut attached: HashSet<(String, i64)> =
+            self.hits.iter().map(|(h, _)| (h.session_id.clone(), h.seq)).collect();
+        let sessions: BTreeSet<String> = self.hits.iter().map(|(h, _)| h.session_id.clone()).collect();
+        let mut owed = HashSet::new();
+        for sid in sessions {
+            if target.owes_session(&sid).await? {
+                owed.insert(sid);
+            }
+        }
+        if !owed.is_empty() {
+            let local = Memory::local().open().await?;
+            let mut refs: Vec<&mut Hit> = self
+                .hits
+                .iter_mut()
+                .map(|(h, _)| h)
+                .filter(|h| owed.contains(&h.session_id))
+                .collect();
+            attach_exchange(&local, &mut refs, &mut attached).await?;
+        }
+        for (i, ds) in self.sources.iter().enumerate() {
+            let mut refs: Vec<&mut Hit> = self
+                .hits
+                .iter_mut()
+                .zip(&self.origins)
+                .filter(|((h, _), origin)| **origin == i && !owed.contains(&h.session_id))
+                .map(|((h, _), _)| h)
+                .collect();
+            attach_exchange(ds, &mut refs, &mut attached).await?;
+        }
+        Ok(())
+    }
+}
+
+/// An attached turn under assembly, keyed by (session, seq): its role, and its text blocks' splits,
+/// each keyed by (block_idx, split_idx) with its chunk id and text.
+type ExchangeTexts = HashMap<(String, i64), (String, Vec<((i64, i64), String, String)>)>;
+
+/// Attach to each hit the prose turns framing its exchange, once per reply: `taken` arrives holding
+/// the hits' own turns, which the reply shows already.
+async fn attach_exchange(ds: &Dataset, hits: &mut [&mut Hit], taken: &mut HashSet<(String, i64)>) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    // Placing the turns needs no text, so the text is read for the few turns chosen alone.
+    let sessions: BTreeSet<&str> = hits.iter().map(|h| h.session_id.as_str()).collect();
+    let in_sessions = sessions
+        .iter()
+        .map(|s| dataset::eq("session_id", s))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let cols = ["session_id", "seq", "role", "block_type"];
+    let batches = dataset::scan_rows(ds, &cols, Some(in_sessions.as_str()), None).await?;
+    // (session, seq) -> (role, has a text block, has a tool_result block)
+    let mut turns: HashMap<(String, i64), (String, bool, bool)> = HashMap::new();
+    for batch in &batches {
+        let (sess, role, bt) = (
+            dataset::strs(batch, "session_id"),
+            dataset::strs(batch, "role"),
+            dataset::strs(batch, "block_type"),
+        );
+        let seq = dataset::ints(batch, "seq");
+        for i in 0..batch.num_rows() {
+            let e = turns
+                .entry((sess.get(i).to_string(), seq.get(i)))
+                .or_insert_with(|| (role.get(i).to_string(), false, false));
+            match bt.get(i) {
+                "text" => e.1 = true,
+                "tool_result" => e.2 = true,
+                _ => {}
+            }
+        }
+    }
+    // The start of every user text block says whether it is the human's words or scaffolding.
+    let pred = format!(
+        "({in_sessions}) AND {} AND {} AND split_idx = 0",
+        dataset::eq("role", "user"),
+        dataset::eq("block_type", "text")
+    );
+    let cols = ["session_id", "seq", "block_idx", "text"];
+    let batches = dataset::scan_rows(ds, &cols, Some(pred.as_str()), None).await?;
+    let mut scaffolding: HashSet<(String, i64, i64)> = HashSet::new();
+    let mut spoken: HashSet<(String, i64)> = HashSet::new();
+    for batch in &batches {
+        let (sess, text) = (dataset::strs(batch, "session_id"), dataset::strs(batch, "text"));
+        let (seq, bi) = (dataset::ints(batch, "seq"), dataset::ints(batch, "block_idx"));
+        for i in 0..batch.num_rows() {
+            if traces::is_scaffolding(text.get(i)) {
+                scaffolding.insert((sess.get(i).to_string(), seq.get(i), bi.get(i)));
+            } else {
+                spoken.insert((sess.get(i).to_string(), seq.get(i)));
+            }
+        }
+    }
+    let mut prompts: HashMap<&str, Vec<i64>> = HashMap::new();
+    let mut summaries: HashMap<&str, Vec<i64>> = HashMap::new();
+    for ((sid, seq), (role, text, tool_result)) in &turns {
+        if role == "user" && !*tool_result && spoken.contains(&(sid.clone(), *seq)) {
+            prompts.entry(sid.as_str()).or_default().push(*seq);
+        }
+        if role == "assistant" && *text {
+            summaries.entry(sid.as_str()).or_default().push(*seq);
+        }
+    }
+    for v in prompts.values_mut() {
+        v.sort_unstable();
+    }
+    for v in summaries.values_mut() {
+        v.sort_unstable();
+    }
+    let mut wanted: Vec<Vec<(String, i64)>> = Vec::with_capacity(hits.len());
+    let mut completed = HashSet::new();
+    for h in hits.iter() {
+        let ps = prompts.get(h.session_id.as_str()).map_or(&[][..], Vec::as_slice);
+        let ss = summaries.get(h.session_id.as_str()).map_or(&[][..], Vec::as_slice);
+        let p = ps.iter().rev().find(|&&s| s <= h.seq).copied();
+        let n = ps.iter().find(|&&s| s > h.seq).copied();
+        let (lo, hi) = (p.unwrap_or(i64::MIN), n.unwrap_or(i64::MAX));
+        let s = ss.iter().rev().find(|&&s| s >= lo && s < hi).copied();
+        let mut want: Vec<i64> = [p, s, n].into_iter().flatten().collect();
+        want.sort_unstable();
+        want.dedup();
+        let keep = want
+            .into_iter()
+            .filter(|&seq| {
+                let key = (h.session_id.clone(), seq);
+                if seq == h.seq {
+                    completed.insert(key)
+                } else {
+                    taken.insert(key)
+                }
+            })
+            .map(|seq| (h.session_id.clone(), seq))
+            .collect();
+        wanted.push(keep);
+    }
+    let all: Vec<&(String, i64)> = wanted.iter().flatten().collect();
+    if all.is_empty() {
+        return Ok(());
+    }
+    let pred = all
+        .iter()
+        .map(|(sid, seq)| format!("({} AND seq = {seq})", dataset::eq("session_id", sid)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let cols = [
+        "id",
+        "session_id",
+        "seq",
+        "role",
+        "block_type",
+        "block_idx",
+        "split_idx",
+        "text",
+    ];
+    let batches = dataset::scan_rows(ds, &cols, Some(pred.as_str()), None).await?;
+    let mut texts: ExchangeTexts = HashMap::new();
+    for batch in &batches {
+        let (id, sess, role, bt, text) = (
+            dataset::strs(batch, "id"),
+            dataset::strs(batch, "session_id"),
+            dataset::strs(batch, "role"),
+            dataset::strs(batch, "block_type"),
+            dataset::strs(batch, "text"),
+        );
+        let (seq, bi, si) = (
+            dataset::ints(batch, "seq"),
+            dataset::ints(batch, "block_idx"),
+            dataset::ints(batch, "split_idx"),
+        );
+        for i in 0..batch.num_rows() {
+            if bt.get(i) != "text" {
+                continue;
+            }
+            let e = texts
+                .entry((sess.get(i).to_string(), seq.get(i)))
+                .or_insert_with(|| (role.get(i).to_string(), Vec::new()));
+            e.1.push(((bi.get(i), si.get(i)), id.get(i).to_string(), text.get(i).to_string()));
+        }
+    }
+    for (h, keys) in hits.iter_mut().zip(wanted) {
+        for key in keys {
+            let Some((role, mut splits)) = texts.remove(&key) else {
+                continue;
+            };
+            splits.sort_by_key(|(k, _, _)| *k);
+            // A block of one split that is the hit itself is already shown whole.
+            let mut blocks: Vec<(i64, usize, String, String)> = Vec::new();
+            for ((bi, _), id, piece) in splits {
+                match blocks.last_mut() {
+                    Some((last, n, _, text)) if *last == bi => {
+                        let joined = chunk::stitch(text, &piece);
+                        *text = joined;
+                        *n += 1;
+                    }
+                    _ => blocks.push((bi, 1, id, piece)),
+                }
+            }
+            let text = blocks
+                .into_iter()
+                .filter(|(_, n, id, _)| !(*n == 1 && *id == h.id))
+                .filter(|(bi, _, _, _)| !scaffolding.contains(&(key.0.clone(), key.1, *bi)))
+                .map(|(_, _, _, t)| t)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                h.exchange.push(ExchangeTurn { seq: key.1, role, text });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Vector ANN + BM25 candidates fused by reciprocal rank, top `candidates`.
@@ -730,7 +984,7 @@ fn hits_of(batches: &[RecordBatch]) -> Result<Vec<(u64, Hit)>> {
                     ts: ts.get(i).to_string(),
                     block_type: bt.get(i).to_string(),
                     harness: harness.get(i).to_string(),
-                    neighbors: Vec::new(),
+                    exchange: Vec::new(),
                     memory: String::new(),
                     fused: 0.0,
                 },
@@ -764,84 +1018,6 @@ fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<
         .into_iter()
         .filter_map(|(id, fused)| rows.remove(&id).map(|h| Hit { fused, ..h }))
         .collect()
-}
-
-/// For each hit, pull chunks in the same session within `window` of its seq (excluding the
-/// hit's own turn) as surrounding context. One combined scan covers every hit.
-async fn attach_neighbors(ds: &Dataset, hits: &mut [&mut Hit], window: i64) -> Result<()> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let pred = hits
-        .iter()
-        .map(|h| {
-            format!(
-                "({} AND seq >= {} AND seq <= {})",
-                dataset::eq("session_id", &h.session_id),
-                h.seq - window,
-                h.seq + window
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
-
-    let cols = [
-        "session_id",
-        "turn_uuid",
-        "seq",
-        "role",
-        "block_type",
-        "text",
-        "block_idx",
-        "split_idx",
-    ];
-    let batches = dataset::scan_rows(ds, &cols, Some(pred.as_str()), None).await?;
-
-    let mut rows: Vec<NeighborRow> = Vec::new();
-    for batch in &batches {
-        let (sess, turn, role, bt, text) = (
-            dataset::strs(batch, "session_id"),
-            dataset::strs(batch, "turn_uuid"),
-            dataset::strs(batch, "role"),
-            dataset::strs(batch, "block_type"),
-            dataset::strs(batch, "text"),
-        );
-        let (seq, bi, si) = (
-            dataset::ints(batch, "seq"),
-            dataset::ints(batch, "block_idx"),
-            dataset::ints(batch, "split_idx"),
-        );
-        for i in 0..batch.num_rows() {
-            rows.push((
-                sess.get(i).to_string(),
-                seq.get(i),
-                turn.get(i).to_string(),
-                bi.get(i),
-                si.get(i),
-                role.get(i).to_string(),
-                bt.get(i).to_string(),
-                text.get(i).to_string(),
-            ));
-        }
-    }
-
-    for h in hits.iter_mut() {
-        let mut ns: Vec<&NeighborRow> = rows
-            .iter()
-            .filter(|r| r.0 == h.session_id && r.2 != h.turn_uuid && (r.1 - h.seq).abs() <= window)
-            .collect();
-        ns.sort_by_key(|r| (r.1, r.3, r.4));
-        h.neighbors = ns
-            .into_iter()
-            .map(|r| Neighbor {
-                seq: r.1,
-                role: r.5.clone(),
-                block_type: r.6.clone(),
-                text: r.7.clone(),
-            })
-            .collect();
-    }
-    Ok(())
 }
 
 /// Which turns of a session to read, as a `seq` range: `seq` is the session's own dense counter over
@@ -1965,7 +2141,7 @@ mod tests {
             ts: String::new(),
             block_type: String::new(),
             harness: String::new(),
-            neighbors: Vec::new(),
+            exchange: Vec::new(),
             memory: String::new(),
             fused: 0.0,
         };

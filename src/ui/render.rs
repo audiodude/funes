@@ -17,7 +17,8 @@ fn hint_range(seq: i64) -> String {
 }
 
 /// The agent `recall` format: provenance header with score, a `→ get` line naming the memory the
-/// hit was read from, the full chunk text, and neighbor lines (unclipped for OMP). The ranking scored
+/// hit was read from, the full chunk text, and the turns framing the hit's exchange under `↳` lines
+/// (each OMP turn carrying its citation and archive caveat). The chunk is never clipped — the ranking scored
 /// all of it, so a preview could hide exactly the span that made it a hit; the chunker's size
 /// cap bounds the payload instead. Byte-stable — the layout is a published contract.
 pub fn recall_agent(note: &str, hits: &[(Hit, f64)]) -> String {
@@ -46,20 +47,48 @@ pub fn recall_agent(note: &str, hits: &[(Hit, f64)]) -> String {
             let _ = writeln!(out, "[Archived statement, NOT a verified outcome. Citation: [session {}, seq {}, turn {}]. Current applicability and supersession are unknown.]", h.session_id, h.seq, h.turn_uuid);
         }
         let _ = writeln!(out, "{}", h.text);
-        for n in &h.neighbors {
+        for e in &h.exchange {
             if is_omp {
-                // A clipped neighbor can omit the caveat that qualifies its reported outcome.
+                // An OMP exchange turn is an archived statement like the hit itself; cite it.
                 let _ = writeln!(
                     out,
-                    "  ~ [{} {} seq{}] [session {}, seq {}] [Archived statement, not independent verification] {}",
-                    n.role, n.block_type, n.seq, h.session_id, n.seq, n.text
+                    "  ↳ [{} text seq{}] [session {}, seq {}] [Archived statement, not independent verification]",
+                    e.role, e.seq, h.session_id, e.seq
                 );
             } else {
-                let np: String = n.text.chars().take(160).collect();
-                let _ = writeln!(out, "  ~ [{} {} seq{}] {}", n.role, n.block_type, n.seq, np);
+                let _ = writeln!(out, "  ↳ [{} text seq{}]", e.role, e.seq);
             }
+            let _ = writeln!(out, "{}", e.text);
         }
         let _ = writeln!(out, "---");
+    }
+    out
+}
+
+/// Characters of a hit's opening words on its `--oneline` row.
+const ONELINE_CHARS: usize = 120;
+
+/// The `recall --oneline` format: one row per hit, the provenance header and the `→ get` target
+/// joined, then the hit's opening words flattened onto the line, and no passage. For choosing what
+/// to read. Byte-stable, a contract like the agent format.
+pub fn recall_oneline(note: &str, hits: &[(Hit, f64)]) -> String {
+    let mut out = note.to_string();
+    for (h, score) in hits {
+        let s8 = &h.session_id[..h.session_id.len().min(8)];
+        let _ = writeln!(
+            out,
+            "[{}] {} {}/{} {}  score={:.3}  → get {}{}{} · {}",
+            h.ts,
+            h.harness,
+            h.workdir,
+            s8,
+            h.block_type,
+            score,
+            h.session_id,
+            hint_range(h.seq),
+            memory_hint(Some(&h.memory).filter(|m| !m.is_empty()).map(String::as_str)),
+            one_line(&h.text, ONELINE_CHARS)
+        );
     }
     out
 }
@@ -89,6 +118,14 @@ pub fn recall_reply(note: &str, hits: &[(Hit, f64)], languages: Option<&str>) ->
         );
     }
     format!("{}{}\n", recall_agent(note, hits), recall_miss(languages))
+}
+
+/// [`recall_reply`] in the one-line format. Byte-stable.
+pub fn recall_oneline_reply(note: &str, hits: &[(Hit, f64)], languages: Option<&str>) -> String {
+    if hits.is_empty() {
+        return recall_reply(note, hits, languages);
+    }
+    format!("{}{}\n", recall_oneline(note, hits), recall_miss(languages))
 }
 
 /// The agent `scan` format: a header naming the needle, the session and the window, then one line
@@ -323,7 +360,7 @@ pub fn dim(s: &str, color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::recall::{Neighbor, ScanHit};
+    use crate::commands::recall::{ExchangeTurn, ScanHit};
     use crate::commands::sketch::{Diagnostics, Evidence};
 
     fn hit(ts: &str, block_type: &str, text: &str) -> Hit {
@@ -337,7 +374,7 @@ mod tests {
             ts: ts.to_string(),
             block_type: block_type.to_string(),
             harness: "claude_code".to_string(),
-            neighbors: vec![],
+            exchange: vec![],
             memory: "hf://datasets/acme/kb".to_string(),
             fused: 0.0,
         }
@@ -347,20 +384,13 @@ mod tests {
     // byte-for-byte.
     #[test]
     fn agent_format_is_byte_stable() {
-        let mut h = hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
-        h.neighbors.push(Neighbor {
-            seq: 5,
-            role: "assistant".to_string(),
-            block_type: "text".to_string(),
-            text: "hello".to_string(),
-        });
+        let h = hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
         let out = recall_agent("", &[(h, 0.5781)]);
         assert_eq!(
             out,
             "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578\n\
              \x20 → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb\n\
              the decision was made\n\
-             \x20 ~ [assistant text seq5] hello\n\
              ---\n"
         );
         // A hit with no memory to name keeps the hint bare.
@@ -371,6 +401,47 @@ mod tests {
             bare.contains("  → get 0123456789abcdef --from 4 --to 10\n"),
             "got: {bare}"
         );
+    }
+
+    #[test]
+    fn agent_format_frames_a_hit_with_its_exchange() {
+        let mut h = hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
+        h.exchange.push(ExchangeTurn {
+            seq: 3,
+            role: "user".to_string(),
+            text: "should we keep it?".to_string(),
+        });
+        h.exchange.push(ExchangeTurn {
+            seq: 9,
+            role: "assistant".to_string(),
+            text: "we keep it".to_string(),
+        });
+        assert_eq!(
+            recall_agent("", &[(h, 0.5781)]),
+            "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578\n\
+             \x20 → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb\n\
+             the decision was made\n\
+             \x20 ↳ [user text seq3]\n\
+             should we keep it?\n\
+             \x20 ↳ [assistant text seq9]\n\
+             we keep it\n\
+             ---\n"
+        );
+    }
+
+    // The one-line format is a contract too: a row holds the header, the `→ get` target and the
+    // opening words flattened, cut at ONELINE_CHARS.
+    #[test]
+    fn oneline_format_is_byte_stable() {
+        let h = hit("2026-06-19T01:29:59.000Z", "text", "the decision\n  was made");
+        assert_eq!(
+            recall_oneline("", &[(h, 0.5781)]),
+            "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578  → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb · the decision was made\n"
+        );
+        let long = hit("2026-06-19T01:29:59.000Z", "text", &"word ".repeat(40));
+        let row = recall_oneline("", &[(long, 0.5)]);
+        assert!(row.ends_with("…\n"), "got: {row}");
+        assert_eq!(row.split(" · ").nth(1).unwrap().chars().count(), ONELINE_CHARS + 2);
     }
 
     #[test]
@@ -420,21 +491,26 @@ mod tests {
     }
 
     #[test]
-    fn omp_neighbor_preserves_late_qualifiers_verbatim() {
+    fn omp_exchange_turn_is_cited_and_keeps_late_qualifiers_verbatim() {
         let text = format!(
             "{} Current tests still require inspection; this is only a reported conclusion.",
             "A historical claim. ".repeat(12)
         );
         let mut h = hit("2026-09-06", "text", "The accepted storage decision.");
         h.harness = "omp".into();
-        h.neighbors.push(Neighbor {
+        h.exchange.push(ExchangeTurn {
             seq: 8,
             role: "assistant".into(),
-            block_type: "text".into(),
             text: text.clone(),
         });
         let out = recall_agent("", &[(h, 1.0)]);
-        assert!(out.contains(&text), "OMP neighbor omitted the qualifier: {out}");
+        assert!(out.contains(&text), "OMP exchange turn omitted the qualifier: {out}");
+        assert!(
+            out.contains(
+                "  ↳ [assistant text seq8] [session 0123456789abcdef, seq 8] [Archived statement, not independent verification]\n"
+            ),
+            "OMP exchange turn lost its citation: {out}"
+        );
     }
 
     #[test]

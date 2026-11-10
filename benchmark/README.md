@@ -20,15 +20,14 @@ dataset over `hf://` — both legs run identical data, so the gap is the I/O pat
 Every timed call runs the recall pipeline:
 
 ```
-embed query → vector ANN + BM25 FTS (fused by RRF) → [cross-encoder rerank] → neighbors → format
+embed query → vector ANN + BM25 FTS (fused by RRF) → [cross-encoder rerank] → format
 ```
 
 The rerank runs whenever the pool holds more rows than `--k`, so a default timed call (8 of 30)
 reranks 30 pairs. `--candidates 8` times a call without one.
 
 The CPU stages (query embed, and the rerank when it runs) are identical whatever the memory, so the
-local↔remote gap is entirely the I/O path: opening the dataset, the ANN/FTS scans, and the neighbor
-fetch. The embed + rerank models are loaded once in a warm-up call that is **excluded** from all
+local↔remote gap is entirely the I/O path: opening the dataset and the ANN/FTS scans. The embed + rerank models are loaded once in a warm-up call that is **excluded** from all
 timings.
 
 For each memory the harness reports a single **cold** call followed by the min / median / max of
@@ -63,7 +62,6 @@ both legs run identical data, so the gap is the I/O path, not the corpus.
 | `--cold` | off | give the remote leg a throwaway `HF_HUB_CACHE` temp dir so its cold call is a true download (your real cache is left untouched) |
 | `--k <N>` | `8` | results returned |
 | `--candidates <N>` | `30` | fused candidates reranked |
-| `--neighbors <N>` | `1` | adjacent chunks attached per hit |
 
 > `--cold` only relocates the hf-hub file **cache** (via `HF_HUB_CACHE`) to a temp dir for the run —
 > it does not touch your real `~/.cache/huggingface/hub`, your HF token, or `HF_HOME`. The local-leg
@@ -124,12 +122,14 @@ that there is nothing to compare.
 
 `score_recall.rs` asks each question of a labeled set with `funes recall`'s defaults and prints the
 receipt: the funes version, the memory's revision and the file's hash, then hit@1, hit@5, found@8,
-the mean reciprocal rank and the median latency, overall and by kind, then each question's rank.
+the mean reciprocal rank and how many answers are a hit's own turn, overall and by kind, with the
+median reply size and latency, then each question's rank and the turns its reply showed.
 `--candidates` asks from a deeper pool. `--candidates 8` scores the fused order alone, since a pool
 of the hits is not reranked.
-A question is one JSON line with an `id`, the `question`, `gold` (the spans its answer is in, each a
-`session_id` with optional `from` and `to` turns) and an optional `kind`. Its rank is the position of
-its first hit in a gold span. The labeled sets and their receipts live in the
+A question is one JSON line with an `id`, the `question`, `gold` (the turns that answer it, each a
+`session_id` and the `turn` within it: the answer and each restatement of it) and an optional `kind`.
+Its rank is the position of its first hit that shows an answering turn, as the hit itself or as a turn
+of the exchange frame attached to it. The labeled sets and their receipts live in the
 [`dacorvo/funes-recall-benchmark`](https://huggingface.co/datasets/dacorvo/funes-recall-benchmark)
 dataset:
 
@@ -155,7 +155,8 @@ cargo run --release --example sweep_rerank -- questions.jsonl --memory mem/funes
 ```
 
 For each question and each `--pools` size N (10, 12, 16, 20, 24, 30, 32, 50 and 100 by default) it
-asks `recall_hits` for N hits from N candidates, the fused order of the pool recall would cut, and
+asks `ranked_hits` for N hits from N candidates, the fused order of the pool recall would cut, before
+the exchange frame a recall adds, and
 scores every candidate with funes's own reranker. One JSON line per question and pool: the
 candidates in fused order, each with its fused score and its reranker score, and the retrieval and
 rerank times. By default a question's union of pools is scored in one reranker call and a chunk's
