@@ -940,6 +940,86 @@ fn omp_live_steering_rejects_malformed_values_and_non_user_carriers() {
     }
 }
 
+fn parent_irc_steer(id: &str, parent: Value, irc: Value) -> Value {
+    json!({"type":"message","id":id,"parentId":parent,"message":{"role":"user","attribution":"agent","steering":true,"timestamp":5000,"content":"PARENT ENVELOPE","parentIrc":irc}})
+}
+
+#[test]
+fn omp_parent_irc_steers_are_agent_boundaries_without_exposing_the_message() {
+    // OMP 18.18.6 records a parent agent's IRC steer into a child as an agent-attributed user
+    // message carrying `parentIrc: {from, body}` for transcript presentation.
+    let mut rows = conversation("omp");
+    rows.push(parent_irc_steer(
+        "p",
+        json!("a"),
+        json!({"from": "Main", "body": "PARENT BODY"}),
+    ));
+    let result = parse(&rows, "omp", 10.0, true);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(result["turns"][0]["invalid"], false);
+    assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+    assert_eq!(result["turns"][0]["items"][0]["text"], "Question");
+    assert_eq!(result["turns"][0]["items"][1]["text"], "Answer");
+    for private in ["PARENT", "parentIrc", "Main"] {
+        assert!(!result.to_string().contains(private), "exposed {private}: {result}");
+    }
+
+    // A steer that opens the child is a boundary, not a turn; the human turn after it still reads.
+    let mut rows = conversation("omp");
+    rows.insert(
+        1,
+        parent_irc_steer("p", Value::Null, json!({"from": "Main", "body": "PARENT BODY"})),
+    );
+    rows[2]["parentId"] = json!("p");
+    let result = parse(&rows, "omp", 10.0, true);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(result["turns"][0]["message_ids"], json!(["u", "a"]));
+    assert!(!result.to_string().contains("PARENT"), "exposed the steer: {result}");
+}
+
+#[test]
+fn omp_parent_irc_rejects_malformed_values_and_non_agent_carriers() {
+    for irc in [
+        Value::Null,
+        json!("Main"),
+        json!([]),
+        json!({}),
+        json!({"from": "Main"}),
+        json!({"body": "PARENT BODY"}),
+        json!({"from": 1, "body": "PARENT BODY"}),
+        json!({"from": "Main", "body": null}),
+        json!({"from": "Main", "body": "PARENT BODY", "attribution": "user"}),
+    ] {
+        // A steer that opens the child, so the rejection is not preceded by a completed turn.
+        let mut rows = conversation("omp");
+        rows.insert(1, parent_irc_steer("p", Value::Null, irc));
+        rows[2]["parentId"] = json!("p");
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+    let irc = json!({"from": "Main", "body": "PARENT BODY"});
+    for attribution in [Value::Null, json!("user")] {
+        let mut rows = conversation("omp");
+        rows[1]["message"]["parentIrc"] = irc.clone();
+        rows[1]["message"]["attribution"] = attribution;
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+    for role in ["assistant", "toolResult", "system", "developer"] {
+        let mut rows = conversation("omp");
+        rows[2]["message"]["role"] = json!(role);
+        rows[2]["message"]["attribution"] = json!("agent");
+        rows[2]["message"]["parentIrc"] = irc.clone();
+        let result = parse(&rows, "omp", 10.0, true);
+        assert_eq!(result["status"], "unknown_content_schema");
+        assert_eq!(result["turns"], json!([]));
+    }
+}
+
 #[test]
 fn omp_request_controls_preserve_evidence_without_exposing_provider_bookkeeping() {
     for controls in [

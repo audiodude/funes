@@ -791,7 +791,7 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
     let allowed = match message["role"].as_str() {
         Some("bashExecution") => "role command output exitCode cancelled truncated timestamp excludeFromContext",
         Some("fileMention") => "role files timestamp",
-        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError liveSteered model provider providerPayload prunedAt requestControls responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
+        _ => "api attribution completedAt content contextSnapshot credentialId details duration errorId errorMessage errorStatus inputTransformations isError liveSteered model parentIrc provider providerPayload prunedAt requestControls responseId retryRecovery role steering stopDetails stopReason timestamp toolCallId toolName ttft upstreamModel usage useless",
     };
     if !allowed_keys(message, allowed) {
         return Err(SCHEMA);
@@ -807,6 +807,18 @@ fn omp(row: &Value, context: &mut Context) -> Result<Event, &'static str> {
         .is_some_and(|value| message["role"] != "user" || !value.is_boolean())
     {
         return Err(SCHEMA);
+    }
+    // OMP 18.18.6 keeps a parent agent's IRC steer as presentation metadata on the agent-attributed
+    // user message it injects into a child; it is never human authorship and never exposed.
+    if let Some(irc) = message.get("parentIrc") {
+        if message["role"] != "user"
+            || message["attribution"] != "agent"
+            || !allowed_keys(irc, "from body")
+            || !irc["from"].is_string()
+            || !irc["body"].is_string()
+        {
+            return Err(SCHEMA);
+        }
     }
     if let Some(controls) = message.get("requestControls") {
         // Provider replay bookkeeping is assistant-only metadata, never evidence.
