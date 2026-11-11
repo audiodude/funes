@@ -920,3 +920,32 @@ the `/tmp`-extracted Arch Expect 5.45.4. `scripts/test-install.sh` passes.
 `HF_FUNES_TEST_TOKEN` stays empty, so credential-gated Hub tests return early.
 No `funes update`, `funes push`, release tag/artifact, Hugging Face upload, or
 memory publication is part of this refresh. AI-assisted by Claude.
+
+### November 11, 2026 OMP 18.18.9 stable consumer refresh
+
+The isolated `update-stable18189` branch starts from `update-stable18186`
+(`efdde67`, the 18.18.6 refresh). Upstream `huggingface/funes` main has no
+commits beyond the last merge (`v1.9.1` is already included), so nothing is
+merged. `cargo update` (`ad07a49`) moved 17 compatible packages (bit_field
+0.10.4, const-oid 0.10.3, hf-xet/xet-* 1.8.1, jiff/jiff-static 0.2.43,
+jiff-core 0.1.5, prost/prost-build/prost-derive/prost-types 0.14.5,
+rustls-pki-types 1.16.0, webpki-root-certs/webpki-roots 1.0.12) and dropped
+prettyplease.
+
+OMP 18.18.7–18.18.9 add no persisted session-entry or message fields, so the
+OMP reader is unchanged. On one copied inventory snapshot (1,087 OMP sources)
+the 18.18.6 build (`b0854901`) and this build report the same outcomes: 986–987
+complete, 79–80 `incomplete_turn` and 19 `unknown_content_schema`; the
+differences are live transcripts that changed between the two passes
+(`source_changed`).
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`, default and `onnx`) pass, and `cargo test --profile ci
+--no-fail-fast` (lld, `RUST_MIN_STACK=16777216`, one test thread) passes all
+429 tests across 45 suites plus doc-tests, including the 32
+`add_fifth_integration` tests against the `/tmp`-extracted, signature-checked
+Arch Expect 5.45.4 (its library lives in `usr/lib/expect5.45.4`, which must be
+on `LD_LIBRARY_PATH`). `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN`
+stays empty, so credential-gated Hub tests return early. No `funes update`,
+`funes push`, release tag/artifact, Hugging Face upload, or memory publication
+is part of this refresh. AI-assisted by Claude.
