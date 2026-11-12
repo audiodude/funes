@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, FixedSizeListArray, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
@@ -14,7 +15,7 @@ use funes::commands::recall;
 use funes::home;
 use funes::inference::{self, EmbeddingModel};
 use funes::memory::{dataset, Memory};
-use hf_hub::{HFError, HFRepository, RepoTypeDataset};
+use hf_hub::{HFClient, HFError, HFRepository, RepoTypeDataset};
 use lance::Dataset;
 
 /// The model cache the embedder and reranker read, for a run whose `$HOME` is fake.
@@ -162,6 +163,70 @@ pub async fn root_readme(repo: &HFRepository<RepoTypeDataset>) -> Option<String>
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(HFError::EntryNotFound { .. }) => None,
         Err(e) => panic!("querying the repo-root README: {e}"),
+    }
+}
+
+/// The Hub org the live tests write under.
+const TEST_ORG: &str = "optimum-internal-testing";
+
+/// A private dataset repo for one live test alone, `funes-test-<tag>-<pid>-<nanos>` under the test
+/// org, deleted when dropped, so a test that panics takes its repo with it. The Hub's commit lock
+/// and parent-commit guard are repo-wide, so tests sharing a repo, each under a prefix of its own,
+/// still refuse each other's commits.
+pub struct ScratchRepo {
+    /// `owner/name`.
+    pub id: String,
+    pub repo: HFRepository<RepoTypeDataset>,
+    token: String,
+}
+
+impl ScratchRepo {
+    /// Create the repo with `token`. `None`, after a skip note, when the Hub refuses that token the
+    /// right to create one under the org; any other failure is the test's own, and panics.
+    pub async fn create(token: &str, tag: &str) -> Option<Self> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("funes-test-{tag}-{}-{nanos}", std::process::id());
+        let id = format!("{TEST_ORG}/{name}");
+        let client = HFClient::builder().token(token).build().unwrap();
+        match client
+            .create_repository()
+            .repo_id(&id)
+            .repo_type(RepoTypeDataset)
+            .private(true)
+            .send()
+            .await
+        {
+            Ok(_) => Some(Self {
+                id,
+                repo: client.dataset(TEST_ORG, name),
+                token: token.to_string(),
+            }),
+            Err(e @ HFError::Forbidden { .. }) => {
+                eprintln!("skip: the token may not create a scratch repo under {TEST_ORG}: {e}");
+                None
+            }
+            Err(e) => panic!("creating the scratch repo {id}: {e}"),
+        }
+    }
+}
+
+impl Drop for ScratchRepo {
+    /// Best effort: a deletion that fails leaves a repo named for its test behind, not a failed test.
+    fn drop(&mut self) {
+        let (token, id) = (self.token.clone(), self.id.clone());
+        // A drop cannot await, and the test's runtime refuses to be blocked on from inside it, so
+        // the blocking client makes the call on a runtime of its own, on a thread of its own.
+        let _ = std::thread::spawn(move || {
+            let Ok(client) = HFClient::builder().token(token).build_sync() else {
+                return;
+            };
+            let _ = client
+                .delete_repository()
+                .repo_id(&id)
+                .repo_type(RepoTypeDataset)
+                .send();
+        })
+        .join();
     }
 }
 
