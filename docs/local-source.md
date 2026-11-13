@@ -977,3 +977,29 @@ signature-checked Arch Expect 5.45.4 on `PATH` and `usr/lib/expect5.45.4` on
 stays empty, so credential-gated Hub tests return early. No `funes update`,
 `funes push`, release tag/artifact, Hugging Face upload, or memory publication
 is part of this refresh. AI-assisted by Claude.
+
+### November 12, 2026 OMP 18.20.0 stable consumer refresh
+
+The isolated `update-stable18200` branch starts from `update-stable18190`
+(`c3ad8bf`, the 18.19.0 refresh). Upstream `huggingface/funes` main has
+nothing new to merge. `cargo update` (`d58f34e`) refreshes `errno`, `prost`
+(and `-build`/`-derive`/`-types`), `rmcp` (and `-macros`), `rustls-webpki`,
+`ureq`, `zstd`, `zstd-safe` and `zstd-sys` within semver.
+
+OMP 18.20.0 adds no persisted session-entry or message fields (its session
+changes are event-loop phase instrumentation around rewrites), so the OMP
+reader is unchanged. On one copied inventory snapshot (1,100–1,101 OMP
+sources) the 18.19.0 build (`2152045a`) and this build report the same
+outcomes: 999–1,000 complete, 80–81 `incomplete_turn` and 19
+`unknown_content_schema`; the differences are live transcripts that changed
+between the two passes (`source_changed`).
+
+`cargo fmt --check` and both clippy configurations (`--profile ci`, `-D
+warnings`, default and `onnx`) pass, and `cargo test --profile ci
+--no-fail-fast` (lld, `RUST_MIN_STACK=16777216`, one test thread) passes all
+432 tests across 45 suites plus doc-tests, with the `/tmp`-extracted,
+signature-checked Arch Expect 5.45.4 on `PATH` and `usr/lib/expect5.45.4` on
+`LD_LIBRARY_PATH`. `scripts/test-install.sh` passes. `HF_FUNES_TEST_TOKEN`
+stays empty, so credential-gated Hub tests return early. No `funes update`,
+`funes push`, release tag/artifact, Hugging Face upload, or memory publication
+is part of this refresh. AI-assisted by Claude.
