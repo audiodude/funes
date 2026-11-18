@@ -342,7 +342,7 @@ fn main() -> std::process::ExitCode {
     match runtime.block_on(run(cli)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) if e.downcast_ref::<memory::lock::Busy>().is_some() => {
-            eprintln!("funes: memory writer busy; retry later");
+            eprintln!("Error: {e:#}");
             std::process::ExitCode::from(EX_TEMPFAIL)
         }
         Err(e) => {
