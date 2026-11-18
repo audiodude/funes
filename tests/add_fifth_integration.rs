@@ -9,7 +9,7 @@ mod support;
 use funes::inference::EmbeddingModel;
 use funes::memory::dataset;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -99,7 +99,7 @@ fn bundle(dir: &Path, id: &str, contract: u32, tag: &str) -> PathBuf {
 /// [`bundle`], declaring `repo` as where it is published from.
 fn bundle_published_by(dir: &Path, id: &str, repo: &str, contract: u32, tag: &str) -> PathBuf {
     let dir = dir.to_path_buf();
-    fs::create_dir_all(&dir).unwrap();
+    fs::DirBuilder::new().recursive(true).mode(0o755).create(&dir).unwrap();
     fs::write(
         dir.join("manifest.json"),
         format!(r#"{{"contract_version":{contract},"id":"{id}","label":"Clyde","repo":"{repo}","version":"1.0.0"}}"#),
@@ -1398,7 +1398,9 @@ fn the_memory_bound_through_one_agent_is_the_hosts() {
     // wrote, is no binding and no disagreement.
     fs::remove_file(&bound).unwrap();
     let older = |id: &str, memory: &str| {
-        fs::write(home.join(format!(".funes/agents/{id}.memory")), format!("{memory}\n")).unwrap()
+        let note = home.join(format!(".funes/agents/{id}.memory"));
+        fs::write(&note, format!("{memory}\n")).unwrap();
+        fs::set_permissions(&note, fs::Permissions::from_mode(0o644)).unwrap();
     };
     older("clyde", memory);
     older("dotty", "local");

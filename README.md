@@ -112,8 +112,9 @@ funes recall "..." --memory <user|org>/funes-memory   # read any remote memory f
 
 That second form is how you read **someone else's** published memory on a topic, without touching
 your own setup. Publishing is guarded: funes redacts credentials at index time, and a separate,
-always-on gate refuses to push any chunk that still contains a secret. And because a published memory
-is just a dataset, you can try recall **right now**, before indexing anything of your own:
+always-on gate redacts any left in what it publishes, holding back what it can't redact. And because
+a published memory is just a dataset, you can try recall **right now**, before indexing anything of
+your own:
 
 ```bash
 funes recall "why is funes append-only" --memory huggingface/funes-memory
@@ -190,7 +191,7 @@ back to the CPU where no GPU starts. An ONNX Runtime backend is available as an 
 
 ```bash
 cargo build --release --no-default-features --features onnx   # ONNX backend instead
-cargo run --release --features onnx --example bench_backends  # A/B both backends
+cargo run --release --features onnx --example score_models    # score the built-in backend against it
 ```
 
 ## Notes

@@ -57,7 +57,7 @@ async fn acquire_lock(interactive: bool) -> Result<lock::MemoryLock> {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
-    Err(IndexBusy.into())
+    Err(lock::Busy.into())
 }
 
 /// What `funes index` was asked, as the CLI help describes each.
@@ -274,17 +274,16 @@ fn sanitize_units(
     Ok(())
 }
 
-/// Units a batch consumes: those read are scanned for secrets in one scanner spawn (~1 s) rather
-/// than one per unit, so a directory of hundreds of session files is scanned in seconds, not
-/// minutes.
-const SCAN_BATCH: usize = 32;
+/// Units a batch consumes, at most: a batch's units are read, scanned, written and recorded
+/// together, so one scanner spawn (~1 s) covers the batch rather than each unit.
+const BATCH_UNITS: usize = 32;
 
-/// Block text a batch holds before it is scanned: bounds the memory a batch of bulk units (a Hub
+/// Block text a batch holds before it is written: bounds the memory a batch of bulk units (a Hub
 /// shard holds thousands of sessions) takes, where the unit count alone would not.
-const SCAN_BATCH_BYTES: usize = 64 << 20;
+const BATCH_BYTES: usize = 64 << 20;
 
-/// Read units from the front of `units` until a batch fills — [`SCAN_BATCH`] consumed, or
-/// [`SCAN_BATCH_BYTES`] of block text read, whichever comes first. `read(n, unit)` gives the
+/// Read units from the front of `units` until a batch fills: [`BATCH_UNITS`] consumed, or
+/// [`BATCH_BYTES`] of block text read, whichever comes first. `read(n, unit)` gives the
 /// `n`th unit's turns, or `None` for one the batch has no use for (already indexed, rejected).
 /// Either way the unit is consumed and counts, so whatever a backlog holds, a caller's check
 /// between batches is never more than a batch away. Returns one entry per unit consumed, in
@@ -305,7 +304,7 @@ fn take_batch<T>(
                 .sum::<usize>();
         }
         batch.push(turns);
-        if batch.len() >= SCAN_BATCH || bytes >= SCAN_BATCH_BYTES {
+        if batch.len() >= BATCH_UNITS || bytes >= BATCH_BYTES {
             break;
         }
     }
@@ -323,7 +322,6 @@ fn find_scanner() -> Option<scan::Trufflehog> {
         }
     }
 }
-
 /// A unit's distinct-session count and a log label: `"<sid> (<workdir>)"` for a single session (a
 /// JSONL file), `"<n> sessions"` for a bulk unit (many sessions in one artifact), and the unit's `key` (its
 /// path) when it has no turns at all. The borrow of `turns` is confined here so callers keep it mutable.
@@ -617,10 +615,10 @@ pub(crate) fn local_index_coverage() -> Option<IndexCoverage> {
     })
 }
 
-/// A set-up indexer: it holds the memory lock, embedder, dataset, redaction scanner, and incremental
-/// state, so a caller can index units in whatever batches it likes — one at a time to check the
-/// clock between them, or all at once — without reloading the model. Build the indexes once at the
-/// end with [`Indexer::finalize`].
+/// A set-up indexer: it holds the memory lock, embedder, dataset, and incremental state, so a
+/// caller can index units in whatever batches it likes (one at a time to check the clock between
+/// them, or all at once) without reloading the model. Build the indexes once at the end with
+/// [`Indexer::finalize`].
 struct Indexer {
     uri: String,
     ds: Option<Dataset>,
@@ -662,6 +660,11 @@ struct Indexer {
     /// Units (by index) whose read failed this run — reported once. Signed units also keep their
     /// refusal in state until their content or this build changes.
     rejected: HashSet<usize>,
+    /// A unit's state was recorded since the last [`Indexer::persist`].
+    recorded: bool,
+    /// The spool files this batch indexed, as key, signature and progress label, to drain once
+    /// [`Indexer::persist`] has recorded them.
+    to_drain: Vec<(String, String, String)>,
 }
 
 /// Enumerate every source's units (each source orders its own — recency-desc), tagged with the
@@ -697,7 +700,7 @@ fn collect_units(sources: &[Box<dyn source::TraceSource>]) -> Result<Vec<(usize,
 
 impl Indexer {
     /// Acquire the memory lock, open (or plan to create) the dataset, load incremental state, bring
-    /// up the embedder and secret scanner, and enumerate `sources`' units.
+    /// up the embedder, and enumerate `sources`' units.
     async fn open(sources: Vec<Box<dyn source::TraceSource>>, no_thinking: bool) -> Result<Indexer> {
         std::fs::create_dir_all(home::dir())?;
         let interactive = std::io::stdin().is_terminal();
@@ -788,6 +791,8 @@ impl Indexer {
             n_embedded: 0,
             languages,
             rejected: HashSet::new(),
+            recorded: false,
+            to_drain: Vec::new(),
         })
     }
 
@@ -821,9 +826,18 @@ impl Indexer {
             .collect()
     }
 
-    /// Record a unit's state and persist it, so an interrupted run resumes where it stopped.
-    fn record(&mut self, key: &str, state: UnitState) -> Result<()> {
+    /// Record a unit's state, unwritten until the next [`Indexer::persist`].
+    fn record(&mut self, key: &str, state: UnitState) {
         self.state.insert(key.to_string(), state);
+        self.recorded = true;
+    }
+
+    /// Write every unit's state, if one was recorded since the last write, so an interrupted run
+    /// resumes where it stopped.
+    fn persist(&mut self) -> Result<()> {
+        if !std::mem::take(&mut self.recorded) {
+            return Ok(());
+        }
         atomic_json(&self.state_path, &self.state)?;
         write_index_coverage(&self.coverage_path, &self.sources, &self.units, &self.state)
     }
@@ -872,7 +886,7 @@ impl Indexer {
                             level: None,
                             refused: Some(VERSION.to_string()),
                         },
-                    )?;
+                    );
                 }
                 Ok(None)
             }
@@ -880,8 +894,8 @@ impl Indexer {
         }
     }
 
-    /// Read and sanitize a batch of units, with one scanner run. Returns one entry per unit
-    /// consumed: its turns, or `None` when skipped or refused.
+    /// Read a batch of units, their data URIs elided. Returns one entry per unit consumed: its turns,
+    /// or `None` when skipped or refused.
     fn read_batch(
         &mut self,
         units: &[usize],
@@ -901,9 +915,10 @@ impl Indexer {
         Ok(read)
     }
 
-    /// Write all tiers of unit `i` from sanitized `turns`, keeping only new chunks in one append.
-    /// Record that its rows are in the memory before draining its spool file; the memory itself
-    /// carries any embeddings still owed. A bulk source stays one fragment per unit.
+    /// Write all tiers of unit `i` from its `turns`, keeping only new chunks in one append, and
+    /// record that its rows are in the memory. A spool file left with nothing owed is queued to
+    /// drain. The memory itself carries any embeddings still owed. A bulk source stays one fragment
+    /// per unit.
     async fn write_unit(&mut self, i: usize, turns: &[traces::Turn], progress: &str) -> Result<u64> {
         let (key, sig) = {
             let unit = &self.units[i].1;
@@ -942,12 +957,23 @@ impl Indexer {
             eprintln!("{progress} {label} — no indexable content");
             0
         } else {
-            // A unit can carry one id twice (a turn re-emitted under its `turn_uuid`); the first wins,
-            // as it would have had the two arrived in separate runs.
+            // A block stored once takes no more pieces: a re-read can split it into more than the
+            // memory holds (an edit re-emitted under its `turn_uuid`, or a block an older funes stored
+            // with its secrets cut out), and the extra ones would sit behind the old ones. A block's
+            // first piece stands for it, since its pieces are written together, and the first
+            // occurrence of a block in a unit wins, as it would have in separate runs.
             let mut in_batch = HashSet::new();
+            let mut new_block = false;
             let mut new_chunks: Vec<chunk::Chunk> = chunks
                 .into_iter()
-                .filter(|c| !self.existing.contains(&c.id) && in_batch.insert(c.id.clone()))
+                .filter(|c| {
+                    if c.split_idx == 0 {
+                        new_block = !self.existing.contains(&c.id) && in_batch.insert(c.id.clone());
+                    }
+                    // An OMP chunk budget can store a block's later pieces without its first; when
+                    // the block is read again, only its missing pieces are new.
+                    new_block && (c.split_idx == 0 || !self.existing.contains(&c.id))
+                })
                 .collect();
             if is_omp {
                 if let Some(budget) = self.omp_max_chunks {
@@ -997,11 +1023,9 @@ impl Indexer {
                     level: Some(Tier::ToolResult),
                     refused: None,
                 },
-            )?;
+            );
             if drains(&key, Tier::ToolResult, self.include_thinking) {
-                if let Err(e) = drain(&key, sig) {
-                    eprintln!("{progress} {key} — indexed, but the spool copy stayed: {e:#}");
-                }
+                self.to_drain.push((key, sig.clone(), progress.to_string()));
             }
         }
         self.n_sessions += sessions;
@@ -1032,6 +1056,14 @@ impl Indexer {
             }
             if let Some(turns) = turns {
                 self.write_unit(units[n], &turns, &label(n)).await?;
+            }
+        }
+        // One state write per batch, since each write holds every unit's state. A spool file is
+        // drained only once the state says its unit is indexed.
+        self.persist()?;
+        for (key, sig, progress) in std::mem::take(&mut self.to_drain) {
+            if let Err(e) = drain(&key, &sig) {
+                eprintln!("{progress} {key} — indexed, but the spool copy stayed: {e:#}");
             }
         }
         Ok(consumed)
@@ -1638,6 +1670,47 @@ fn check_source(src: Box<dyn source::TraceSource>, path: &Path, no_thinking: boo
 /// `yes = true`: these callers are non-interactive and must not gate on the first-index prompt.
 pub async fn run_index(path: &Path, no_thinking: bool, max_sessions: Option<usize>) -> Result<()> {
     run_index_roots(&[path.to_path_buf()], no_thinking, max_sessions, true).await
+}
+
+/// What [`write_rows`] wrote, and how long each part of the run took.
+pub struct RowsWritten {
+    pub sessions: u64,
+    pub chunks: u64,
+    /// The fragments the writes left for the compaction to merge.
+    pub fragments: usize,
+    /// Every unit's rows: reading, chunking, appending, recording its state.
+    pub write: Duration,
+    /// The end of the run: the language counts and the compaction.
+    pub finalize: Duration,
+}
+
+/// Index `path` as [`run_index`] does, but leave every embedding pending: the part of a run the
+/// embedder has no share in.
+pub async fn write_rows(path: &Path, max_sessions: Option<usize>) -> Result<RowsWritten> {
+    let mut indexer = Indexer::open(vec![source::open(path, max_sessions)?], false).await?;
+    let total = indexer.unit_count();
+    let all: Vec<usize> = (0..total).collect();
+    let t0 = Instant::now();
+    let mut done = 0;
+    while done < total {
+        done += indexer.write_units(&all[done..], done, total).await?;
+    }
+    let write = t0.elapsed();
+    let fragments = match &indexer.ds {
+        Some(ds) => dataset::fragments_to_compact(ds).await?,
+        None => 0,
+    };
+    let (sessions, chunks) = (indexer.n_sessions, indexer.n_chunks);
+    indexer.work_remaining = true;
+    let t1 = Instant::now();
+    indexer.finalize().await?;
+    Ok(RowsWritten {
+        sessions,
+        chunks,
+        fragments,
+        write,
+        finalize: t1.elapsed(),
+    })
 }
 
 /// A first interactive index estimated at ≥ this many seconds prompts before continuing.
@@ -2345,20 +2418,20 @@ mod tests {
 
         // Tiny units fill a batch by count; the rest go in the next.
         let batch = take_batch(&units, |_, _| Ok(Some(turns_of(1)))).unwrap();
-        assert_eq!(batch.len(), SCAN_BATCH);
+        assert_eq!(batch.len(), BATCH_UNITS);
         let rest = take_batch(&units[batch.len()..], |_, _| Ok(Some(turns_of(1)))).unwrap();
-        assert_eq!(rest.len(), 40 - SCAN_BATCH);
+        assert_eq!(rest.len(), 40 - BATCH_UNITS);
 
         // A unit the pass has no use for is consumed and counts: a backlog of them still ends a
         // batch, so a budget check is never more than a batch away.
         let batch = take_batch(&units, |n, _| Ok((n % 2 == 0).then(|| turns_of(1)))).unwrap();
-        assert_eq!(batch.len(), SCAN_BATCH);
-        assert_eq!(batch.iter().flatten().count(), SCAN_BATCH / 2);
+        assert_eq!(batch.len(), BATCH_UNITS);
+        assert_eq!(batch.iter().flatten().count(), BATCH_UNITS / 2);
         let batch = take_batch(&units, |_, _| Ok(None)).unwrap();
-        assert_eq!(batch.len(), SCAN_BATCH);
+        assert_eq!(batch.len(), BATCH_UNITS);
 
         // Text fills a batch before the count does.
-        let batch = take_batch(&units, |_, _| Ok(Some(turns_of(SCAN_BATCH_BYTES / 4)))).unwrap();
+        let batch = take_batch(&units, |_, _| Ok(Some(turns_of(BATCH_BYTES / 4)))).unwrap();
         assert_eq!(batch.len(), 4);
     }
 

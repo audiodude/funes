@@ -77,7 +77,7 @@ metal = [
     "dep:half",
 ]
 # ONNX inference backend (fastembed/ort). When both backends are compiled in, `blas` is the one
-# funes runs; the ONNX types are the reference backend for bench_backends.
+# funes runs, and the ONNX types are the reference score_models measures it against.
 onnx = ["dep:fastembed"]
 
 # Benchmarks live under benchmark/ alongside their README; run via `cargo run --example <name>`.
@@ -85,11 +85,25 @@ onnx = ["dep:fastembed"]
 name = "bench_recall"
 path = "benchmark/bench_recall.rs"
 
-# A/B the inference backends (BLAS vs ONNX as reference). Needs both compiled in:
-#   cargo run --release --features onnx --example bench_backends
+# Time the part of `funes index` that writes rows, without the embedding:
+#   cargo run --release --example bench_index -- --sessions 2000 2>/dev/null
 [[example]]
-name = "bench_backends"
-path = "benchmark/bench_backends.rs"
+name = "bench_index"
+path = "benchmark/bench_index.rs"
+
+# Time the embedder and the reranker on one backend, blas or, in a macOS build, metal:
+#   cargo run --release --example bench_models -- --backend metal
+[[example]]
+name = "bench_models"
+path = "benchmark/bench_models.rs"
+required-features = ["blas"]
+
+# Score the backends against ONNX Runtime, which it needs compiled in:
+#   cargo run --release --features onnx --example score_models
+[[example]]
+name = "score_models"
+path = "benchmark/score_models.rs"
+required-features = ["onnx"]
 
 # A default `funes recall` scored against a labeled set of questions.
 [[example]]

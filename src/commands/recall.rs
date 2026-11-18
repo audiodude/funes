@@ -981,11 +981,13 @@ fn hit_cols(ds: &Dataset) -> Vec<&'static str> {
         .collect()
 }
 
-/// The `(row id, Hit)` of every row of `batches`, in their order (the search's rank).
+/// The `(row id, Hit)` of every row of `batches`, in their order (the search's rank), equal scores
+/// by row id.
 fn hits_of(batches: &[RecordBatch]) -> Result<Vec<(u64, Hit)>> {
     let mut out = Vec::new();
     for batch in batches {
         let row_ids = dataset::row_ids(batch)?;
+        let scores = dataset::search_scores(batch)?;
         let (chunk_id, text, sess, proj, turn, ts, bt, harness) = (
             dataset::strs(batch, "id"),
             dataset::strs(batch, "text"),
@@ -997,8 +999,9 @@ fn hits_of(batches: &[RecordBatch]) -> Result<Vec<(u64, Hit)>> {
             dataset::strs(batch, "harness"),
         );
         let seq = dataset::ints(batch, "seq");
-        for i in 0..batch.num_rows() {
+        for (i, &score) in scores.iter().enumerate() {
             out.push((
+                score,
                 row_ids.get(i),
                 Hit {
                     id: chunk_id.get(i).to_string(),
@@ -1017,7 +1020,12 @@ fn hits_of(batches: &[RecordBatch]) -> Result<Vec<(u64, Hit)>> {
             ));
         }
     }
-    Ok(out)
+    // Equal BM25 scores come back in an order that depends on which of Lance's index segments
+    // finishes first.
+    for tie in out.chunk_by_mut(|(a, ..), (b, ..)| a == b) {
+        tie.sort_unstable_by_key(|(_, id, _)| *id);
+    }
+    Ok(out.into_iter().map(|(_, id, hit)| (id, hit)).collect())
 }
 
 /// Reciprocal-rank fusion (k=60): each list contributes `1/(rank + 60)` to a row's score; return
@@ -2248,6 +2256,44 @@ mod tests {
         // The cut through a tie takes the same rows every run, not an arbitrary half of it.
         let (v, f) = lists();
         assert_eq!(ids(rrf_fuse(v, f, 5)), ["0", "1", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn search_hits_break_score_ties_before_fusion() {
+        use arrow_array::{ArrayRef, Float32Array, StringArray, UInt64Array};
+        use std::sync::Arc;
+
+        let batch = |score_column, rows: &[(u64, f32)]| {
+            RecordBatch::try_from_iter([
+                (
+                    "_rowid",
+                    Arc::new(UInt64Array::from_iter_values(rows.iter().map(|(id, _)| *id))) as ArrayRef,
+                ),
+                (
+                    "id",
+                    Arc::new(StringArray::from_iter_values(rows.iter().map(|(id, _)| id.to_string()))) as ArrayRef,
+                ),
+                (
+                    score_column,
+                    Arc::new(Float32Array::from_iter_values(rows.iter().map(|(_, score)| *score))) as ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+
+        for (score_column, best, worse) in [("_distance", 0.0, 0.5), ("_score", 0.5, 0.0)] {
+            // Lance may deliver the same score tie in either order and across batches.
+            for (a, b) in [(11, 3), (3, 11)] {
+                let batches = [
+                    batch(score_column, &[(a, best)]),
+                    batch(score_column, &[(b, best), (1, worse)]),
+                ];
+                let hits = hits_of(&batches).unwrap();
+                let row_ids: Vec<_> = hits.iter().map(|(id, _)| *id).collect();
+                assert_eq!(row_ids, [3, 11, 1], "{score_column}");
+                assert_eq!(rrf_fuse(hits, vec![], 1)[0].id, "3");
+            }
+        }
     }
 
     #[test]

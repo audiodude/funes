@@ -216,9 +216,9 @@ enum Cmd {
         #[arg(value_name = "MEMORY")]
         memory: Option<String>,
     },
-    /// Redact secrets from your local memory in place — for rows indexed before redaction existed (or
-    /// flagged by an updated ruleset); needs no source transcript. Cleans the local memory only: it
-    /// does NOT scrub an already-published remote, which the push gate can only stop adding to.
+    /// Redact secrets from your local memory in place, such as the blocks a push holds back. Needs no
+    /// source transcript, and cleans the local memory only: it does NOT scrub an already-published
+    /// remote, which the push gate can only stop adding to.
     Scrub,
     /// Update funes in place: download the latest release binary for this platform and replace the
     /// running executable, then bring the installed agent integrations to their newest release.
@@ -318,6 +318,10 @@ impl MemoryOpts {
     }
 }
 
+/// The exit status of a command that found the memory busy: sysexits' EX_TEMPFAIL, a temporary
+/// failure.
+const EX_TEMPFAIL: u8 = 75;
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     // The local source protocol never talks to the Hub, so it neither needs the Hub User-Agent
@@ -337,9 +341,9 @@ fn main() -> std::process::ExitCode {
     };
     match runtime.block_on(run(cli)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) if e.downcast_ref::<index::IndexBusy>().is_some() => {
+        Err(e) if e.downcast_ref::<memory::lock::Busy>().is_some() => {
             eprintln!("funes: memory writer busy; retry later");
-            std::process::ExitCode::from(75)
+            std::process::ExitCode::from(EX_TEMPFAIL)
         }
         Err(e) => {
             if omp_index {

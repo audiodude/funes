@@ -56,8 +56,8 @@ An agent funes has no parser for joins through the same shape: its per-turn hook
 that writes the session as a [`.funes.jsonl` turns file](funes-jsonl.md), then `funes index <that
 file>` — or, as an installed [integration](add.md#the-integration-contract), into the agent's spool
 followed by `funes index --harness <id>`. Three things to know when writing one: an explicit path is indexed in full, unbudgeted — a
-single session is small, so that is what you want; a run that finds the memory lock busy fails fast,
-and the next turn's run catches up (indexing is idempotent); and `funes index --check <file>`
+single session is small, so that is what you want; a run that finds the memory lock busy fails fast
+with exit code 75, and the next turn's run catches up (indexing is idempotent); and `funes index --check <file>`
 validates a producer's output without writing anything, so run it before wiring the hook.
 
 ## How it behaves
@@ -78,9 +78,10 @@ validates a producer's output without writing anything, so run it before wiring 
   memory compete for its head on the Hub, and the one that loses retries. The one case that can
   leave rows out is a first publish to an empty memory, which has no head to check against. Setting
   up one host before the others avoids it.
-- **Secrets held back.** funes redacts credentials at index time; on push, a separate always-on gate
-  withholds any chunk that still contains one — the clean rows publish, and the push exits non-zero
-  (code `2`) only if that leaves nothing to publish. Run `funes scrub`, then the next push includes it.
+- **Secrets redacted on the way out.** funes redacts credentials at index time, and on push a
+  separate always-on gate redacts any left in what it publishes. A block it can't redact in place is
+  held back, the clean rows publish, and the push exits non-zero (code `2`) only if that leaves
+  nothing to publish. Run `funes scrub`, then the next push includes it.
 - **The card rides along.** A push to a memory at the repo root creates the repo's dataset card
   (tagged `funes`) and keeps its stats fresh — in the same commit as the data. A hand-written
   card is never touched.
