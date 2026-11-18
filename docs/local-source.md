@@ -1003,3 +1003,29 @@ signature-checked Arch Expect 5.45.4 on `PATH` and `usr/lib/expect5.45.4` on
 stays empty, so credential-gated Hub tests return early. No `funes update`,
 `funes push`, release tag/artifact, Hugging Face upload, or memory publication
 is part of this refresh. AI-assisted by Claude.
+
+### November 17, 2026 OMP 18.22.1 stable consumer refresh
+
+Merges 25 upstream `huggingface/funes` commits. Upstream's `perf(index): leave
+secret redaction to push` is not taken: this fork keeps index-time TruffleHog
+redaction and the per-source scanner receipts the OMP bridge reports, while
+adopting upstream's typed `lock::Busy` (exit 75 with its message), per-batch
+state writes, and first-piece block dedup. Because an OMP chunk budget can
+store a block's later pieces without its first, a re-read block admits only
+pieces the memory lacks. `cargo update` refreshes 65 lock entries within
+semver (datafusion 54.2, rmcp 3.11, jiff, mio, uuid and others).
+
+OMP 18.22.1 drops the optional `seanceSource` header field and adds no
+persisted entry fields the reader depends on. On one copied inventory snapshot
+of 1,210 OMP sources the previous build (`d58f34e2`) and this build report the
+same outcomes: 1,093–1,094 complete, 86 `incomplete_turn` and 29
+`unknown_content_schema`; the difference is a live transcript
+(`source_changed`).
+
+`cargo fmt --check` and both clippy configurations pass, and `cargo test
+--profile ci --no-fail-fast` passes all 436 tests across 45 suites (the
+contention test was rerun after aligning the busy message), with the
+`/tmp`-extracted, signature-checked Arch Expect 5.45.4. `scripts/test-install.sh`
+passes. `HF_FUNES_TEST_TOKEN` stays empty. No `funes update`, `funes push`,
+release artifact, Hugging Face upload, or memory publication is part of this
+refresh. AI-assisted by Claude.
