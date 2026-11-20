@@ -1029,3 +1029,27 @@ contention test was rerun after aligning the busy message), with the
 passes. `HF_FUNES_TEST_TOKEN` stays empty. No `funes update`, `funes push`,
 release artifact, Hugging Face upload, or memory publication is part of this
 refresh. AI-assisted by Claude.
+
+### November 20, 2026 OMP 19.0.1 stable consumer refresh
+
+Merges upstream `huggingface/funes` `0d00729` (CI workflow action bump
+only; it touches no Rust source, so the pinned build revision predates it).
+`cargo update` refreshes 20 lock entries within semver (bstr, clap, regex,
+serde_with, smallvec, pin-project and others; jiff 1.0 enters as a new
+transitive dependency).
+
+OMP 19.0.0/19.0.1 add optional `model_usage` fields (`duration`, `ttft`,
+`judgment`, `completion`) and `custom_message.excludeFromContext`; the reader
+already passes both entry types through without indexing their payloads, and
+no `message` fields changed. On one copied inventory snapshot of 1,284 OMP
+sources the previous build (`b4816cb9`) and this build report the same
+outcomes apart from live transcripts: 1,146–1,148 complete, 88
+`incomplete_turn`, 29 `unknown_content_schema`, 11 `missing_session_header`,
+6 `incomplete_write`, and 2–4 `source_changed`.
+
+`cargo fmt --check` and both clippy configurations pass, and `cargo test
+--profile ci --no-fail-fast` passes all 436 tests across 45 suites, with the
+`/tmp`-extracted, signature-checked Arch Expect 5.45.4. `scripts/test-install.sh`
+passes. `HF_FUNES_TEST_TOKEN` stays empty. No `funes update`, `funes push`,
+release artifact, Hugging Face upload, or memory publication is part of this
+refresh. AI-assisted by Claude.
